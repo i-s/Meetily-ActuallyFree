@@ -1,6 +1,9 @@
-# CI-only CPU candidate. Production universal/updater packaging stays in
+# CI-only single-backend candidate. Production universal/updater packaging stays in
 # build-universal-windows.ps1; this path never signs or publishes a release.
-param([string]$Target = 'x86_64-pc-windows-msvc')
+param(
+  [ValidateSet('x86_64-pc-windows-msvc')][string]$Target = 'x86_64-pc-windows-msvc',
+  [ValidateSet('cpu', 'cuda')][string]$Backend = 'cpu'
+)
 
 $ErrorActionPreference = 'Stop'
 $frontend = Split-Path $PSScriptRoot -Parent
@@ -16,14 +19,42 @@ if (!$env:RUNNER_TEMP -or !$env:BUILD_COMMIT -or !$env:VCToolsRedistDir) {
 
 $output = Join-Path $repo 'dist/windows-preview'
 $stage = Join-Path $tauri 'preview-runtime'
+# Prevent a previous CUDA invocation from leaking DLLs into the CPU payload.
+if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
 New-Item -ItemType Directory -Force $output, $stage | Out-Null
 
-# App-local Microsoft redistributable DLLs make this CPU preview runnable on
+# App-local Microsoft redistributable DLLs make this preview runnable on
 # machines without VS installed. The production installer has its own redist hook.
 foreach ($component in @('Microsoft.VC143.CRT', 'Microsoft.VC143.OpenMP')) {
   $source = Join-Path $env:VCToolsRedistDir "x64/$component"
   if (!(Test-Path $source)) { throw "Missing MSVC redistributables: $source" }
   Copy-Item "$source/*.dll" $stage -Force
+}
+$features = 'custom-protocol'
+$cuda = $null
+if ($Backend -eq 'cuda') {
+  . (Join-Path $PSScriptRoot 'preview-cuda-runtime.ps1')
+  if (!$env:CUDA_PATH) { throw 'CUDA Preview requires CUDA_PATH pointing to CUDA 13.0.2' }
+  $nvcc = Join-Path $env:CUDA_PATH 'bin/nvcc.exe'
+  if (!(Test-Path $nvcc)) { throw "CUDA compiler missing: $nvcc" }
+  $nvccVersion = @(& $nvcc --version)
+  if ($LASTEXITCODE -ne 0 -or "$nvccVersion" -notmatch 'release 13\.0,') { throw 'CUDA Preview requires CUDA 13.0' }
+  if ($env:CMAKE_CUDA_ARCHITECTURES -ne '86') { throw 'CUDA Preview requires CMAKE_CUDA_ARCHITECTURES=86 (RTX 3080 Laptop)' }
+  $env:CUDA_TOOLKIT_ROOT_DIR = $env:CUDA_PATH
+  $env:PATH = "$env:CUDA_PATH\bin;$env:CUDA_PATH\bin\x64;$env:PATH"
+  $env:NVCC_APPEND_FLAGS = '-std=c++17 -Xcompiler=/Zc:preprocessor -DCCCL_IGNORE_MSVC_TRADITIONAL_PREPROCESSOR_WARNING'
+  $null = Get-Command dumpbin.exe -ErrorAction Stop
+  $sevenZip = (Get-Command 7z.exe -ErrorAction Stop).Source
+  $cudaImports = Copy-PreviewCudaRuntime -Toolkit $env:CUDA_PATH -Stage $stage -SystemDirectory ([Environment]::SystemDirectory)
+  $features = 'custom-protocol,cuda'
+  $cuda = @{
+    compiler_version = $nvccVersion
+    architectures = $env:CMAKE_CUDA_ARCHITECTURES
+    nvcc_append_flags = $env:NVCC_APPEND_FLAGS
+    runtime_imports = $cudaImports
+    driver_dependency = 'NVIDIA CUDA 13 compatible driver; nvcuda.dll is not redistributed'
+    gpu_inference_verified = $false
+  }
 }
 $resources = [ordered]@{}
 foreach ($directory in @('templates', 'resources/diarization', 'binaries/onnxruntime')) {
@@ -34,13 +65,13 @@ foreach ($directory in @('templates', 'resources/diarization', 'binaries/onnxrun
     $resources[$relative] = $relative
   }
 }
-foreach ($file in Get-ChildItem $stage -Filter '*.dll') {
+foreach ($file in Get-ChildItem $stage -File) {
   $resources["preview-runtime/$($file.Name)"] = $file.Name
 }
 
 # Tauri merges this override after tauri.windows.conf.json. Null removes the
 # release signing command and universal installer template/hooks. Stock NSIS
-# installs the single CPU executable and required resources for the current user.
+# installs the selected executable and required resources for the current user.
 $override = Join-Path $tauri 'tauri.preview.generated.json'
 @{
   build = @{ beforeBuildCommand = '' }
@@ -56,8 +87,8 @@ $override = Join-Path $tauri 'tauri.preview.generated.json'
 
 Push-Location $frontend
 try {
-  pnpm exec tauri build --target $Target --config $override --bundles nsis -- --locked --no-default-features --features custom-protocol
-  if ($LASTEXITCODE -ne 0) { throw 'CPU Preview NSIS build failed' }
+  pnpm exec tauri build --target $Target --config $override --bundles nsis -- --locked --no-default-features --features $features
+  if ($LASTEXITCODE -ne 0) { throw "$Backend Preview NSIS build failed" }
 } finally {
   Pop-Location
   Remove-Item $override -Force
@@ -70,6 +101,7 @@ if ((Get-AuthenticodeSignature $installer).Status -ne 'NotSigned') { throw 'Prev
 
 # Verify the actual installed payload, including Tauri resource destination paths.
 $installed = Join-Path $env:RUNNER_TEMP 'meetily-preview-installed'
+if (Test-Path $installed) { Remove-Item $installed -Recurse -Force }
 $process = Start-Process -FilePath $installer -ArgumentList @('/S', "/D=$installed") -Wait -PassThru
 if ($process.ExitCode -ne 0) { throw "Preview install failed: $($process.ExitCode)" }
 $main = Join-Path $installed 'meetily.exe'
@@ -111,6 +143,22 @@ foreach ($sidecar in @('llama-helper', 'ffmpeg')) {
     throw "Installed sidecar hash mismatch: $sidecar"
   }
 }
+if ($Backend -eq 'cuda') {
+  $mainImports = @(Get-PreviewPeDependencies $main)
+  # whisper-rs-sys 0.11.1 explicitly links cudart and cuBLAS on Windows.
+  # Imports establish compile identity without launching GPU code on the runner.
+  foreach ($dependency in @('cudart64_13.dll', 'cublas64_13.dll')) {
+    if ($mainImports -notcontains $dependency) { throw "CUDA executable does not import $dependency" }
+  }
+  foreach ($dependency in @('cudart64_13.dll', 'cublas64_13.dll', 'cublasLt64_13.dll', 'CUDA-EULA.txt')) {
+    if (!(Test-Path (Join-Path $installed $dependency))) { throw "Installed CUDA payload missing: $dependency" }
+  }
+  $sidecarImports = @(Get-PreviewPeDependencies (Join-Path $installed 'llama-helper.exe'))
+  if ($sidecarImports -match '(?i)(cuda|cublas|nvrtc|nvjitlink)') { throw 'llama-helper must retain its CPU backend' }
+  $cuda.application_imports = $mainImports
+  $cuda.cpu_sidecar_imports = $sidecarImports
+  $cuda.compile_identity_verified = $true
+}
 
 $audio = Join-Path $env:RUNNER_TEMP 'meetily-preview-smoke.m4a'
 & (Join-Path $installed 'ffmpeg.exe') -v error -f lavfi -i 'anullsrc=r=48000:cl=mono' -t 0.25 -c:a aac -y $audio
@@ -122,11 +170,24 @@ if ($LASTEXITCODE -ne 0 -or "$llamaOutput" -notmatch '"type":"pong"' -or "$llama
   throw 'Installed llama-helper protocol smoke test failed'
 }
 
-$stem = "Meetily-Actually-Free_$($base.version)_preview-fixes_$($env:BUILD_COMMIT.Substring(0, 12))_x64-cpu"
+$stem = "Meetily-Actually-Free_$($base.version)_preview-fixes_$($env:BUILD_COMMIT.Substring(0, 12))_x64-$Backend"
 Copy-Item $installer (Join-Path $output "$stem-setup.exe")
 # The ZIP contains the same verified installed files, allowing qualification
 # without replacing an installed executable (the app still shares its data root).
-Compress-Archive -Path "$installed/*" -DestinationPath (Join-Path $output "$stem.app.zip") -Force
+$archive = Join-Path $output "$stem.app.zip"
+if ($Backend -eq 'cuda') {
+  # Compress-Archive has a 2 GiB per-file limit; CUDA DLLs can exceed it.
+  if (Test-Path $archive) { Remove-Item $archive -Force }
+  Push-Location $installed
+  try {
+    & $sevenZip a -tzip -mx=5 $archive '.\*'
+    if ($LASTEXITCODE -ne 0) { throw 'CUDA Preview ZIP creation failed' }
+    & $sevenZip t $archive
+    if ($LASTEXITCODE -ne 0) { throw 'CUDA Preview ZIP integrity check failed' }
+  } finally { Pop-Location }
+} else {
+  Compress-Archive -Path "$installed/*" -DestinationPath $archive -Force
+}
 $payload = @(Get-ChildItem $installed -Recurse -File | Sort-Object FullName | ForEach-Object {
   @{ path = [IO.Path]::GetRelativePath($installed, $_.FullName).Replace('\', '/'); size = $_.Length; sha256 = (Get-FileHash $_.FullName).Hash.ToLowerInvariant() }
 })
@@ -138,7 +199,9 @@ $payload = @(Get-ChildItem $installed -Recurse -File | Sort-Object FullName | Fo
   repository = $env:GITHUB_REPOSITORY
   run_url = "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
   target = $Target
-  whisper_backend = 'cpu'
+  whisper_backend = $Backend
+  cargo_features = $features
+  cuda = $cuda
   signing = 'unsigned'
   updater_artifacts = $false
   installer_payload_verified = $true
@@ -151,13 +214,15 @@ $payload = @(Get-ChildItem $installed -Recurse -File | Sort-Object FullName | Fo
   "rustc: $(rustc --version)"
   "cargo: $(cargo --version)"
   "cmake: $((cmake --version | Select-Object -First 1))"
+  if ($Backend -eq 'cuda') { "nvcc: $($nvccVersion -join ' ')" }
 ) | Set-Content (Join-Path $output 'tool-versions.txt') -Encoding utf8
 Get-ChildItem $output -File | Where-Object Name -ne 'SHA256SUMS' | Sort-Object Name | ForEach-Object {
   "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant())  $($_.Name)"
 } | Set-Content (Join-Path $output 'SHA256SUMS') -Encoding ascii
 @(
   "Candidate commit: $env:BUILD_COMMIT"
-  'Unsigned x64 CPU NSIS installer and app ZIP; version 0.2.18 / com.meetily.ai.'
-  'Native synthetic regressions, silent installation, resource hashes and sidecar smoke tests passed.'
+  "Unsigned x64 $Backend NSIS installer and app ZIP; version 0.2.18 / com.meetily.ai."
+  'Silent installation, resource hashes and sidecar smoke tests passed.'
+  if ($Backend -eq 'cuda') { 'CUDA 13 import identity verified for sm_86. GPU startup/inference requires a physical NVIDIA machine.' }
   'Live Windows Discord/call detection still requires physical-machine qualification.'
 ) >> $env:GITHUB_STEP_SUMMARY

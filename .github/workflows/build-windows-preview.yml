@@ -19,10 +19,14 @@ env:
 
 jobs:
   build-windows:
-    name: Native regressions and unsigned Windows CPU candidate
+    name: Windows Preview (${{ matrix.backend }})
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository }}
     runs-on: windows-2022
     timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [cpu, cuda]
     defaults:
       run:
         shell: pwsh
@@ -62,7 +66,7 @@ jobs:
         uses: swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
         with:
           workspaces: ". -> target"
-          key: windows-preview-cpu-v1
+          key: windows-preview-${{ matrix.backend }}-v1
           cache-on-failure: true
 
       - name: Cache LLVM 18 and downloaded native resources
@@ -121,12 +125,41 @@ jobs:
           & (Join-Path $llvmBin 'clang.exe') --version
           if ($LASTEXITCODE -ne 0) { throw 'LLVM clang version check failed' }
 
+      - name: Install CUDA 13.0.2 compiler and runtime
+        if: matrix.backend == 'cuda'
+        timeout-minutes: 25
+        uses: Jimver/cuda-toolkit@b8bf9c6c28f8a92fbb04dcfcaee872e60c57462d # v0.2.36
+        with:
+          cuda: '13.0.2'
+          method: network
+          # CUDA 13 separates CRT/NVVM; Windows calls the CCCL package thrust.
+          # Install build/runtime components only, without a GPU driver.
+          sub-packages: '["nvcc", "crt", "nvvm", "cudart", "thrust", "cublas", "cublas_dev"]'
+          use-github-cache: false
+
+      - name: Configure CUDA for RTX 3080 Laptop
+        if: matrix.backend == 'cuda'
+        timeout-minutes: 2
+        run: |
+          if (!$env:CUDA_PATH) { throw 'CUDA_PATH missing after toolkit installation' }
+          & (Join-Path $env:CUDA_PATH 'bin/nvcc.exe') --version
+          if ($LASTEXITCODE -ne 0) { throw 'CUDA compiler check failed' }
+          "CUDA_TOOLKIT_ROOT_DIR=$env:CUDA_PATH" >> $env:GITHUB_ENV
+          'CMAKE_CUDA_ARCHITECTURES=86' >> $env:GITHUB_ENV
+          'CARGO_BUILD_JOBS=2' >> $env:GITHUB_ENV
+          'CMAKE_BUILD_PARALLEL_LEVEL=2' >> $env:GITHUB_ENV
+          'NVCC_APPEND_FLAGS=-std=c++17 -Xcompiler=/Zc:preprocessor -DCCCL_IGNORE_MSVC_TRADITIONAL_PREPROCESSOR_WARNING' >> $env:GITHUB_ENV
+          (Join-Path $env:CUDA_PATH 'bin/x64') >> $env:GITHUB_PATH
+
       - name: Install frontend dependencies
         working-directory: frontend
         run: pnpm install --frozen-lockfile
 
       - name: Test NSIS payload verification
         run: node --test frontend/scripts/verify-nsis-payload.test.mjs
+
+      - name: Test CUDA runtime dependency packaging
+        run: ./frontend/scripts/preview-cuda-runtime.test.ps1
 
       # Keep Next, tsc and native compilation sequential: Next owns frontend/out.
       - name: Build frontend
@@ -155,6 +188,9 @@ jobs:
           Copy-Item "target/$env:TARGET/release/llama-helper.exe" "frontend/src-tauri/binaries/llama-helper-$env:TARGET.exe"
 
       - name: Run native Windows Codex CLI and meeting detection regressions
+        # Hosted runners have no NVIDIA driver/device. The CPU matrix job runs
+        # these platform regressions; CUDA qualification below checks its payload.
+        if: matrix.backend == 'cpu'
         working-directory: frontend/src-tauri
         run: |
           # Target only synthetic regressions; hosted runners cannot qualify live WASAPI calls.
@@ -164,18 +200,19 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw "Native regression failed: $filter" }
           }
 
-      - name: Build and verify unsigned CPU Preview installer
+      - name: Build and verify unsigned Preview installer
         env:
           BUILD_COMMIT: ${{ steps.candidate.outputs.commit }}
+          PREVIEW_BACKEND: ${{ matrix.backend }}
         run: |
-          ./frontend/scripts/build-preview-windows.ps1
+          ./frontend/scripts/build-preview-windows.ps1 -Backend $env:PREVIEW_BACKEND
           git diff --exit-code -- Cargo.lock frontend/pnpm-lock.yaml frontend/src-tauri/tauri.conf.json
           if ($LASTEXITCODE -ne 0) { throw 'Preview changed version/configuration or lockfiles' }
 
       - name: Upload candidate artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: meetily-preview-fixes-${{ steps.candidate.outputs.commit }}-windows-x64-cpu
+          name: meetily-preview-fixes-${{ steps.candidate.outputs.commit }}-windows-x64-${{ matrix.backend }}
           path: |
             dist/windows-preview/*
           if-no-files-found: error

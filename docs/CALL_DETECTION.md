@@ -98,3 +98,23 @@ Local bootstrap use requires 7-Zip on PATH or in Program Files/7-Zip.
 The unsigned NSIS payload check accounts for Tauri's first `UNK` → `NSS` bundle
 marker patch, then compares the entire executable byte for byte. All other
 differences fail verification; resource and sidecar hashes remain exact checks.
+
+Windows Preview now builds independent CPU and CUDA matrix jobs, with separate
+Rust caches and artifacts. CUDA targets the requested RTX 3080 Laptop (`sm_86`)
+using pinned CUDA 13.0.2 compiler/runtime components, without installing a driver.
+The Preview packager stages CUDA runtime DLLs from that toolkit, follows their
+PE dependency graph, rejects unresolved dependencies, and includes the toolkit
+license. `nvcuda.dll` remains owned by the user's NVIDIA driver. The CUDA app ZIP
+uses 7-Zip to support large CUDA DLLs. Installed executable imports must establish
+CUDA/cuBLAS linkage; installed resources retain byte-for-byte hash checks.
+Dependency fixtures cover transitive imports, cycles, missing DLLs/license,
+system/driver exclusions and the CUDA 13 `bin/x64` layout.
+
+Hosted runners can verify compilation, NSIS installation and CPU sidecars, but
+cannot establish GPU startup, inference speed or real-call performance. Metadata
+explicitly records this limitation. CPU native regressions run in the CPU job;
+the CUDA job does not execute the CUDA-linked app on a runner without a GPU.
+The CUDA backend accelerates **Whisper**. **Parakeet** has a separate Settings >
+Labs > Parakeet on the GPU switch using DirectML for its encoder; enabling CUDA
+does not change that preference. Test the CUDA Preview on the physical laptop
+with a CUDA 13-compatible NVIDIA driver before treating acceleration as qualified.

@@ -46,8 +46,11 @@ model override from `~/.codex/config.toml`.
   `item.error` warnings and `todo_list` plan metadata are ignored, as are reasoning
   items. Command/file/MCP/collaboration/search items are rejected in all three
   lifecycle phases (`started`, `updated`, `completed`); unknown items fail with
-  an unsupported-item error. Top-level `error`, failed/partial/empty output still
-  fail. Raw diagnostics and meeting text are never included in these errors.
+  an unsupported-item error. Top-level `error` is deferred: Codex also uses it
+  for stream retries. Only a later `turn.completed`, successful process exit,
+  and nonempty answer establish recovery. `turn.failed`, an unrecovered or
+  trailing error, and partial/empty output still fail. Raw diagnostics and
+  meeting text are never included in these errors.
 - Each subprocess has a bounded deadline (20 seconds for an individual probe,
   300 seconds for generation). Pipe input/output and child exit are awaited
   concurrently, including large prompts. Cancellation/timeout also covers open
@@ -93,9 +96,10 @@ reproduces their error without any tool call or paid inference.
 
 The upstream
 [exec event schema](https://github.com/openai/codex/blob/67727e7cf114cf3e1b71db368d74b24e32f6cb12/codex-rs/exec/src/exec_events.rs)
-defines item-level `error` as non-fatal and the top-level `error` as fatal. The
-parser now respects that distinction and allows plan metadata, while retaining
-execution-tool rejection and completion checks. The deprecated memory alias was
+defines item-level `error` as non-fatal and describes the top-level `error` as
+fatal. Actual CLI behavior also uses top-level errors for recoverable retries
+(see below). The parser allows plan metadata while retaining execution-tool
+rejection and completion checks. The deprecated memory alias was
 removed; `features.memories=false` remains. The working reference's additional
 feature/skill disabling settings and parent-session cleanup were adopted. The
 same local endpoint observed four advertised tools before these settings
@@ -108,6 +112,18 @@ deadline; those differences are not part of this parser/configuration fix.
 The ChatGPT-only login gate, isolated working directory, stdin transport and
 existing bounded I/O/cancellation contract are retained. Installed macOS and
 real-account summary qualification remain separate from the fixture result.
+
+### Recovered stream errors
+
+A Windows user with Codex 0.159.2 reported a successful ChatGPT status check and
+working interactive CLI, but both Meetily summaries and Test AI call failed with
+the generic response-completion error. A local fixture using the actual Codex
+0.159.0-alpha.3 reproduced that exact error: the first Responses stream closes
+before completion, Codex emits a top-level `error`, retries, receives a valid
+answer and `turn.completed`, and exits successfully. The old parser rejected
+the earlier retry event. It now waits for the final outcome as described above.
+This establishes a real integration defect; the user's exact failure remains
+unconfirmed until the updated Preview is tested.
 
 ## Verification
 
@@ -127,7 +143,7 @@ pnpm dlx bun@1.3.10 test tests/hooks/summary-recovery.test.tsx
 
 The core module also compiles independently of Tauri using a portable Cargo test
 harness that imports `codex_cli/codex_cli.rs` directly with Tokio, tokio-util,
-serde, serde_json and tempfile. Its ten default tests passed on Linux, including
+serde, serde_json and tempfile. Its eleven default tests passed on Linux, including
 non-fatal warnings, plan metadata, execution items in every lifecycle phase,
 unknown-item failure and session isolation. Frontend tests
 passed for readiness, clearing a saved path, stale responses and both summary
@@ -139,7 +155,9 @@ localhost Responses endpoint, using the production generation arguments with
 only provider routing replaced. It clears the child environment, uses an empty
 HOME/CODEX_HOME, checks that no Authorization header was sent, requires an empty
 tool catalog, and parses the synthetic final answer through the production
-parser. It passed on Linux with `/opt/codex/bin/codex` version `0.159.0-alpha.3`.
+parser. A second ignored test deliberately interrupts the first stream and
+requires an actual retry error followed by a successful answer. Both fixtures
+use the same isolated local endpoint and no real account.
 Run it explicitly with the native build prerequisites or the portable harness:
 
 ```sh

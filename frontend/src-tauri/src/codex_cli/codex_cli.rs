@@ -266,18 +266,27 @@ pub async fn probe(configured: Option<&str>) -> CodexCliStatus {
 fn parse_response(output: &str) -> Result<String, String> {
     let mut response = None;
     let mut complete = false;
+    let mut pending_error = false;
+    const FAILED_RESPONSE: &str = "Codex CLI could not complete the response. Check your ChatGPT login, usage limits and connection.";
     for line in output.lines().filter(|s| !s.trim().is_empty()) {
         let event: serde_json::Value =
             serde_json::from_str(line).map_err(|_| "Codex CLI returned invalid JSON events")?;
         match event["type"].as_str() {
-            Some("turn.completed") => complete = true,
-            Some("turn.failed" | "error") => return Err("Codex CLI could not complete the response. Check your ChatGPT login, usage limits and connection.".into()),
+            Some("turn.completed") => {
+                complete = true;
+                pending_error = false;
+            }
+            Some("turn.failed") => return Err(FAILED_RESPONSE.into()),
+            // Codex also emits top-level errors for retriable stream failures,
+            // without serializing will_retry. A later completed turn (and the
+            // successful process exit checked by generate) establishes recovery.
+            Some("error") => pending_error = true,
             Some("item.completed") if event["item"]["type"] == "agent_message" => {
                 response = event["item"]["text"].as_str().map(str::to_owned);
             }
             Some("item.started" | "item.updated" | "item.completed") => {
                 // Codex's item.error is a non-fatal diagnostic (including config
-                // deprecations), unlike the fatal top-level error above. Plan
+                // deprecations), independently of turn success. Plan
                 // metadata also does not establish that an execution tool ran.
                 // Keep unknown items fail-closed without misreporting tool use.
                 match event["item"]["type"].as_str() {
@@ -290,6 +299,9 @@ fn parse_response(output: &str) -> Result<String, String> {
             }
             _ => {}
         }
+    }
+    if pending_error {
+        return Err(FAILED_RESPONSE.into());
     }
     if !complete {
         return Err("Codex CLI response ended before completion".into());
