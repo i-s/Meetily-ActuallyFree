@@ -49,10 +49,31 @@ if ($Phase -eq 'Verify') {
   exit 0
 }
 
-Write-Host "[$([DateTime]::UtcNow.ToString('o'))] Extracting LLVM with $((Get-Command tar).Source)"
-tar -xf $archive -C $ToolRoot
-if ($LASTEXITCODE -ne 0 -or -not (Test-Path $libclang)) {
-  throw "Failed to extract portable LLVM 18"
+$sevenZip = Get-Command 7z -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source -First 1
+if (!$sevenZip -and $env:ProgramFiles) {
+  $candidate = Join-Path $env:ProgramFiles '7-Zip/7z.exe'
+  if (Test-Path $candidate) { $sevenZip = $candidate }
+}
+if (!$sevenZip) { throw 'LLVM extraction requires 7-Zip (7z on PATH or Program Files/7-Zip/7z.exe)' }
+
+# Windows' bundled tar stalled on this verified XZ archive in CI. Use 7-Zip
+# for both layers; do not pipe binary TAR data through PowerShell's text pipeline.
+$scratch = Join-Path $ToolRoot ('.llvm-extract-' + [Guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $scratch | Out-Null
+try {
+  Write-Host "[$([DateTime]::UtcNow.ToString('o'))] Decompressing XZ with $sevenZip"
+  & $sevenZip x $archive "-o$scratch" -y -bsp0 | Out-Host
+  if ($LASTEXITCODE -ne 0) { throw 'Failed to decompress LLVM XZ archive' }
+  $tarFiles = @(Get-ChildItem $scratch -Filter '*.tar' -File)
+  if ($tarFiles.Count -ne 1) { throw 'Expected exactly one TAR inside LLVM XZ archive' }
+  Write-Host "[$([DateTime]::UtcNow.ToString('o'))] XZ complete; extracting TAR ($($tarFiles[0].Length) bytes)"
+  & $sevenZip x $tarFiles[0].FullName "-o$ToolRoot" -y -bsp0 | Out-Host
+  if ($LASTEXITCODE -ne 0 -or -not (Test-Path $libclang)) {
+    throw 'Failed to extract LLVM TAR payload'
+  }
+} finally {
+  # Only this invocation's intermediate TAR; keep the verified source archive.
+  Remove-Item $scratch -Recurse -Force
 }
 
 Write-Host "LLVM 18 ready in $($timer.Elapsed.TotalSeconds.ToString('F1')) seconds: $llvm"

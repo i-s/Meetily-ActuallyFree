@@ -91,3 +91,7 @@ are 5, 15, 5, 15 and 2 minutes respectively. The shared LLVM bootstrap defaults
 to the complete local setup; CI uses its individual phases with timestamped
 diagnostics. Extraction rechecks the pinned hash before unpacking. A cached LLVM
 installation skips archive work but still runs the libclang/version check.
+LLVM extraction uses 7-Zip for both XZ and TAR layers because Windows' bundled
+tar timed out on the checksum-verified archive. Each layer logs its boundary;
+the temporary uncompressed TAR is removed after extraction (including errors).
+Local bootstrap use requires 7-Zip on PATH or in Program Files/7-Zip.
