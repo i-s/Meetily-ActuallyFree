@@ -12,6 +12,8 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Hint } from '@/components/ui/tooltip';
 import { NotesEditor, type NotesContent } from '@/components/editor/NotesEditor';
 import { ChatThread } from '@/components/chat/ChatThread';
+import { useAskAiLanguage } from '@/hooks/useAskAiLanguage';
+import { askAiCopy } from '@/lib/ask-ai-language';
 import { useUserName } from '@/hooks/useUserName';
 import { displaySpeaker, isUserSpeaker, speakerDot, speakerKey } from '@/utils/speakerUtils';
 import { buildLiveContext, lineAt, type LiveLine } from '@/lib/live-context';
@@ -163,6 +165,8 @@ export function LivePanel({
   onJumpTo: (lineId: string) => void;
 }) {
   const userName = useUserName();
+  const { language, ready } = useAskAiLanguage(undefined, lines);
+  const copy = askAiCopy(language);
   const linesRef = useRef(lines);
   linesRef.current = lines;
 
@@ -184,10 +188,10 @@ export function LivePanel({
       ]
         .filter(Boolean)
         .join('\n\n');
-      if (!context.trim()) throw new Error('Nothing has been said yet. Ask again once the transcript has some lines.');
-      return invoke<string>('ask_live_assistant', { question, transcriptContext: context, persona: guidance });
+      if (!context.trim()) throw new Error(copy.noTranscript);
+      return invoke<string>('ask_live_assistant', { question, transcriptContext: context, persona: guidance, answerLanguage: language });
     },
-    [userName],
+    [userName, language, copy],
   );
 
   return (
@@ -205,7 +209,7 @@ export function LivePanel({
           </TabsTrigger>
           <TabsTrigger value="ask">
             <Sparkles />
-            Ask AI
+            {copy.tab}
           </TabsTrigger>
         </TabsList>
       </div>
@@ -221,11 +225,9 @@ export function LivePanel({
           historyKey={`live:${sessionKey}`}
           ask={ask}
           compact
-          emptyTitle="Ask about this call"
-          emptyHint="Answers come from what has been said so far and your notes."
-          suggestions={['What did I miss in the last 5 minutes?', 'What has been decided?', 'Which action items came up?', 'What questions are still open?']}
-          placeholder="Ask about the call…"
-          footnote="Uses your summary model. Cloud providers receive the parts of the transcript needed to answer."
+          language={language}
+          disabled={!ready}
+          {...copy.live}
           onSeek={(seconds) => {
             const target = lineAt(linesRef.current, seconds);
             if (target) onJumpTo(target.id);

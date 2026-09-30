@@ -106,6 +106,9 @@ pub struct Setting {
     #[sqlx(rename = "claudeCliPath")]
     #[serde(rename = "claudeCliPath")]
     pub claude_cli_path: Option<String>,
+    #[sqlx(rename = "codexCliPath")]
+    #[serde(rename = "codexCliPath")]
+    pub codex_cli_path: Option<String>,
 }
 
 impl Setting {

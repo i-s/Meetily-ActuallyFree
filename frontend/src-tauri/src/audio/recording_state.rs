@@ -127,6 +127,7 @@ pub struct RecordingState {
 
     // Recording start time for accurate timestamps
     recording_start: Mutex<Option<Instant>>,
+    recording_end: Mutex<Option<Instant>>,
     // Pause time tracking
     pause_start: Mutex<Option<Instant>>,
     total_pause_duration: Mutex<std::time::Duration>,
@@ -154,6 +155,7 @@ impl RecordingState {
             error_callback: Mutex::new(None),
             stats: Mutex::new(RecordingStats::default()),
             recording_start: Mutex::new(None),
+            recording_end: Mutex::new(None),
             pause_start: Mutex::new(None),
             total_pause_duration: Mutex::new(std::time::Duration::ZERO),
             capture_setup_complete: AtomicBool::new(false),
@@ -168,6 +170,7 @@ impl RecordingState {
         self.microphone_muted.store(false, Ordering::SeqCst);
         self.system_audio_muted.store(false, Ordering::SeqCst);
         *self.recording_start.lock().unwrap() = Some(Instant::now());
+        *self.recording_end.lock().unwrap() = None;
         self.error_count.store(0, Ordering::SeqCst);
         self.recoverable_error_count.store(0, Ordering::SeqCst);
         *self.last_error.lock().unwrap() = None;
@@ -199,7 +202,13 @@ impl RecordingState {
     }
 
     pub fn stop_recording(&self) {
+        // Freeze capture time before asynchronous drain/model/file work. Repeated
+        // stop/cleanup calls must not extend a completed recording.
+        let end = *self.recording_end.lock().unwrap().get_or_insert_with(Instant::now);
         self.is_recording.store(false, Ordering::SeqCst);
+        if let Some(paused_at) = self.pause_start.lock().unwrap().take() {
+            *self.total_pause_duration.lock().unwrap() += end.saturating_duration_since(paused_at);
+        }
         self.is_paused.store(false, Ordering::SeqCst);
         self.microphone_muted.store(false, Ordering::SeqCst);
         self.system_audio_muted.store(false, Ordering::SeqCst);
@@ -425,12 +434,14 @@ impl RecordingState {
         self.recording_start
             .lock()
             .unwrap()
-            .map(|start| start.elapsed().as_secs_f64())
+            .map(|start| self.recording_end.lock().unwrap().unwrap_or_else(Instant::now)
+                .saturating_duration_since(start).as_secs_f64())
     }
 
     pub fn get_active_recording_duration(&self) -> Option<f64> {
         self.recording_start.lock().unwrap().map(|start| {
-            let total_duration = start.elapsed().as_secs_f64();
+            let total_duration = self.recording_end.lock().unwrap().unwrap_or_else(Instant::now)
+                .saturating_duration_since(start).as_secs_f64();
             let pause_duration = self.get_total_pause_duration();
             let current_pause = if self.is_paused() {
                 self.pause_start
@@ -454,7 +465,8 @@ impl RecordingState {
             self.pause_start
                 .lock()
                 .unwrap()
-                .map(|start| start.elapsed().as_secs_f64())
+                .map(|start| self.recording_end.lock().unwrap().unwrap_or_else(Instant::now)
+                .saturating_duration_since(start).as_secs_f64())
         } else {
             None
         }
@@ -477,6 +489,7 @@ impl RecordingState {
         *self.error_callback.lock().unwrap() = None;
         *self.stats.lock().unwrap() = RecordingStats::default();
         *self.recording_start.lock().unwrap() = None;
+        *self.recording_end.lock().unwrap() = None;
         *self.pause_start.lock().unwrap() = None;
         *self.total_pause_duration.lock().unwrap() = std::time::Duration::ZERO;
         self.error_count.store(0, Ordering::SeqCst);
@@ -506,6 +519,7 @@ impl Default for RecordingState {
             error_callback: Mutex::new(None),
             stats: Mutex::new(RecordingStats::default()),
             recording_start: Mutex::new(None),
+            recording_end: Mutex::new(None),
             pause_start: Mutex::new(None),
             total_pause_duration: Mutex::new(std::time::Duration::ZERO),
             capture_setup_complete: AtomicBool::new(false),
@@ -523,5 +537,49 @@ impl Clone for RecordingStats {
             total_duration: self.total_duration,
             last_activity: self.last_activity,
         }
+    }
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+
+    #[test]
+    fn stopped_duration_is_frozen_while_final_audio_is_saved() {
+        let state = RecordingState::new();
+        state.start_recording().unwrap();
+        state.stop_recording();
+        let duration = state.get_active_recording_duration().unwrap();
+        assert_eq!(state.get_active_recording_duration(), Some(duration));
+        state.stop_recording();
+        assert_eq!(state.get_active_recording_duration(), Some(duration));
+    }
+
+    #[test]
+    fn stop_while_paused_keeps_pause_out_of_saved_duration() {
+        let state = RecordingState::new();
+        state.start_recording().unwrap();
+        let now = Instant::now();
+        *state.recording_start.lock().unwrap() = Some(now - std::time::Duration::from_secs(10));
+        state.pause_recording().unwrap();
+        *state.pause_start.lock().unwrap() = Some(now - std::time::Duration::from_secs(5));
+        state.stop_recording();
+        assert!((state.get_active_recording_duration().unwrap() - 5.0).abs() < 0.1);
+        assert!((state.get_total_pause_duration() - 5.0).abs() < 0.1);
+    }
+
+    #[tokio::test]
+    async fn stopped_input_drains_queued_tail_before_eof() {
+        let state = RecordingState::new();
+        state.start_recording().unwrap();
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        state.set_audio_sender(sender);
+        state.send_audio_chunk(AudioChunk {
+            data: vec![0.125, 0.5], sample_rate: 48_000, timestamp: 2.0,
+            chunk_id: 1, device_type: DeviceType::System,
+        }).unwrap();
+        state.stop_recording();
+        assert_eq!(receiver.recv().await.unwrap().data, [0.125, 0.5]);
+        assert!(receiver.recv().await.is_none());
     }
 }

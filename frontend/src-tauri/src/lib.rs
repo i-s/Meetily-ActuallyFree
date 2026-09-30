@@ -38,6 +38,7 @@ pub mod api;
 pub mod app_update;
 pub mod audio;
 pub mod claude_cli;
+pub mod codex_cli;
 pub mod config;
 pub mod console_utils;
 pub mod crash_report;
@@ -764,6 +765,10 @@ pub fn run() {
             console_utils::show_console,
             console_utils::hide_console,
             console_utils::toggle_console,
+            codex_cli::commands::codex_cli_get_status,
+            codex_cli::commands::codex_cli_get_path,
+            codex_cli::commands::codex_cli_save_path,
+            codex_cli::commands::codex_cli_test_connection,
             claude_cli::commands::claude_cli_get_status,
             claude_cli::commands::claude_cli_list_models,
             claude_cli::commands::claude_cli_get_path,

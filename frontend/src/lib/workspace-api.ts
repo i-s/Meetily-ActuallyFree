@@ -250,8 +250,8 @@ export interface AskTurn {
   answer: string;
 }
 
-export const askMeeting = (meetingId: string, question: string, history: AskTurn[] = []) =>
-  invoke<string>('api_ask_meeting', { meetingId, question, history });
+export const askMeeting = (meetingId: string, question: string, history: AskTurn[] = [], answerLanguage?: string) =>
+  invoke<string>('api_ask_meeting', { meetingId, question, history, answerLanguage });
 
 // ---- Cross-view refresh ---------------------------------------------------------
 

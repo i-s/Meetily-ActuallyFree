@@ -1,4 +1,4 @@
-name: "Build - macOS system audio idle fix"
+name: "Build - macOS Preview fixes"
 
 on:
   pull_request:
@@ -132,14 +132,33 @@ jobs:
         working-directory: frontend
         run: pnpm dlx bun@1.3.10 test ./tests/audio-levels/lifecycle.test.tsx
 
-      - name: Run native macOS audio regressions
+      - name: Test Ask AI language and Codex CLI integration
+        working-directory: frontend
+        shell: bash
+        run: |
+          set -euo pipefail
+          while IFS= read -r -d '' test_file; do
+            pnpm dlx bun@1.3.10 test "$test_file"
+          done < <(find tests/chat tests/codex-cli -type f \( -name '*.test.ts' -o -name '*.test.tsx' \) -print0 | sort -z)
+          pnpm dlx bun@1.3.10 test tests/hooks/recording-shutdown.test.tsx
+          pnpm dlx bun@1.3.10 test tests/hooks/summary-recovery.test.tsx
+
+      - name: Run native macOS audio and AI regressions
         working-directory: frontend/src-tauri
         shell: bash
         run: |
           set -euo pipefail
           test "$(uname -m)" = arm64
           # build/ffmpeg.rs prepares the FFmpeg sidecar during the native build.
-          for filter in audio::stream core_audio audio::permissions audio::pipeline; do
+          # Exercise that exact sidecar in the real PCM encode/decode regression.
+          mkdir -p "$RUNNER_TEMP/meetily-test-sidecars"
+          ln -sf "$PWD/binaries/ffmpeg-$TARGET" "$RUNNER_TEMP/meetily-test-sidecars/ffmpeg"
+          export PATH="$RUNNER_TEMP/meetily-test-sidecars:$PATH"
+          for filter in audio::stream core_audio audio::permissions audio::pipeline audio::recording_state audio::encode audio::recording_saver codex_cli live_assistant::answer_language_tests; do
+            if [[ "$filter" = audio::encode ]]; then
+              test -x "$PWD/binaries/ffmpeg-$TARGET"
+              test "$(command -v ffmpeg)" = "$RUNNER_TEMP/meetily-test-sidecars/ffmpeg"
+            fi
             cargo test --locked -p meetily --lib --target "$TARGET" "$filter" -- --nocapture
           done
 
@@ -274,7 +293,7 @@ jobs:
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$INFO_PLIST")" = "$VERSION"
 
           mkdir -p dist
-          ARTIFACT_STEM="Meetily-Actually-Free_${VERSION}_idle-fix_${BUILD_COMMIT:0:12}_aarch64"
+          ARTIFACT_STEM="Meetily-Actually-Free_${VERSION}_preview-fixes_${BUILD_COMMIT:0:12}_aarch64"
           cp "$DMG_PATH" "dist/$ARTIFACT_STEM.dmg"
           # ditto preserves the .app directory, symlinks, executable bits and resources.
           ditto -c -k --sequesterRsrc --keepParent "$APP_PATH" "dist/$ARTIFACT_STEM.app.zip"
@@ -340,7 +359,7 @@ jobs:
       - name: Upload candidate artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: meetily-idle-fix-${{ steps.candidate.outputs.commit }}-macos-aarch64
+          name: meetily-preview-fixes-${{ steps.candidate.outputs.commit }}-macos-aarch64
           path: |
             dist/*.dmg
             dist/*.app.zip

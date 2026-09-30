@@ -402,7 +402,9 @@ impl RecordingSaver {
             *is_saving = false;
         }
         if let Some(handle) = self.accumulation_handle.take() {
+            info!("[recording-stop] saver_drain_start");
             handle.await.map_err(|e| format!("Recording saver task failed: {e}"))?;
+            info!("[recording-stop] saver_drain_complete");
         }
 
         // Check if incremental saver exists (indicates auto_save was enabled)
@@ -432,6 +434,7 @@ impl RecordingSaver {
                     Ok(None)
                 };
             };
+            info!("[recording-stop] track_finalize_start track={label}");
             let mut guard = saver_arc.lock().await;
             match guard.finalize().await {
                 Ok(path) => {
@@ -591,5 +594,52 @@ mod tests {
         saver.set_meeting_name(Some("Test meeting".to_string()));
 
         assert!(saver.start_accumulation(true).is_err());
+    }
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+    use super::super::recording_state::DeviceType;
+
+    #[tokio::test]
+    async fn saver_drains_thirty_five_seconds_and_finalizes_all_three_tracks() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut saver = RecordingSaver::new();
+        saver.set_recordings_folder(directory.path().to_path_buf());
+        saver.set_meeting_name(Some("Synthetic shutdown".into()));
+        let sender = saver.start_accumulation(true).unwrap();
+        for index in 0..70 {
+            let samples: Vec<f32> = (0..24_000).map(|i| {
+                0.2 * (i as f32 * 440.0 * std::f32::consts::TAU / 48_000.0).sin()
+            }).collect();
+            for device_type in [DeviceType::Microphone, DeviceType::System, DeviceType::Mixed] {
+                sender.send(AudioChunk {
+                    data: samples.clone(), sample_rate: 48_000, timestamp: (index + 1) as f64 / 2.0,
+                    chunk_id: index, device_type,
+                }).unwrap();
+            }
+        }
+        drop(sender);
+        // Same owner/wait as stop_and_save: queued audio must drain before any
+        // track lock is acquired for the final partial checkpoint.
+        saver.accumulation_handle.take().unwrap().await.unwrap();
+        for track in [&saver.mic_saver, &saver.system_saver, &saver.mixed_saver] {
+            let mut track = track.as_ref().unwrap().lock().await;
+            assert_eq!(track.get_checkpoint_count(), 1, "30-second checkpoint must complete");
+            let output = track.finalize().await.unwrap();
+            let decoded = std::process::Command::new(super::super::ffmpeg::find_ffmpeg_path().unwrap())
+                .args(["-v", "error", "-i"]).arg(&output)
+                .args(["-f", "f32le", "-ac", "1", "-ar", "48000", "pipe:1"])
+                .output().unwrap();
+            assert!(decoded.status.success());
+            let count = decoded.stdout.len() / 4;
+            // Concat retains AAC framing from both separately encoded
+            // checkpoints (priming plus final-frame padding, <=2 frames each).
+            assert!((35 * 48_000..=35 * 48_000 + 4 * 1024).contains(&count), "track lost audio: {count} samples");
+            let energy: f32 = decoded.stdout[(35 * 48_000 - 4800) * 4..35 * 48_000 * 4]
+                .chunks_exact(4).map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()).powi(2)).sum();
+            assert!((energy / 4800.0).sqrt() > 0.1, "final five-second checkpoint must retain its tail");
+        }
     }
 }

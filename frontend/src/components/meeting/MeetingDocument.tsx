@@ -36,6 +36,8 @@ import { VisuallyHidden } from '@/components/ui/visually-hidden';
 import { NotesEditor, type NotesContent } from '@/components/editor/NotesEditor';
 import { ActionItemsList } from '@/components/actions/ActionItemsList';
 import { ChatThread } from '@/components/chat/ChatThread';
+import { useAskAiLanguage } from '@/hooks/useAskAiLanguage';
+import { askAiCopy } from '@/lib/ask-ai-language';
 import { LanguagePickerPopover } from '@/components/LanguagePickerPopover';
 import { ModelSettingsModal, type ModelConfig } from '@/components/ModelSettingsModal';
 import { useAutosave, saveStateLabel, type SaveState } from '@/hooks/useAutosave';
@@ -103,6 +105,8 @@ function SaveIndicator({ state }: { state: SaveState }) {
 
 export function MeetingDocument(props: MeetingDocumentProps) {
   const [tab, setTab] = useState<'notes' | 'ask'>('notes');
+  const { language, ready } = useAskAiLanguage(props.meetingId, props.transcript);
+  const copy = askAiCopy(language);
   return (
     <Tabs value={tab} onValueChange={(value) => setTab(value as 'notes' | 'ask')} className="flex h-full min-h-0 flex-col">
       <div className="flex h-12 shrink-0 items-center justify-between gap-3 border-b border-af-border px-4">
@@ -113,7 +117,7 @@ export function MeetingDocument(props: MeetingDocumentProps) {
           </TabsTrigger>
           <TabsTrigger value="ask" className="text-xs">
             <Sparkles className="!size-3.5" />
-            Ask AI
+            {copy.tab}
           </TabsTrigger>
         </TabsList>
       </div>
@@ -123,12 +127,10 @@ export function MeetingDocument(props: MeetingDocumentProps) {
       <TabsContent value="ask" className="mt-0 min-h-0 flex-1 data-[state=inactive]:hidden" forceMount>
         <ChatThread
           historyKey={`meeting:${props.meetingId}`}
-          ask={(question, history) => askMeeting(props.meetingId, question, history)}
-          suggestions={['What was decided?', 'Who owns what?', 'What questions are still open?', 'Summarize the last ten minutes']}
-          placeholder="Ask about this meeting…"
-          emptyTitle="Ask about this meeting"
-          emptyHint="Answers use the whole transcript, your notes, the summary, and the action items, with links to the moment."
-          footnote="Uses your configured AI model. Cloud providers receive the parts of this meeting needed to answer."
+          ask={(question, history) => askMeeting(props.meetingId, question, history, language)}
+          language={language}
+          disabled={!ready}
+          {...copy.meeting}
           onSeek={props.onSeek}
         />
       </TabsContent>

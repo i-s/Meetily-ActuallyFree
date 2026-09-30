@@ -28,6 +28,8 @@ import {
   CommandList,
 } from '@/components/ui/command';
 import { cn, isOllamaNotInstalledError } from '@/lib/utils';
+import { CodexCliSettings } from '@/components/CodexCliSettings';
+import { CODEX_CLI_MODELS, CodexCliStatus, getCodexCliPath, isCodexCliReady } from '@/lib/codex-cli';
 import { ClaudeCliSettings } from '@/components/ClaudeCliSettings';
 import {
   CLAUDE_CLI_DEFAULT_MODEL,
@@ -41,7 +43,7 @@ import { toast } from 'sonner';
 import { claudeOutputBudget, parseClaudeOutputTokens } from '@/lib/claude-output-tokens';
 
 export interface ModelConfig {
-  provider: 'ollama' | 'groq' | 'claude' | 'claude-cli' | 'openai' | 'openrouter' | 'builtin-ai' | 'custom-openai';
+  provider: 'ollama' | 'groq' | 'claude' | 'claude-cli' | 'codex-cli' | 'openai' | 'openrouter' | 'builtin-ai' | 'custom-openai';
   model: string;
   whisperModel: string;
   apiKey?: string | null;
@@ -50,6 +52,7 @@ export interface ModelConfig {
   summaryMaxTokens?: number | null;
   // Claude Code CLI fields (only meaningful when provider is 'claude-cli')
   claudeCliPath?: string | null;
+  codexCliPath?: string | null;
   // Custom OpenAI fields
   customOpenAIEndpoint?: string | null;
   customOpenAIModel?: string | null;
@@ -173,10 +176,14 @@ export function ModelSettingsModal({
   const [summaryMaxTokens, setSummaryMaxTokens] = useState<string>(
     modelConfig.summaryMaxTokens?.toString() || ''
   );
+  const [codexCliPath, setCodexCliPath] = useState(modelConfig.codexCliPath || '');
+  const [codexCliStatus, setCodexCliStatus] = useState<CodexCliStatus | null>(null);
   // Claude Code CLI state
   const [claudeCliPath, setClaudeCliPath] = useState<string>(modelConfig.claudeCliPath || '');
   const [claudeCliModels, setClaudeCliModels] = useState<string[]>(CLAUDE_CLI_FALLBACK_MODELS);
   const [claudeCliStatus, setClaudeCliStatus] = useState<ClaudeCliStatus | null>(null);
+
+  useEffect(() => { setCodexCliPath(modelConfig.codexCliPath || ''); }, [modelConfig.codexCliPath]);
 
   // Combobox state
   const [modelComboboxOpen, setModelComboboxOpen] = useState<boolean>(false);
@@ -250,6 +257,7 @@ export function ModelSettingsModal({
     ollama: models.map((model) => model.name),
     claude: claudeModels.length > 0 ? claudeModels : CLAUDE_FALLBACK_MODELS,
     'claude-cli': claudeCliModels,
+    'codex-cli': CODEX_CLI_MODELS,
     groq: groqModels.length > 0 ? groqModels : GROQ_FALLBACK_MODELS,
     openai: openaiModels.length > 0 ? openaiModels : OPENAI_FALLBACK_MODELS,
     openrouter: openRouterModels.map((m) => m.id),
@@ -282,7 +290,7 @@ export function ModelSettingsModal({
     (requiresApiKey && (!apiKey || (typeof apiKey === 'string' && !apiKey.trim()))) ||
     (modelConfig.provider === 'ollama' && ollamaEndpointChanged) ||
     isCustomOpenAIInvalid ||
-    isClaudeCliInvalid;
+    isClaudeCliInvalid || (modelConfig.provider === 'codex-cli' && !isCodexCliReady(codexCliStatus));
 
   useEffect(() => {
     const fetchModelConfig = async () => {
@@ -298,7 +306,7 @@ export function ModelSettingsModal({
           setModelConfig(data);
 
           // Fetch API key if not included in response and provider requires it
-          if (data.provider !== 'ollama' && data.provider !== 'claude-cli' && !data.apiKey) {
+          if (data.provider !== 'ollama' && data.provider !== 'claude-cli' && data.provider !== 'codex-cli' && !data.apiKey) {
             try {
               const apiKeyData = await invoke('api_get_api_key', {
                 provider: data.provider
@@ -317,6 +325,7 @@ export function ModelSettingsModal({
           }
           hasLoadedInitialConfig.current = true; // Mark that initial config is loaded
 
+          setCodexCliPath(data.codexCliPath || '');
           // Sync the Claude Code CLI path when that provider is already active
           if (data.provider === 'claude-cli') {
             setClaudeCliPath(data.claudeCliPath || '');
@@ -714,6 +723,7 @@ export function ModelSettingsModal({
       claudeCliPath: modelConfig.provider === 'claude-cli'
         ? (claudeCliPath.trim() || null)
         : (modelConfig.claudeCliPath || null),
+      codexCliPath: modelConfig.provider === 'codex-cli' ? (codexCliPath.trim() || null) : (modelConfig.codexCliPath || null),
       // Include custom OpenAI fields
       customOpenAIEndpoint: modelConfig.provider === 'custom-openai' ? customOpenAIEndpoint.trim() : null,
       customOpenAIModel: modelConfig.provider === 'custom-openai' ? customOpenAIModel.trim() : null,
@@ -923,6 +933,11 @@ export function ModelSettingsModal({
                   loadBuiltinAiModels();
                 }
 
+                if (provider === 'codex-cli') {
+                  setCodexCliStatus(null);
+                  getCodexCliPath().then(saved => setCodexCliPath(saved || '')).catch(err => console.error('Failed to load Codex CLI path:', err));
+                }
+
                 // Load the saved CLI path when the Claude Code CLI is selected.
                 // ClaudeCliSettings probes for the executable once it mounts.
                 if (provider === 'claude-cli') {
@@ -958,6 +973,7 @@ export function ModelSettingsModal({
                 <SelectItem value="builtin-ai">Built-in AI (Offline, No API needed)</SelectItem>
                 <SelectItem value="claude">Claude (API key)</SelectItem>
                 <SelectItem value="claude-cli">Claude Code CLI (Claude subscription)</SelectItem>
+                <SelectItem value="codex-cli">Codex CLI (ChatGPT subscription)</SelectItem>
                 <SelectItem value="custom-openai">Custom Server (OpenAI)</SelectItem>
                 <SelectItem value="groq">Groq</SelectItem>
                 <SelectItem value="ollama">Ollama</SelectItem>
@@ -1463,6 +1479,10 @@ export function ModelSettingsModal({
               </ScrollArea>
             )}
           </div>
+        )}
+
+        {modelConfig.provider === 'codex-cli' && (
+          <CodexCliSettings path={codexCliPath} onPathChange={setCodexCliPath} model={modelConfig.model || 'default'} onStatusChange={setCodexCliStatus} />
         )}
 
         {/* Claude Code CLI Section */}

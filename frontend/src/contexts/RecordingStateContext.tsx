@@ -2,6 +2,7 @@
 
 import React, { createContext, useContext, useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { recordingService } from '@/services/recordingService';
+import { listen } from '@tauri-apps/api/event';
 
 /**
  * Recording state synchronized with backend
@@ -99,8 +100,10 @@ export function RecordingStateProvider({ children }: { children: React.ReactNode
         isMicrophoneMuted: backendState.is_microphone_muted,
         isSystemAudioMuted: backendState.is_system_audio_muted,
         isActive: backendState.is_active,
-        recordingDuration: backendState.recording_duration,
-        activeDuration: backendState.active_duration,
+        // Native shutdown temporarily takes ownership of the manager. Its
+        // absent snapshot must not reset the last captured duration to zero.
+        recordingDuration: backendState.recording_duration ?? (backendState.is_recording ? prev.recordingDuration : null),
+        activeDuration: backendState.active_duration ?? (backendState.is_recording ? prev.activeDuration : null),
       }));
 
       console.log('[RecordingStateContext] Synced with backend:', backendState);
@@ -133,6 +136,26 @@ export function RecordingStateProvider({ children }: { children: React.ReactNode
     }
   };
 
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void listen<{ stage: string; message: string }>('recording-shutdown-progress', ({ payload }) => {
+      // Completion is owned by recording-stopped / stop-recording-event, which
+      // carry save metadata. A progress message alone must never finish Stop.
+      if (disposed || payload.stage === 'complete') return;
+      setState(prev => ({
+        ...prev,
+        status: payload.stage === 'processing_transcripts'
+          ? RecordingStatus.PROCESSING_TRANSCRIPTS : RecordingStatus.STOPPING,
+        statusMessage: payload.message,
+      }));
+    }).then(cleanup => {
+      if (disposed) cleanup();
+      else unlisten = cleanup;
+    }).catch(error => console.error('Failed to listen for recording shutdown progress:', error));
+    return () => { disposed = true; unlisten?.(); };
+  }, []);
+
   /**
    * Set up event listeners for backend state changes
    */
@@ -153,6 +176,7 @@ export function RecordingStateProvider({ children }: { children: React.ReactNode
             isSystemAudioMuted: false,
             isActive: true,
             status: RecordingStatus.RECORDING,  // NEW: Set status to RECORDING
+            statusMessage: undefined,
           }));
           startPolling();
         });

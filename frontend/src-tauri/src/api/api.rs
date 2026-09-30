@@ -88,6 +88,8 @@ pub struct ModelConfig {
     pub summary_max_tokens: Option<i64>,
     #[serde(rename = "claudeCliPath")]
     pub claude_cli_path: Option<String>,
+    #[serde(rename = "codexCliPath")]
+    pub codex_cli_path: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -636,6 +638,7 @@ pub async fn api_get_model_config<R: Runtime>(
                         ollama_endpoint: config.ollama_endpoint,
                         summary_max_tokens: config.summary_max_tokens,
                         claude_cli_path: config.claude_cli_path,
+                        codex_cli_path: config.codex_cli_path,
                     }))
                 }
                 Err(e) => {
@@ -670,6 +673,7 @@ pub async fn api_save_model_config<R: Runtime>(
     ollama_endpoint: Option<String>,
     summary_max_tokens: Option<i64>,
     claude_cli_path: Option<String>,
+    codex_cli_path: Option<String>,
     _auth_token: Option<String>,
 ) -> Result<serde_json::Value, String> {
     log_info!(
@@ -712,6 +716,11 @@ pub async fn api_save_model_config<R: Runtime>(
             log_error!("❌ Failed to save Claude Code CLI path: {}", e);
             return Err(e.to_string());
         }
+    }
+
+    if provider == "codex-cli" {
+        SettingsRepository::save_codex_cli_path(pool, codex_cli_path.as_deref()).await
+            .map_err(|e| format!("Failed to save Codex CLI path: {e}"))?;
     }
 
     // Skip API key saving for custom-openai provider (it uses customOpenAIConfig JSON instead)
@@ -1721,5 +1730,21 @@ pub async fn api_test_custom_openai_connection<R: Runtime>(
                 Err(format!("Connection failed: {}", e))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod codex_cli_config_tests {
+    #[test]
+    fn codex_cli_path_is_optional_in_existing_model_configs() {
+        let old = serde_json::json!({"provider":"claude-cli", "model":"sonnet", "whisperModel":"large-v3", "claudeCliPath":"/Users/test/claude"});
+        let config: super::ModelConfig = serde_json::from_value(old).unwrap();
+        assert!(config.codex_cli_path.is_none());
+        assert_eq!(config.claude_cli_path.as_deref(), Some("/Users/test/claude"));
+        let mut json = serde_json::to_value(config).unwrap();
+        json["provider"] = "codex-cli".into();
+        json["codexCliPath"] = "/Users/test/codex".into();
+        let config: super::ModelConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(config.codex_cli_path.as_deref(), Some("/Users/test/codex"));
     }
 }

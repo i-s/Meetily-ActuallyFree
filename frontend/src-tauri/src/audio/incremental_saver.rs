@@ -111,6 +111,8 @@ impl IncrementalAudioSaver {
         let checkpoint_path = self.checkpoints_dir
             .join(format!("{}_chunk_{:03}.mp4", self.track, self.checkpoint_count));
 
+        info!("[recording-save] checkpoint_encode_start track={} checkpoint={} samples={}",
+            self.track, self.checkpoint_count, audio_data.len());
         // Encode and save checkpoint
         encode_single_audio(
             bytemuck::cast_slice(&audio_data),

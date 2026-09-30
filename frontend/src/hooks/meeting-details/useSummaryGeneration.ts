@@ -1,3 +1,4 @@
+import {getCodexCliStatus, codexCliBlockingReason} from '@/lib/codex-cli';
 import { useState, useCallback, useEffect, useRef } from 'react';
 import { Transcript, Summary } from '@/types';
 import { ModelConfig } from '@/components/ModelSettingsModal';
@@ -36,6 +37,11 @@ async function claudeCliPreflight(): Promise<{ message: string; installed: boole
       installed: false,
     };
   }
+}
+
+async function codexCliPreflight(path?: string | null): Promise<string | null> {
+  try { return codexCliBlockingReason(await getCodexCliStatus(path)); }
+  catch (error) { return error instanceof Error ? error.message : String(error); }
 }
 
 async function resolveSummaryLanguage(
@@ -780,6 +786,18 @@ export function useSummaryGeneration({
     }
 
     // Check the Claude Code CLI is installed and signed in
+    if (modelConfig.provider === 'codex-cli') {
+      const problem = await codexCliPreflight(modelConfig.codexCliPath);
+      if (!isCurrentRequest()) return false;
+      if (problem) {
+        setSummaryStatus('error');
+        setSummaryError(problem);
+        toast.error('Codex CLI is not ready', {description: problem});
+        onOpenModelSettings?.();
+        return false;
+      }
+    }
+
     if (modelConfig.provider === 'claude-cli') {
       const problem = await claudeCliPreflight();
       if (!isCurrentRequest()) return false;
@@ -937,6 +955,18 @@ export function useSummaryGeneration({
       setSummaryStatus('idle');
       toast.error('No transcripts available for summary regeneration');
       return;
+    }
+
+    if (modelConfig.provider === 'codex-cli') {
+      const problem = await codexCliPreflight(modelConfig.codexCliPath);
+      if (!isCurrentRequest()) return;
+      if (problem) {
+        setSummaryStatus('error');
+        setSummaryError(problem);
+        toast.error('Codex CLI is not ready', {description: problem});
+        onOpenModelSettings?.();
+        return;
+      }
     }
 
     if (modelConfig.provider === 'claude-cli') {

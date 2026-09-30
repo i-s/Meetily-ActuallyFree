@@ -101,7 +101,7 @@ impl SettingsRepository {
             "groq" => "groqApiKey",
             "openrouter" => "openRouterApiKey",
             "builtin-ai" => return Ok(()), // No API key needed
-            "claude-cli" => return Ok(()), // Auth is owned by the Claude Code CLI
+            "claude-cli" | "codex-cli" => return Ok(()), // Auth is owned by the Claude Code CLI
             _ => {
                 return Err(sqlx::Error::Protocol(
                     format!("Invalid provider: {}", provider).into(),
@@ -140,7 +140,7 @@ impl SettingsRepository {
             "claude" => "anthropicApiKey",
             "openrouter" => "openRouterApiKey",
             "builtin-ai" => return Ok(None), // No API key needed
-            "claude-cli" => return Ok(None), // Auth is owned by the Claude Code CLI
+            "claude-cli" | "codex-cli" => return Ok(None), // Auth is owned by the Claude Code CLI
             _ => {
                 return Err(sqlx::Error::Protocol(
                     format!("Invalid provider: {}", provider).into(),
@@ -307,7 +307,7 @@ impl SettingsRepository {
             "claude" => "anthropicApiKey",
             "openrouter" => "openRouterApiKey",
             "builtin-ai" => return Ok(()), // No API key needed
-            "claude-cli" => return Ok(()), // Auth is owned by the Claude Code CLI
+            "claude-cli" | "codex-cli" => return Ok(()), // Auth is owned by the Claude Code CLI
             _ => {
                 return Err(sqlx::Error::Protocol(
                     format!("Invalid provider: {}", provider).into(),
@@ -354,6 +354,43 @@ impl SettingsRepository {
             VALUES ('1', 'claude-cli', 'sonnet', 'large-v3', $1)
             ON CONFLICT(id) DO UPDATE SET
                 claudeCliPath = excluded.claudeCliPath
+            "#,
+        )
+        .bind(normalised)
+        .execute(pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Read the user-configured Codex CLI executable path.
+    /// `None` (or a blank string) means the backend discovers the binary itself.
+    pub async fn get_codex_cli_path(
+        pool: &SqlitePool,
+    ) -> std::result::Result<Option<String>, sqlx::Error> {
+        let path: Option<Option<String>> =
+            sqlx::query_scalar("SELECT codexCliPath FROM settings WHERE id = '1' LIMIT 1")
+                .fetch_optional(pool)
+                .await?;
+        Ok(path
+            .flatten()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()))
+    }
+
+    /// Persist an explicit Codex CLI path, or clear it to resume auto-discovery.
+    pub async fn save_codex_cli_path(
+        pool: &SqlitePool,
+        path: Option<&str>,
+    ) -> std::result::Result<(), sqlx::Error> {
+        let normalised = path.map(str::trim).filter(|value| !value.is_empty());
+
+        sqlx::query(
+            r#"
+            INSERT INTO settings (id, provider, model, whisperModel, codexCliPath)
+            VALUES ('1', 'codex-cli', 'default', 'large-v3', $1)
+            ON CONFLICT(id) DO UPDATE SET
+                codexCliPath = excluded.codexCliPath
             "#,
         )
         .bind(normalised)
@@ -441,5 +478,30 @@ impl SettingsRepository {
         .await?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod codex_cli_settings_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn codex_cli_path_save_and_clear_preserve_existing_settings() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new().max_connections(1).connect("sqlite::memory:").await.unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        SettingsRepository::save_model_config(&pool, "claude-cli", "sonnet", "large-v3", None, Some(4096)).await.unwrap();
+        SettingsRepository::save_claude_cli_path(&pool, Some("/Users/test/claude")).await.unwrap();
+        SettingsRepository::save_api_key(&pool, "openai", "fixture-key").await.unwrap();
+        SettingsRepository::save_codex_cli_path(&pool, Some(" /Users/test/codex ")).await.unwrap();
+        assert_eq!(SettingsRepository::get_codex_cli_path(&pool).await.unwrap().as_deref(), Some("/Users/test/codex"));
+        SettingsRepository::save_codex_cli_path(&pool, Some("  ")).await.unwrap();
+        let settings = SettingsRepository::get_model_config(&pool).await.unwrap().unwrap();
+        assert_eq!(settings.provider, "claude-cli");
+        assert_eq!(settings.model, "sonnet");
+        assert_eq!(settings.summary_max_tokens, Some(4096));
+        assert_eq!(settings.claude_cli_path.as_deref(), Some("/Users/test/claude"));
+        assert!(settings.codex_cli_path.is_none());
+        assert_eq!(settings.openai_api_key.as_deref(), Some("fixture-key"));
+        assert!(SettingsRepository::get_api_key(&pool, "codex-cli").await.unwrap().is_none());
     }
 }

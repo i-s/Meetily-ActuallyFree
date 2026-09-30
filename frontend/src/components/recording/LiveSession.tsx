@@ -54,7 +54,7 @@ export function LiveSession({
     meetingTitle,
     setMeetingTitle,
   } = useTranscripts();
-  const { isRecording, isPaused } = useRecordingState();
+  const { isRecording, isPaused, statusMessage } = useRecordingState();
   const { transcriptModelConfig } = useConfig();
   const { groupById } = useWorkspace();
   const { meetings } = useSidebar();
@@ -196,7 +196,7 @@ export function LiveSession({
                     )}
                   />
                   <span className={isStopping ? 'text-af-text-3' : isPaused ? 'text-af-warning' : 'text-af-record'}>
-                    {isStopping || isProcessingStop ? 'Finishing' : isPaused ? 'Paused' : 'Recording'}
+                    {isStopping || isProcessingStop ? (statusMessage || 'Finishing') : isPaused ? 'Paused' : 'Recording'}
                   </span>
                   <span className="tabular-nums text-af-text-3">{formatClock(elapsed)}</span>
                 </span>
