@@ -164,3 +164,10 @@ passed. The build retained existing Tailwind ambiguous-utility warnings. The ful
 Linux desktop Cargo attempt was stopped during dependency downloads after repeated
 partial-transfer errors; no Linux desktop or macOS native pass is claimed by these
 portable results. macOS verification belongs to the candidate's Actions run.
+
+The first PR frontend job exposed the v0.2.18 workflow's documented mock leak:
+`summary-language-preferences` installed a read-only global window before
+`meeting-automation` assigned its own window (102 passed, one failure). The
+existing `pr-checks.yml` now runs each existing lib/hooks test file in a separate
+Bun process. The same isolated command passed in Cloud; no application behavior
+outside the audio fix was changed for that CI correction.
