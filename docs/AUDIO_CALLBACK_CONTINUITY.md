@@ -102,7 +102,8 @@ missing-source zero padding continue to own alignment and silence.
 `CoreAudioStream::poll_next` and the capture callback. The fast pop is followed by
 waker registration and a second data/terminal check before Pending. Both delivery
 and terminal transitions wake the consumer. More than ten consecutive incomplete
-writes still terminate capture; success resets the counter. AtomicWaker avoids a
+writes still terminate capture; success resets the counter. Once terminal, later
+callbacks cannot refill the queue or postpone EOF while it drains. AtomicWaker avoids a
 blocking mutex in the callback.
 
 `trigger_system_audio_permission_command` now returns
@@ -171,3 +172,8 @@ The first PR frontend job exposed the v0.2.18 workflow's documented mock leak:
 existing `pr-checks.yml` now runs each existing lib/hooks test file in a separate
 Bun process. The same isolated command passed in Cloud; no application behavior
 outside the audio fix was changed for that CI correction.
+
+A follow-up terminal-state regression failed after eleven overflows because a
+later callback could refill the queue and postpone EOF indefinitely. The producer
+now rejects post-terminal writes. All seven handoff tests pass, including attempts
+to refill both before and after EOF; the non-test helper also compiles.

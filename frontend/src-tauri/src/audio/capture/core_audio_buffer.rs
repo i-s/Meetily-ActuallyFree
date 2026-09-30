@@ -24,6 +24,11 @@ enum PollStage {
 
 impl CoreAudioBufferState {
     pub(super) fn push_samples(&self, producer: &mut HeapProd<f32>, data: &[f32]) {
+        // The device can still call back while the consumer drains after a fatal
+        // overflow. Keep that drain finite and never publish new samples after EOF.
+        if self.should_terminate.load(Ordering::Acquire) {
+            return;
+        }
         let pushed = producer.push_slice(data);
         if pushed < data.len() {
             let consecutive = self.consecutive_drops.fetch_add(1, Ordering::AcqRel) + 1;
@@ -196,6 +201,28 @@ mod tests {
             state.poll_sample(&mut consumer, &mut cx),
             Poll::Ready(Some(0.5))
         );
+        assert_eq!(state.poll_sample(&mut consumer, &mut cx), Poll::Ready(None));
+    }
+
+    #[test]
+    fn callbacks_after_terminal_overflow_cannot_refill_the_buffer() {
+        let (mut producer, mut consumer) = HeapRb::<f32>::new(1).split();
+        let state = CoreAudioBufferState::default();
+        let waker = Waker::from(Arc::new(WakeCount::default()));
+        let mut cx = Context::from_waker(&waker);
+        state.push_samples(&mut producer, &[0.5]);
+        for _ in 0..11 {
+            state.push_samples(&mut producer, &[0.75]);
+        }
+        assert_eq!(
+            state.poll_sample(&mut consumer, &mut cx),
+            Poll::Ready(Some(0.5))
+        );
+        // The device may keep invoking its callback while the stream drains.
+        // Once terminal, those calls must not postpone or reverse EOF.
+        state.push_samples(&mut producer, &[0.25]);
+        assert_eq!(state.poll_sample(&mut consumer, &mut cx), Poll::Ready(None));
+        state.push_samples(&mut producer, &[0.125]);
         assert_eq!(state.poll_sample(&mut consumer, &mut cx), Poll::Ready(None));
     }
 
