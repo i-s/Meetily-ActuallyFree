@@ -308,7 +308,7 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
   // automation) routes here and leaves a request, so the normal stop and save
   // flow runs from this card.
   const consumePendingStop = useCallback(() => {
-    consumeRecordingStopRequest(isRecording && !isStarting && !isStopping, () => { void handleStopRecording(); });
+    consumeRecordingStopRequest(isRecording && !isStarting && !isStopping, () => { void handleStopRecording(); }, isStopping);
   }, [isRecording, isStarting, isStopping, handleStopRecording]);
 
   useEffect(() => { consumePendingStop(); }, [consumePendingStop]);

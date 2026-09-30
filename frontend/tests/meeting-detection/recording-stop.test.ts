@@ -43,3 +43,17 @@ test('a stop after navigation persists until the recorder mounts ready', () => {
   consumeRecordingStopRequest(true, () => { stops++; });
   expect(stops).toBe(1);
 });
+
+test('a duplicate request during stopping is satisfied and cannot stop the next manual recording', () => {
+  let stops = 0;
+  requestRecordingStop(() => {});
+  consumeRecordingStopRequest(true, () => { stops++; });
+  expect(stops).toBe(1);
+  requestRecordingStop(() => {});
+  consumeRecordingStopRequest(false, () => { stops++; }, true);
+  expect(storage.has(STOP_REQUEST_KEY)).toBe(false);
+  // The previous recording ends, then a new manual recording becomes ready.
+  consumeRecordingStopRequest(false, () => { stops++; });
+  consumeRecordingStopRequest(true, () => { stops++; });
+  expect(stops).toBe(1);
+});

@@ -39,7 +39,13 @@ export function requestRecordingStop(navigate: (href: string) => void) {
 }
 
 /** Keep early stop requests until the recorder can run its normal save flow. */
-export function consumeRecordingStopRequest(ready: boolean, stop: () => void): boolean {
+export function consumeRecordingStopRequest(ready: boolean, stop: () => void, alreadyStopping = false): boolean {
+  if (alreadyStopping) {
+    // The current stop already satisfies duplicate requests. Retaining one
+    // would otherwise stop the next recording when it becomes ready.
+    try { sessionStorage.removeItem(STOP_REQUEST_KEY); } catch { /* Storage may be unavailable. */ }
+    return false;
+  }
   if (!ready) return false;
   try {
     if (sessionStorage.getItem(STOP_REQUEST_KEY) !== '1') return false;
