@@ -8,6 +8,9 @@ pub mod per_app;
 #[cfg(target_os = "macos")]
 pub mod core_audio;
 
+#[cfg(any(target_os = "macos", test))]
+mod core_audio_buffer;
+
 // Re-export capture functionality
 pub use system::{
     SystemAudioCapture, SystemAudioStream,

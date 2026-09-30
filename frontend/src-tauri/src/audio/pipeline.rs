@@ -1643,6 +1643,70 @@ mod ring_buffer_tests {
     use super::*;
     use crate::audio::devices::DeviceType as AudioDeviceType;
 
+    #[tokio::test(start_paused = true)]
+    async fn core_audio_partial_block_stays_before_long_gap_with_continuous_microphone() {
+        use super::super::stream::core_audio_processing::process_core_audio_stream;
+        use tokio::time::{advance, Duration, Instant};
+
+        let rate = 48_000;
+        let mut ring = AudioMixerRingBuffer::new(rate, true, true);
+        let state = RecordingState::new();
+        state.start_recording().unwrap();
+        let (sample_sender, sample_receiver) = futures::channel::mpsc::unbounded();
+        let (chunk_sender, mut chunk_receiver) = mpsc::unbounded_channel();
+        let origin = Instant::now();
+        let task = tokio::spawn(process_core_audio_stream(
+            sample_receiver,
+            move |_| rate,
+            move |samples| {
+                chunk_sender.send((samples.to_vec(), origin.elapsed().as_secs_f64())).unwrap();
+            },
+            state.clone(),
+            "synthetic system source".into(),
+            rate,
+        ));
+        let mut microphone = Vec::new();
+        let mut system = Vec::new();
+        let mut expected_system = vec![0.0; 32 * rate as usize];
+        // System callbacks are absent initially, then stop for thirty seconds.
+        // The first callback is shorter than the processing task's 1024 block.
+        // Each distinctive sample must survive once, at its original position.
+        for tick in 1..=3200 {
+            advance(Duration::from_millis(10)).await;
+            let end = tick as f64 / 100.0;
+            let mic: Vec<f32> = ((tick - 1) * 480..tick * 480).map(|i| (i + 1) as f32).collect();
+            ring.add_samples(DeviceType::Microphone, mic, end);
+            if tick == 103 || tick == 3103 {
+                let count = if tick == 103 { 137 } else { 1024 };
+                let samples: Vec<f32> = (0..count).map(|i| -(i as f32 + tick as f32)).collect();
+                let start = tick * 480 - count;
+                expected_system[start..start + count].copy_from_slice(&samples);
+                for sample in samples { sample_sender.unbounded_send(sample).unwrap(); }
+            }
+            tokio::task::yield_now().await;
+            while let Ok((samples, timestamp)) = chunk_receiver.try_recv() {
+                ring.add_samples(DeviceType::System, samples, timestamp);
+            }
+            while let Some((mic, sys)) = ring.extract_window() {
+                microphone.extend(mic);
+                system.extend(sys);
+            }
+        }
+        while let Some((mic, sys)) = ring.extract_remaining() {
+            microphone.extend(mic);
+            system.extend(sys);
+        }
+        assert!(state.is_recording());
+        assert_eq!(state.get_error_count(), 0);
+        assert_eq!(microphone.len(), 32 * rate as usize);
+        assert_eq!(system.len(), microphone.len());
+        assert!(microphone.iter().enumerate().all(|(i, value)| *value == (i + 1) as f32), "microphone sample repeated, lost or shifted");
+        assert!(system == expected_system, "system markers or silence shifted across idle boundary");
+        state.stop_recording();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+    }
+
     #[test]
     fn callback_jitter_preserves_every_source_sample() {
         // The reported devices deliver 10 ms (wired) and 8 ms (Bluetooth)

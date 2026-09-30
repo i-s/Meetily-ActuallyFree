@@ -5,7 +5,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { useOnboarding } from '@/contexts/OnboardingContext';
 import { usePlatform } from '@/hooks/usePlatform';
-import { MACOS_SYSTEM_AUDIO_VERIFIED_KEY } from '@/hooks/usePermissionCheck';
+import { applySystemAudioProbe, readSystemAudioPermission, SystemAudioPermission, SystemAudioProbeResult } from '@/lib/system-audio-permission';
 import { OnboardingContainer } from '../OnboardingContainer';
 import { Check, Mic, Volume2, RefreshCw } from 'lucide-react';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
@@ -39,7 +39,10 @@ export function AudioTestStep() {
   const [micRms, setMicRms] = useState(0);
   const [sysRms, setSysRms] = useState(0);
   const [micHeard, setMicHeard] = useState(false);
-  const [sysHeard, setSysHeard] = useState(false);
+  const [systemAudio, setSystemAudio] = useState<SystemAudioPermission>(readSystemAudioPermission);
+  const systemAudioRef = useRef(systemAudio);
+  const [sysHeard, setSysHeard] = useState(systemAudio === 'verified');
+  const [systemAdvice, setSystemAdvice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [status, setStatus] = useState('Starting meters…');
   const [inputs, setInputs] = useState<AudioDevice[]>([]);
@@ -98,26 +101,21 @@ export function AudioTestStep() {
           if (isMacOS && sys) {
             setStatus('Testing native system audio… Play a video now.');
             try {
-              const detected = await invoke<boolean>('trigger_system_audio_permission_command');
+              const result = await invoke<SystemAudioProbeResult>('trigger_system_audio_permission_command');
               if (!active.current || run !== meterRun.current) return;
-              window.sessionStorage.setItem(MACOS_SYSTEM_AUDIO_VERIFIED_KEY, String(detected));
-              setSysHeard(detected);
-              setSysRms(detected ? 0.2 : 0);
-              if (!detected) {
-                setError(
-                  'System audio was not detected. Play audio, grant Audio Capture permission if prompted, then click Retest audio.',
-                );
+              const next = applySystemAudioProbe(result, systemAudioRef.current);
+              systemAudioRef.current = next;
+              setSystemAudio(next);
+              setSysHeard(next === 'verified');
+              setSysRms(result.detected ? 0.2 : 0);
+              setSystemAdvice(next === 'unknown'
+                ? 'Computer audio has not been verified. Play audio and click Retest audio.' : null);
+              if (next === 'denied') {
+                setError('Audio Capture permission was denied. Allow Meetily in System Settings, then click Retest audio.');
               }
             } catch (systemError) {
               if (!active.current || run !== meterRun.current) return;
-              window.sessionStorage.setItem(MACOS_SYSTEM_AUDIO_VERIFIED_KEY, 'false');
-              const message =
-                typeof systemError === 'string'
-                  ? systemError
-                  : systemError instanceof Error
-                    ? systemError.message
-                    : String(systemError);
-              setError(`Could not test native system audio: ${message}`);
+              setSystemAdvice('Could not verify computer audio. Play audio and click Retest audio.');
             }
           }
           if (!active.current || run !== meterRun.current) return;
@@ -337,7 +335,7 @@ export function AudioTestStep() {
                   Detected
                 </span>
               ) : (
-                'Play a video…'
+                systemAudio === 'denied' ? 'Permission denied' : 'Play a video…'
               )}
             </span>
           </div>
@@ -364,6 +362,7 @@ export function AudioTestStep() {
           </button>
         </div>
 
+        {systemAdvice && <p className="text-center text-xs text-[var(--af-text-3)]">{systemAdvice}</p>}
         {error && <p className="text-center text-xs text-af-warning break-words">{error}</p>}
         <p className="text-center text-xs text-[var(--af-text-3)]">
           You can finish even if a meter stays quiet — fix devices later in Settings → Recording.
