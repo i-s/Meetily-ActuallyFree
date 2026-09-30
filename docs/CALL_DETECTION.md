@@ -84,3 +84,10 @@ No physical Zoom/macOS or Discord/Windows acceptance is claimed by these fixture
 The second PR's native workflow results and artifact links record actual build
 qualification separately. The bundle identifier and version remain unchanged;
 Preview packaging is not a release or updater publication.
+
+Windows Preview preparation exposes separate MSVC/CMake setup, LLVM download,
+SHA-256 verification, extraction and libclang checks in Actions. Their timeouts
+are 5, 15, 5, 15 and 2 minutes respectively. The shared LLVM bootstrap defaults
+to the complete local setup; CI uses its individual phases with timestamped
+diagnostics. Extraction rechecks the pinned hash before unpacking. A cached LLVM
+installation skips archive work but still runs the libclang/version check.

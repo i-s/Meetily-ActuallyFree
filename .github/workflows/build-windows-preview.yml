@@ -73,14 +73,14 @@ jobs:
             frontend/src-tauri/binaries/onnxruntime
           key: windows-preview-resources-${{ hashFiles('frontend/scripts/bootstrap-llvm18.ps1', 'frontend/src-tauri/build/ffmpeg.rs', 'frontend/src-tauri/build/onnxruntime.rs') }}
 
-      - name: Configure MSVC, CMake and LLVM
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Configure MSVC and CMake
+        timeout-minutes: 5
         run: |
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
           $vs = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
           if (!$vs) { throw 'MSVC installation missing' }
           $vcvars = Join-Path $vs 'VC\Auxiliary\Build\vcvars64.bat'
+          Write-Host "Configuring MSVC from $vcvars"
           cmd /c "call `"$vcvars`" >nul 2>&1 && set" | ForEach-Object {
             if ($_ -match '^([^=]+)=(.*)$') {
               # Persist only vcvars changes, keeping step-scoped GH_TOKEN scoped
@@ -91,12 +91,34 @@ jobs:
               }
             }
           }
-          $llvm = & ./frontend/scripts/bootstrap-llvm18.ps1 | Select-Object -Last 1
-          if ($LASTEXITCODE -ne 0) { throw 'LLVM setup failed' }
-          "LIBCLANG_PATH=$llvm\bin" >> $env:GITHUB_ENV
+          if ($LASTEXITCODE -ne 0) { throw 'MSVC environment setup failed' }
           "CMAKE_GENERATOR=Ninja" >> $env:GITHUB_ENV
           $ninja = Join-Path $vs 'Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja'
           $ninja >> $env:GITHUB_PATH
+          Write-Host "MSVC ready; Ninja directory: $ninja"
+
+      - name: Download LLVM 18 archive
+        timeout-minutes: 15
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./frontend/scripts/bootstrap-llvm18.ps1 -Phase Download
+
+      - name: Verify LLVM 18 archive SHA-256
+        timeout-minutes: 5
+        run: ./frontend/scripts/bootstrap-llvm18.ps1 -Phase Verify
+
+      - name: Extract LLVM 18 archive
+        timeout-minutes: 15
+        run: ./frontend/scripts/bootstrap-llvm18.ps1 -Phase Extract
+
+      - name: Configure and verify libclang
+        timeout-minutes: 2
+        run: |
+          $llvmBin = Join-Path $env:GITHUB_WORKSPACE '.build-tools/clang+llvm-18.1.8-x86_64-pc-windows-msvc/bin'
+          if (!(Test-Path (Join-Path $llvmBin 'libclang.dll'))) { throw 'LLVM libclang.dll missing after extraction' }
+          "LIBCLANG_PATH=$llvmBin" >> $env:GITHUB_ENV
+          & (Join-Path $llvmBin 'clang.exe') --version
+          if ($LASTEXITCODE -ne 0) { throw 'LLVM clang version check failed' }
 
       - name: Install frontend dependencies
         working-directory: frontend
