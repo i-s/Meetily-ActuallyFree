@@ -63,6 +63,7 @@ jobs:
         with:
           workspaces: ". -> target"
           key: windows-preview-cpu-v1
+          cache-on-failure: true
 
       - name: Cache LLVM 18 and downloaded native resources
         uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4
@@ -123,6 +124,9 @@ jobs:
       - name: Install frontend dependencies
         working-directory: frontend
         run: pnpm install --frozen-lockfile
+
+      - name: Test NSIS payload verification
+        run: node --test frontend/scripts/verify-nsis-payload.test.mjs
 
       # Keep Next, tsc and native compilation sequential: Next owns frontend/out.
       - name: Build frontend

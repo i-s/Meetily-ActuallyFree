@@ -97,9 +97,10 @@ foreach ($binary in @($main, (Join-Path $installed 'llama-helper.exe'), (Join-Pa
     }
   } finally { $reader.Dispose() }
 }
-if ((Get-FileHash $main).Hash -ne (Get-FileHash (Join-Path $repo "target/$Target/release/meetily.exe")).Hash) {
-  throw 'Installer application differs from built candidate'
-}
+# Tauri patches the NSIS bundle marker, then restores the raw build output.
+# Check that exact byte transformation while rejecting any other payload change.
+node (Join-Path $PSScriptRoot 'verify-nsis-payload.mjs') (Join-Path $repo "target/$Target/release/meetily.exe") $main
+if ($LASTEXITCODE -ne 0) { throw 'Installer application verification failed' }
 foreach ($resource in $resources.GetEnumerator()) {
   if ((Get-FileHash (Join-Path $tauri $resource.Key)).Hash -ne (Get-FileHash (Join-Path $installed $resource.Value)).Hash) {
     throw "Installed resource hash mismatch: $($resource.Value)"

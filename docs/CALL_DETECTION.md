@@ -95,3 +95,6 @@ LLVM extraction uses 7-Zip for both XZ and TAR layers because Windows' bundled
 tar timed out on the checksum-verified archive. Each layer logs its boundary;
 the temporary uncompressed TAR is removed after extraction (including errors).
 Local bootstrap use requires 7-Zip on PATH or in Program Files/7-Zip.
+The unsigned NSIS payload check accounts for Tauri's first `UNK` → `NSS` bundle
+marker patch, then compares the entire executable byte for byte. All other
+differences fail verification; resource and sidecar hashes remain exact checks.

@@ -31,6 +31,8 @@ jobs:
           cache: pnpm
           cache-dependency-path: frontend/pnpm-lock.yaml
       - run: pnpm install --frozen-lockfile
+      - name: Test NSIS payload verification
+        run: node --test scripts/verify-nsis-payload.test.mjs
       - name: Run existing frontend tests in isolated processes
         shell: bash
         run: |
