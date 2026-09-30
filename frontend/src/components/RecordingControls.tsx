@@ -37,7 +37,7 @@ import { useAppAudio } from '@/hooks/useAppAudio';
 import { GroupPicker } from '@/components/groups/GroupBits';
 import { Hint } from '@/components/ui/tooltip';
 import { Spinner } from '@/components/ui/spinner';
-import { STOP_RECORDING_EVENT, STOP_REQUEST_KEY } from '@/lib/recording-launch';
+import { consumeRecordingStopRequest, STOP_RECORDING_EVENT } from '@/lib/recording-launch';
 import { formatClock } from '@/lib/dates';
 
 interface RecordingControlsProps {
@@ -307,23 +307,18 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
   // Stop pressed elsewhere in the app (recording pill, command bar, meeting
   // automation) routes here and leaves a request, so the normal stop and save
   // flow runs from this card.
-  useEffect(() => {
-    let requested = false;
-    try {
-      requested = sessionStorage.getItem(STOP_REQUEST_KEY) === '1';
-      if (requested) sessionStorage.removeItem(STOP_REQUEST_KEY);
-    } catch {
-      requested = false;
-    }
-    if (requested && isRecording) void handleStopRecording();
-  }, [isRecording, handleStopRecording]);
+  const consumePendingStop = useCallback(() => {
+    consumeRecordingStopRequest(isRecording && !isStarting && !isStopping, () => { void handleStopRecording(); });
+  }, [isRecording, isStarting, isStopping, handleStopRecording]);
+
+  useEffect(() => { consumePendingStop(); }, [consumePendingStop]);
 
   // The same request while this page is open (command bar, meeting automation).
   useEffect(() => {
-    const onStop = () => void handleStopRecording();
+    const onStop = () => consumePendingStop();
     window.addEventListener(STOP_RECORDING_EVENT, onStop);
     return () => window.removeEventListener(STOP_RECORDING_EVENT, onStop);
-  }, [handleStopRecording]);
+  }, [consumePendingStop]);
 
   const handlePauseRecording = useCallback(async () => {
     if (!isRecording || isPaused || isPausing) return;
