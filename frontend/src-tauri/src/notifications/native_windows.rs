@@ -116,6 +116,18 @@ pub fn show_toast<R: tauri::Runtime>(
     title: &str,
     body: &str,
 ) -> Result<(), String> {
+    show_toast_with_call(app, title, body, None)
+}
+
+pub fn show_meeting_toast<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>, title: &str, body: &str, process: String, session_id: u64,
+) -> Result<(), String> {
+    show_toast_with_call(app, title, body, Some(serde_json::json!({ "process": process, "session_id": session_id })))
+}
+
+fn show_toast_with_call<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>, title: &str, body: &str, call: Option<serde_json::Value>,
+) -> Result<(), String> {
     ensure_app_identity();
 
     use tauri::{Emitter, Manager};
@@ -140,7 +152,11 @@ pub fn show_toast<R: tauri::Runtime>(
                     let _ = win.show();
                     let _ = win.set_focus();
                 }
-                let _ = app_click.emit("start-recording-from-notification", ());
+                if let Some(call) = &call {
+                    let _ = app_click.emit("start-detected-meeting-from-notification", call.clone());
+                } else {
+                    let _ = app_click.emit("start-recording-from-notification", ());
+                }
             }
             Ok(())
         })

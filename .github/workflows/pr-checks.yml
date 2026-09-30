@@ -38,6 +38,6 @@ jobs:
           # Global window and Tauri mocks must not leak across test files.
           while IFS= read -r -d '' test_file; do
             pnpm dlx bun@1.3.10 test "$test_file"
-          done < <(find tests/lib tests/hooks tests/chat tests/codex-cli -type f \( -name '*.test.js' -o -name '*.test.mjs' -o -name '*.test.ts' -o -name '*.test.tsx' \) -print0 | sort -z)
+          done < <(find tests/lib tests/hooks tests/chat tests/codex-cli tests/meeting-detection -type f \( -name '*.test.js' -o -name '*.test.mjs' -o -name '*.test.ts' -o -name '*.test.tsx' \) -print0 | sort -z)
       - run: pnpm run build
       - run: pnpm exec tsc --noEmit

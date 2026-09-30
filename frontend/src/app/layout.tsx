@@ -30,7 +30,7 @@ import { RecordingPostProcessingProvider } from '@/contexts/RecordingPostProcess
 import { ImportDialogProvider } from '@/contexts/ImportDialogContext'
 import { isAudioExtension, getAudioFormatsDisplayList } from '@/constants/audioFormats'
 import { loadLabsPreferences } from '@/lib/labs'
-import { automatedRecording, endAutomatedRecording, markAutomatedStart } from '@/lib/meeting-automation'
+import { automatedRecording, createMeetingDetectionSessions, endAutomatedRecording, markAutomatedStart, sameAutomatedCall, startDetectedMeeting, type AutomatedCall } from '@/lib/meeting-automation'
 import { getPendingCrashReport, type PendingCrashReport } from '@/services/crashReportService'
 import { WorkspaceProvider } from '@/contexts/WorkspaceContext'
 import { RouteWarmup } from '@/components/RouteWarmup'
@@ -154,6 +154,7 @@ export default function RootLayout({
   // Tray, notification and meeting-detection starts work from any page.
   const startRecordingAnywhere = useRef<() => void>(() => undefined)
   startRecordingAnywhere.current = () => launchRecording((href) => router.push(href))
+  const meetingSessions = useRef(createMeetingDetectionSessions())
   const isMinibar = (pathname ?? '').startsWith('/minibar')
   const [showOnboarding, setShowOnboarding] = useState(false)
   const [onboardingCompleted, setOnboardingCompleted] = useState(false)
@@ -300,59 +301,76 @@ export default function RootLayout({
     };
   }, [startupResolved, startupError, pendingCrashReport]);
 
-  // Meeting Detection: prompt to start recording when a meeting app is detected.
-  // With Labs meeting automation on, a call that is using the microphone or
-  // camera starts a recording instead, and that recording stops when the call
-  // ends. The compact bar's window never starts or stops recordings.
+  // Sessions survive routing and settings changes. Only the main window may
+  // own a start/stop; a detected call is checked again at the moment of Start.
   useEffect(() => {
     if (!startupResolved || startupError || pendingCrashReport || isMinibar) return
-    const unlisten = listen<{ app: string; process: string; notify: boolean; active_media: boolean }>(
+    let disposed = false;
+    const sessions = meetingSessions.current;
+    const promptId = (call: AutomatedCall) => `meeting-detected-${call.process}-${call.session_id}`;
+
+    const startDetectedCall = async (call: AutomatedCall, automatic: boolean) => {
+      if (showOnboarding) {
+        toast.error('Please complete setup first', {
+          description: 'Finish onboarding before you can start recording.',
+        });
+        return;
+      }
+      try {
+        const result = await startDetectedMeeting(call, sessions, {
+          getRecordingState: () => invoke<{ is_recording?: boolean }>('get_recording_state'),
+          validateSession: () => invoke<boolean>('validate_meeting_detection_session', {
+            process: call.process, sessionId: call.session_id,
+          }),
+          enabled: () => !disposed && (!automatic || loadLabsPreferences().meetingAutomation),
+          launch: () => {
+            if (automatic) markAutomatedStart(call);
+            startRecordingAnywhere.current();
+          },
+        });
+        if (result !== 'skipped') toast.dismiss(promptId(call));
+        if (result === 'unconfirmed' && !automatic) toast.info('This call could not be confirmed', {
+          description: 'You can still start a recording from the record button.',
+        });
+      } catch (error) {
+        console.error('Could not validate meeting before recording:', error);
+        if (!disposed && !automatic) toast.error('Could not check this call', {
+          description: 'Try again, or start from the record button.',
+        });
+      }
+    };
+
+    const unlisten = listen<AutomatedCall & { notify: boolean; active_media: boolean; session_id: number }>(
       'meeting-detected',
       (event) => {
-        const { app, notify, active_media, process } = event.payload;
-        console.log('[Layout] meeting-detected:', event.payload);
+        if (disposed) return;
+        const { app, notify, active_media } = event.payload;
+        const call = event.payload;
+        if (!active_media || !sessions.detect(call)) return;
 
-        const startRecording = () => {
-          if (showOnboarding) {
-            toast.error('Please complete setup first', {
-              description: 'Finish onboarding before you can start recording.',
-            });
-            return;
-          }
-          startRecordingAnywhere.current();
-        };
-
-        if (loadLabsPreferences().meetingAutomation && active_media && !showOnboarding) {
-          void invoke<{ is_recording?: boolean }>('get_recording_state').then((state) => {
-            if (state.is_recording) return;
-            markAutomatedStart({ app, process });
-            startRecording();
-          }).catch((error) => console.error('Could not check recording state for meeting automation:', error));
+        if (loadLabsPreferences().meetingAutomation && !showOnboarding) {
+          void startDetectedCall(call, true);
           return;
         }
-
-        // OS toast with a Start recording button (Windows native path).
         if (notify) {
-          invoke('show_simple_notification', {
+          invoke('show_meeting_detection_notification', {
             title: `${app} meeting detected`,
             body: 'Start recording this meeting now?',
+            process: call.process,
+            sessionId: call.session_id,
           }).catch(() => {});
         }
-
-        // In-app prompt with a one-click start action.
         toast(`${app} meeting detected`, {
+          id: promptId(call),
           description: 'Capture mic + system audio in Meetily.',
           duration: 20000,
-          action: {
-            label: 'Start recording',
-            onClick: startRecording,
-          },
+          action: { label: 'Start recording', onClick: () => { void startDetectedCall(call, false); } },
         });
       }
     );
 
-    // OS notification button → same start path as sidebar / in-app toast.
     const unlistenStart = listen('start-recording-from-notification', () => {
+      if (disposed) return;
       if (showOnboarding) {
         toast.error('Please complete setup first', {
           description: 'Finish onboarding before you can start recording.',
@@ -361,25 +379,53 @@ export default function RootLayout({
       }
       startRecordingAnywhere.current();
     });
+    const unlistenMeetingStart = listen<{ process: string; session_id: number }>(
+      'start-detected-meeting-from-notification',
+      async (event) => {
+        if (disposed) return;
+        const { process, session_id } = event.payload;
+        const call = { app: process === 'zoom' ? 'Zoom' : process === 'discord' ? 'Discord' : process, process, session_id };
+        // The WebView may have reloaded since this native notification appeared.
+        // Restore only this exact session after a fresh native check.
+        if (!sessions.isActive(call)) {
+          try {
+            const valid = await invoke<boolean>('validate_meeting_detection_session', { process, sessionId: session_id });
+            if (disposed || !valid) return;
+            sessions.detect(call);
+          } catch { return; }
+        }
+        void startDetectedCall(call, false);
+      }
+    );
+    const unlistenRecording = listen('recording-started', () => sessions.recordingStarted());
 
-    // Only a recording that automation started for this same call is stopped.
-    const unlistenEnd = listen<{ app: string; process: string }>('meeting-ended', (event) => {
+    const unlistenEnd = listen<AutomatedCall>('meeting-ended', (event) => {
+      if (disposed) return;
+      sessions.end(event.payload);
+      toast.dismiss(promptId(event.payload));
       const call = automatedRecording();
-      if (!call || call.process !== event.payload.process || !loadLabsPreferences().meetingAutomation) return;
+      if (!call || !sameAutomatedCall(call, event.payload) || !loadLabsPreferences().meetingAutomation) return;
       void invoke<{ is_recording?: boolean }>('get_recording_state').then((state) => {
+        // Ownership may change while native state is being read (manual start,
+        // Don't stop it, or a subsequent call). Check again before stopping.
+        const owner = automatedRecording();
+        if (disposed || !owner || !sameAutomatedCall(owner, call) || !loadLabsPreferences().meetingAutomation) return;
         if (!state.is_recording) {
           endAutomatedRecording();
           return;
         }
-        toast(`${call.app} call ended`, { description: 'Meeting automation is stopping and saving the recording.' });
+        toast(`${call.app} call ended`, { id: `meeting-ended-${call.process}-${call.session_id}`, description: 'Meeting automation is stopping and saving the recording.' });
         requestRecordingStop((href) => router.push(href));
       }).catch((error) => console.error('Could not check recording state for meeting automation:', error));
     });
 
     return () => {
+      disposed = true;
       unlisten.then((fn) => fn());
       unlistenStart.then((fn) => fn());
+      unlistenMeetingStart.then((fn) => fn());
       unlistenEnd.then((fn) => fn());
+      unlistenRecording.then((fn) => fn());
     };
   }, [showOnboarding, startupResolved, startupError, pendingCrashReport, isMinibar, router]);
 

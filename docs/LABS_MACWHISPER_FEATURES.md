@@ -35,24 +35,15 @@ used:
 
 ## Feature 1: meeting automation
 
-`meeting_detection.rs` now includes packaged Teams microphone/camera leases and
-Windows browser meeting window titles alongside the existing process and
-NonPackaged lease checks. Blocking scans run in `spawn_blocking`, and a monitor
-generation prevents duplicate loops after settings changes. The detector emits
-`meeting-detected` with `active_media` and `meeting-ended` after 45 seconds of
-missing signals. Labs auto-start acts only on an active Windows media lease;
-process-only detection still prompts. The frontend stores ownership only after
-a successful start and runs the usual stop/save workflow only for an owned
-recording. Enabling Labs meeting automation also enables the existing Detection
-monitor; switching Labs off leaves ordinary detection prompts available.
+The detector uses native call evidence for Zoom on macOS and Discord on Windows,
+with per-call session IDs, two positive polls before an offer, and 45 seconds of
+confirmed inactivity before an end. Unknown evidence never starts or ends a call.
+Settings changes preserve session state. Process presence alone no longer prompts.
 
-The plan's proposal to bind the detected PID directly to per-app capture is not
-used. Browser PIDs can contain unrelated tabs, and process capture settings are
-independently selected by the user. The detector does not yet meter WASAPI
-sessions or distinguish a muted live call from an idle app with an open media
-lease. macOS and Linux have no active-media automation signal here. A detection
-event is not proof a meeting is underway; users should test the Labs action
-against their conferencing apps before relying on it.
+See [CALL_DETECTION.md](CALL_DETECTION.md) for platform adapters, Accessibility
+permission, diagnostic UI, automation ownership, tests and physical qualification.
+Other Windows applications retain the weaker microphone/camera lease signal.
+Labs automation is opt-in; manually started recordings are never owned by it.
 
 ## Feature 3: audio and transcript seeking
 
