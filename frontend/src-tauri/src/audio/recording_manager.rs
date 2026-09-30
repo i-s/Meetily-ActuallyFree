@@ -297,9 +297,9 @@ impl RecordingManager {
             errors.push(format!("Failed to flush the audio pipeline: {}", e));
         }
 
-        // CRITICAL: Full cleanup to release all Arc references and resources
-        // This ensures microphone is released even if Drop is delayed
-        self.state.cleanup();
+        // stop_recording already releases capture devices and input. Retain the
+        // frozen duration, pause total, statistics and errors through final save;
+        // RecordingManager::drop performs the full reset afterwards.
 
         if !errors.is_empty() {
             return Err(anyhow::anyhow!(errors.join("; ")));

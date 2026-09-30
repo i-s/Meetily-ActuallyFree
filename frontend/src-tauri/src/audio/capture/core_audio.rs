@@ -4,13 +4,13 @@
 use std::pin::Pin;
 #[cfg(target_os = "macos")]
 use std::time::{Duration, Instant};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll, Waker};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
+use std::task::{Context, Poll};
 use anyhow::Result;
 use futures_util::Stream;
 use ringbuf::{
-    traits::{Consumer, Producer, Split},
+    traits::{Consumer, Split},
     HeapCons, HeapProd, HeapRb,
 };
 use log::{error, info, warn};
@@ -18,10 +18,22 @@ use log::{error, info, warn};
 #[cfg(target_os = "macos")]
 use cidre::{arc, av, cat, cf, core_audio as ca, os};
 
-/// Waker state for async polling
-struct WakerState {
-    waker: Option<Waker>,
-    has_data: bool,
+use super::core_audio_buffer::CoreAudioBufferState;
+
+/// Keep explicit OS denial typed across the diagnostic probe's anyhow boundary.
+#[cfg(target_os = "macos")]
+fn core_audio_error(error: os::Error, operation: &str) -> anyhow::Error {
+    // kAudioHardwareNotPermittedError ('perm'); cidre has no named constant.
+    // Silence and unrelated OS failures must never acquire denial semantics.
+    let error = if error == os::Error::from_be_bytes(*b"perm") {
+        anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            error,
+        ))
+    } else {
+        anyhow::Error::new(error)
+    };
+    error.context(operation.to_owned())
 }
 
 /// Core Audio speaker input using aggregate device + tap
@@ -38,7 +50,7 @@ pub struct CoreAudioStream {
     _device: ca::hardware::StartedDevice<ca::AggregateDevice>,
     _ctx: Box<AudioContext>,
     _tap: ca::TapGuard,
-    waker_state: Arc<Mutex<WakerState>>,
+    buffer_state: Arc<CoreAudioBufferState>,
     current_sample_rate: Arc<AtomicU32>,
 }
 
@@ -47,10 +59,8 @@ pub struct CoreAudioStream {
 struct AudioContext {
     format: arc::R<av::AudioFormat>,
     producer: HeapProd<f32>,
-    waker_state: Arc<Mutex<WakerState>>,
+    buffer_state: Arc<CoreAudioBufferState>,
     current_sample_rate: Arc<AtomicU32>,
-    consecutive_drops: Arc<AtomicU32>,
-    should_terminate: Arc<AtomicBool>,
 }
 
 #[cfg(target_os = "macos")]
@@ -73,7 +83,7 @@ impl CoreAudioCapture {
         let output_device = ca::System::default_output_device()
             .map_err(|e| {
                 error!("❌ CoreAudio: Failed to get default output device: {:?}", e);
-                anyhow::anyhow!("Failed to get default output device: {:?}", e)
+                core_audio_error(e, "Failed to get default output device")
             })?;
 
         info!("✅ CoreAudio: Got default output device");
@@ -81,7 +91,7 @@ impl CoreAudioCapture {
         let output_uid = output_device.uid()
             .map_err(|e| {
                 error!("❌ CoreAudio: Failed to get device UID: {:?}", e);
-                anyhow::anyhow!("Failed to get device UID: {:?}", e)
+                core_audio_error(e, "Failed to get device UID")
             })?;
 
         // Get device name for better debugging
@@ -114,7 +124,7 @@ impl CoreAudioCapture {
             })
             .map_err(|e| {
                 error!("❌ CoreAudio: Failed to create process tap: {:?}", e);
-                anyhow::anyhow!("Failed to create process tap: {:?}", e)
+                core_audio_error(e, "Failed to create process tap")
             })?;
 
         // Get tap information
@@ -227,7 +237,7 @@ impl CoreAudioCapture {
         let agg_device = ca::AggregateDevice::with_desc(&self.agg_desc)
             .map_err(|e| {
                 error!("❌ CoreAudio: Failed to create aggregate device: {:?}", e);
-                anyhow::anyhow!("Failed to create aggregate device: {:?}", e)
+                core_audio_error(e, "Failed to create aggregate device")
             })?;
 
         info!("✅ CoreAudio: Aggregate device created");
@@ -237,7 +247,7 @@ impl CoreAudioCapture {
         let proc_id = agg_device.create_io_proc_id(audio_proc, Some(ctx))
             .map_err(|e| {
                 error!("❌ CoreAudio: Failed to create IO proc: {:?}", e);
-                anyhow::anyhow!("Failed to create IO proc: {:?}", e)
+                core_audio_error(e, "Failed to create IO proc")
             })?;
 
         info!("✅ CoreAudio: IO proc created with ID: {:?}", proc_id);
@@ -247,7 +257,7 @@ impl CoreAudioCapture {
         let started_device = ca::device_start(agg_device, Some(proc_id))
             .map_err(|e| {
                 error!("❌ CoreAudio: Failed to start device: {:?}", e);
-                anyhow::anyhow!("Failed to start device: {:?}", e)
+                core_audio_error(e, "Failed to start device")
             })?;
 
         info!("✅ CoreAudio: Audio device started successfully!");
@@ -268,7 +278,7 @@ impl CoreAudioCapture {
         let asbd = self.tap.asbd()
             .map_err(|e| {
                 error!("❌ CoreAudio: Failed to get tap ASBD: {:?}", e);
-                anyhow::anyhow!("Failed to get tap ASBD: {:?}", e)
+                core_audio_error(e, "Failed to get tap ASBD")
             })?;
 
         let format = av::AudioFormat::with_asbd(&asbd)
@@ -284,10 +294,7 @@ impl CoreAudioCapture {
         let rb = HeapRb::<f32>::new(buffer_size);
         let (producer, consumer) = rb.split();
 
-        let waker_state = Arc::new(Mutex::new(WakerState {
-            waker: None,
-            has_data: false,
-        }));
+        let buffer_state = Arc::new(CoreAudioBufferState::default());
 
         let current_sample_rate = Arc::new(AtomicU32::new(asbd.sample_rate as u32));
         info!("✅ CoreAudio: Initial sample rate: {} Hz", asbd.sample_rate);
@@ -295,10 +302,8 @@ impl CoreAudioCapture {
         let mut ctx = Box::new(AudioContext {
             format,
             producer,
-            waker_state: waker_state.clone(),
+            buffer_state: buffer_state.clone(),
             current_sample_rate: current_sample_rate.clone(),
-            consecutive_drops: Arc::new(AtomicU32::new(0)),
-            should_terminate: Arc::new(AtomicBool::new(false)),
         });
 
         info!("🎙️ CoreAudio: Starting audio device...");
@@ -311,7 +316,7 @@ impl CoreAudioCapture {
             _device: device,
             _ctx: ctx,
             _tap: self.tap,
-            waker_state,
+            buffer_state,
             current_sample_rate,
         })
     }
@@ -353,37 +358,8 @@ impl CoreAudioCapture {
 /// Process audio data from the IO proc callback
 #[cfg(target_os = "macos")]
 fn process_audio_data(ctx: &mut AudioContext, data: &[f32]) {
-    // Push raw samples directly to ring buffer
-    // Let the pipeline handle all gain adjustments (post-mix 3x gain + mic normalization)
-    let buffer_size = data.len();
-    let pushed = ctx.producer.push_slice(data);
-
-    if pushed < buffer_size {
-        let consecutive = ctx.consecutive_drops.fetch_add(1, Ordering::AcqRel) + 1;
-
-        if consecutive > 10 {
-            ctx.should_terminate.store(true, Ordering::Release);
-            return;
-        }
-    } else {
-        ctx.consecutive_drops.store(0, Ordering::Release);
-    }
-
-    if pushed > 0 {
-        let should_wake = {
-            let mut waker_state = ctx.waker_state.lock().unwrap();
-            if !waker_state.has_data {
-                waker_state.has_data = true;
-                waker_state.waker.take()
-            } else {
-                None
-            }
-        };
-
-        if let Some(waker) = should_wake {
-            waker.wake();
-        }
-    }
+    // Gain adjustments remain downstream; this only transfers bounded raw samples.
+    ctx.buffer_state.push_samples(&mut ctx.producer, data);
 }
 
 #[cfg(target_os = "macos")]
@@ -402,28 +378,12 @@ impl Stream for CoreAudioStream {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Self::Item>> {
-        // Try to pop a sample from the ring buffer
-        if let Some(sample) = self.consumer.try_pop() {
-            return Poll::Ready(Some(sample));
-        }
-
-        // Check if we should terminate
-        if self._ctx.should_terminate.load(Ordering::Acquire) {
+        let this = &mut *self;
+        let result = this.buffer_state.poll_sample(&mut this.consumer, cx);
+        if matches!(result, Poll::Ready(None)) {
             warn!("Stream terminating due to buffer pressure");
-            return match self.consumer.try_pop() {
-                Some(sample) => Poll::Ready(Some(sample)),
-                None => Poll::Ready(None),
-            };
         }
-
-        // No data available, register waker and return pending
-        {
-            let mut state = self.waker_state.lock().unwrap();
-            state.has_data = false;
-            state.waker = Some(cx.waker().clone());
-        }
-
-        Poll::Pending
+        result
     }
 }
 
@@ -431,7 +391,7 @@ impl Stream for CoreAudioStream {
 impl Drop for CoreAudioStream {
     fn drop(&mut self) {
         info!("CoreAudioStream dropped, signaling termination");
-        self._ctx.should_terminate.store(true, Ordering::Release);
+        self.buffer_state.terminate();
     }
 }
 
@@ -475,6 +435,26 @@ impl Stream for CoreAudioStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn explicit_core_audio_denial_survives_error_context() {
+        let error = core_audio_error(os::Error::from_be_bytes(*b"perm"), "create tap");
+        assert!(error.chain().any(|cause| cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied)));
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn unrelated_core_audio_error_preserves_status_without_denial() {
+        let status = os::Error::new_unchecked(-50);
+        let error = core_audio_error(status, "start device");
+        assert_eq!(error.downcast_ref::<os::Error>(), Some(&status));
+        assert!(!error.chain().any(|cause| cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied)));
+    }
 
     #[tokio::test]
     #[cfg(target_os = "macos")]

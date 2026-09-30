@@ -10,11 +10,15 @@ let polls: Array<{ meeting: string; owner: string; callback: (result: any) => vo
 let stopped: Array<[string,string?]>;
 let toasts: any[];
 let cancelFails = false;
+let provider: 'claude' | 'codex-cli' = 'claude';
+let codexStatus: any;
 const startPolling = (meeting: string, owner: string, callback: (result:any)=>void) => { polls.push({meeting,owner,callback}); };
 const stopPolling = (meeting:string,owner?:string) => { stopped.push([meeting,owner]); };
 mock.module('@/components/Sidebar/SidebarProvider', () => ({useSidebar:()=>({startSummaryPolling:startPolling, stopSummaryPolling:stopPolling})}));
 mock.module('@tauri-apps/api/core', () => ({ invoke: async (command:string,args:any) => {
   invokeCalls.push([command,args]);
+  if (command==='api_get_meeting_transcripts') return {transcripts:[{id:'t',text:'A meeting transcript',timestamp:'00:00:01'}],total_count:1,has_more:false};
+  if (command==='codex_cli_get_status') return typeof codexStatus === 'function' ? codexStatus() : codexStatus;
   if (command==='api_get_summary') return typeof response==='function'?response(args.meetingId):response;
   if (command==='api_cancel_summary') { if (cancelFails) throw new Error('IPC failed'); return {}; }
   throw new Error(`unexpected ${command}`);
@@ -26,11 +30,11 @@ const {useSummaryGeneration} = await import('../../src/hooks/meeting-details/use
 let current: ReturnType<typeof useSummaryGeneration>;
 const roots: ReactTestRenderer[]=[];
 function Probe({id}:{id:string}) {
- current=useSummaryGeneration({meeting:{id,created_at:'2026-09-18'},transcripts:[],modelConfig:{provider:'claude',model:'claude-sonnet-4-5',whisperModel:'base'},isModelConfigLoading:false,selectedTemplate:'standard',setAiSummary:(value)=>updates.push(value),onMeetingUpdated:async()=>{refreshes++;}});
+ current=useSummaryGeneration({meeting:{id,created_at:'2026-09-18'},transcripts:[],modelConfig:{provider,model:'claude-sonnet-4-5',whisperModel:'base'},isModelConfigLoading:false,selectedTemplate:'standard',setAiSummary:(value)=>updates.push(value),onMeetingUpdated:async()=>{refreshes++;}});
  return null;
 }
 async function mount(id='a') { let root!:ReactTestRenderer; await act(async()=>{root=create(<Probe id={id}/>);}); roots.push(root);return root; }
-beforeEach(()=>{ response=null;invokeCalls=[];updates=[];refreshes=0;polls=[];stopped=[];toasts=[];cancelFails=false; });
+beforeEach(()=>{ response=null;invokeCalls=[];updates=[];refreshes=0;polls=[];stopped=[];toasts=[];cancelFails=false;provider='claude';codexStatus={installed:false,logged_in:false,error:'Codex is missing'}; });
 afterEach(async()=>{await act(async()=>{roots.splice(0).forEach(root=>root.unmount());});});
 
 test('returning to a pending summary resumes polling and completion refreshes once',async()=>{
@@ -80,3 +84,14 @@ test('a failed cancellation is not reported as a successful stop',async()=>{
  expect(current.summaryStatus).toBe('error');expect(current.summaryError).toContain('Could not cancel');
  expect(stopped).toHaveLength(0);
 });
+
+for (const regenerate of [false, true]) {
+ test(`Codex readiness failure exits ${regenerate ? 'regeneration' : 'generation'} busy state`, async () => {
+  provider = 'codex-cli'; response = {meeting_id:'a',status:'idle',data:null};
+  await mount();
+  await act(async () => { if (regenerate) await current.handleRegenerateSummary(); else expect(await current.handleGenerateSummary()).toBe(false); });
+  expect(current.summaryStatus).toBe('error');
+  expect(current.summaryError).toBe('Codex is missing');
+  expect(invokeCalls.some(([command]) => command === 'api_process_transcript')).toBe(false);
+ });
+}

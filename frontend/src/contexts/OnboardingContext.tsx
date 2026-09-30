@@ -100,7 +100,7 @@ export function OnboardingProvider({ children }: { children: React.ReactNode }) 
   // Permissions state
   const [permissions, setPermissions] = useState<OnboardingPermissions>({
     microphone: 'not_determined',
-    systemAudio: 'not_determined',
+    systemAudio: 'unknown',
     screenRecording: 'not_determined',
   });
   const [permissionsSkipped, setPermissionsSkipped] = useState(false);

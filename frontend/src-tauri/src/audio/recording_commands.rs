@@ -1164,7 +1164,7 @@ async fn stop_recording_inner<R: Runtime>(
         "recording-shutdown-progress",
         serde_json::json!({
             "stage": "finalizing",
-            "message": "Finalizing recording and cleaning up resources...",
+            "message": "Saving recording audio...",
             "progress": 90
         }),
     );

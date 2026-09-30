@@ -276,6 +276,8 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
             whisperModel: data.whisperModel || prev.whisperModel,
             ollamaEndpoint: data.ollamaEndpoint,
             summaryMaxTokens: data.summaryMaxTokens ?? null,
+            claudeCliPath: data.claudeCliPath ?? null,
+            codexCliPath: data.codexCliPath ?? null,
           }));
 
           // Seed per-provider model cache from DB
@@ -367,6 +369,7 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
     ollama: models.map(model => model.name),
     claude: ['claude-3-5-sonnet-latest'],
     'claude-cli': ['sonnet', 'opus', 'haiku', 'default'],
+    'codex-cli': ['default'],
     groq: ['llama-3.3-70b-versatile'],
     openrouter: [],
     openai: ['gpt-4', 'gpt-4-turbo', 'gpt-3.5-turbo'],

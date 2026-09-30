@@ -12,6 +12,7 @@ import remarkGfm from 'remark-gfm';
 import { ArrowUp, RotateCcw, Sparkles, Trash2 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { Hint } from '@/components/ui/tooltip';
+import { askAiCopy } from '@/lib/ask-ai-language';
 
 export interface ChatMessage {
   id: string;
@@ -71,6 +72,8 @@ function toSeconds(stamp: string): number {
 
 export interface ChatThreadProps {
   historyKey: string;
+  language?: string;
+  disabled?: boolean;
   ask: (question: string, history: Array<{ question: string; answer: string }>) => Promise<string>;
   suggestions?: string[];
   placeholder?: string;
@@ -84,16 +87,19 @@ export interface ChatThreadProps {
 
 export function ChatThread({
   historyKey,
+  language = 'en',
+  disabled = false,
   ask,
   suggestions = [],
-  placeholder = 'Ask a question…',
-  emptyTitle = 'Ask anything',
+  placeholder,
+  emptyTitle,
   emptyHint,
   footnote,
   onSeek,
   className,
   compact = false,
 }: ChatThreadProps) {
+  const copy = askAiCopy(language);
   const [messages, update] = useChatHistory(historyKey);
   const [draft, setDraft] = useState('');
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -107,7 +113,7 @@ export function ChatThread({
 
   const send = async (question: string) => {
     const text = question.trim();
-    if (!text || busy) return;
+    if (!text || busy || disabled) return;
     const id = `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
     const history = messages.filter((m) => m.status === 'done' && m.answer).map((m) => ({ question: m.question, answer: m.answer! }));
     update((current) => [...current, { id, question: text, status: 'pending' }]);
@@ -117,7 +123,7 @@ export function ChatThread({
       const answer = await ask(text, history);
       update((current) => current.map((m) => (m.id === id ? { ...m, answer, status: 'done' } : m)));
     } catch (error) {
-      const message = typeof error === 'string' ? error : error instanceof Error ? error.message : 'Request failed';
+      const message = typeof error === 'string' ? error : error instanceof Error ? error.message : copy.requestFailed;
       update((current) => current.map((m) => (m.id === id ? { ...m, answer: message, status: 'error' } : m)));
     }
   };
@@ -135,7 +141,7 @@ export function ChatThread({
             <span className="mb-3 flex h-10 w-10 items-center justify-center rounded-xl bg-af-accent/[0.12] text-af-accent">
               <Sparkles className="h-4 w-4" />
             </span>
-            <p className="text-sm font-medium text-af-text">{emptyTitle}</p>
+            <p className="text-sm font-medium text-af-text">{emptyTitle ?? copy.emptyTitle}</p>
             {emptyHint && <p className="mt-1 max-w-xs text-xs leading-relaxed text-af-text-3">{emptyHint}</p>}
             {suggestions.length > 0 && (
               <div className="mt-4 flex max-w-sm flex-wrap justify-center gap-1.5">
@@ -144,6 +150,7 @@ export function ChatThread({
                     key={suggestion}
                     type="button"
                     onClick={() => void send(suggestion)}
+                    disabled={disabled}
                     className="rounded-full border border-af-border bg-af-panel-2 px-3 py-1.5 text-xs text-af-text-2 transition-colors hover:border-af-accent/40 hover:text-af-text"
                   >
                     {suggestion}
@@ -172,13 +179,13 @@ export function ChatThread({
                           <span key={dot} className="h-1.5 w-1.5 animate-af-breathe rounded-full bg-af-text-3" style={{ animationDelay: `${dot * 180}ms` }} />
                         ))}
                       </span>
-                      Reading the records…
+                      {copy.reading}
                     </span>
                   ) : message.status === 'error' ? (
                     <div className="space-y-2">
-                      <p className="text-af-danger">Couldn’t answer: {message.answer}</p>
-                      <button type="button" onClick={() => retry(message)} className="inline-flex items-center gap-1.5 text-xs text-af-text-2 hover:text-af-text">
-                        <RotateCcw className="h-3 w-3" /> Try again
+                      <p className="text-af-danger">{copy.failed} {message.answer}</p>
+                      <button type="button" disabled={disabled} onClick={() => retry(message)} className="inline-flex items-center gap-1.5 text-xs text-af-text-2 hover:text-af-text">
+                        <RotateCcw className="h-3 w-3" /> {copy.retry}
                       </button>
                     </div>
                   ) : (
@@ -236,16 +243,16 @@ export function ChatThread({
                 void send(draft);
               }
             }}
-            placeholder={placeholder}
+            placeholder={placeholder ?? copy.placeholder}
             className="af-bare max-h-[120px] min-h-[32px] flex-1 resize-none bg-transparent py-1.5 text-[13px] leading-relaxed text-af-text outline-none placeholder:text-af-text-4"
           />
           {messages.length > 0 && (
-            <Hint label="Clear conversation">
+            <Hint label={copy.clear}>
               <button
                 type="button"
                 onClick={() => update(() => [])}
                 disabled={busy}
-                aria-label="Clear conversation"
+                aria-label={copy.clear}
                 className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-af-text-4 transition-colors hover:bg-af-hover hover:text-af-text-2 disabled:opacity-40"
               >
                 <Trash2 className="h-3.5 w-3.5" />
@@ -254,8 +261,8 @@ export function ChatThread({
           )}
           <button
             type="submit"
-            disabled={busy || !draft.trim()}
-            aria-label="Send"
+            disabled={disabled || busy || !draft.trim()}
+            aria-label={copy.send}
             className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-af-accent text-af-on-accent transition-[background-color,opacity,transform] hover:bg-af-accent-hover active:scale-95 disabled:opacity-35"
           >
             <ArrowUp className="h-4 w-4" />

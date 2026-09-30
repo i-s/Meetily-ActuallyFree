@@ -1,6 +1,6 @@
 export type OnboardingStep = 1 | 2 | 3 | 4 | 5;
 
-export type PermissionStatus = 'checking' | 'not_determined' | 'authorized' | 'denied';
+export type PermissionStatus = 'checking' | 'not_determined' | 'authorized' | 'denied' | 'verified' | 'unknown';
 
 export interface OnboardingPermissions {
   microphone: PermissionStatus;

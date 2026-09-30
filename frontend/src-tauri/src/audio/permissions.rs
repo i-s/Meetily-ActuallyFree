@@ -5,6 +5,10 @@
 // `check_screen_recording_permission` reports platform support only; the audible
 // up-to-five-second probe below is the actual runtime verification.
 use anyhow::Result;
+
+#[path = "permission_probe.rs"]
+mod permission_probe;
+pub use permission_probe::SystemAudioProbeResult;
 use log::{info, warn, error};
 
 #[cfg(target_os = "macos")]
@@ -94,52 +98,31 @@ pub async fn request_screen_recording_permission_command() -> Result<(), String>
         .map_err(|e| e.to_string())
 }
 
-/// Trigger the system-audio permission request and probe functional capture.
-/// Returns Ok(true) only when the started tap receives audible system audio;
-/// false can mean denial, silence, or another capture initialization failure.
+/// Trigger the permission prompt and classify a bounded native capture probe.
 #[cfg(target_os = "macos")]
-pub fn trigger_system_audio_permission() -> Result<bool> {
-    info!("🔐 Triggering Audio Capture permission request...");
-
-    match crate::audio::capture::CoreAudioCapture::new() {
-        Ok(capture) => {
-            info!("✅ Core Audio tap created; starting native capture probe");
-            let detected = capture.probe(std::time::Duration::from_secs(5))?;
-            if detected {
-                info!("✅ Native system audio capture verified");
-            } else {
-                warn!(
-                    "Audio Capture returned silence; permission may be denied or no audio was playing"
-                );
-            }
-            Ok(detected)
-        }
-        Err(e) => {
-            let error_msg = e.to_string().to_lowercase();
-            if error_msg.contains("permission") || error_msg.contains("denied") {
-                info!("🔐 Audio Capture permission denied");
-                info!("👉 Please grant Audio Capture permission in System Settings");
-                return Ok(false);
-            }
-            warn!("⚠️ Failed to create Core Audio tap: {}", e);
-            // If tap creation fails for other reasons, still return false
-            // as we can't verify permission status
-            Ok(false)
-        }
-    }
+pub fn trigger_system_audio_permission() -> Result<SystemAudioProbeResult> {
+    let result = permission_probe::run_probe(|| {
+        let capture = crate::audio::capture::CoreAudioCapture::new()?;
+        capture.probe(std::time::Duration::from_secs(5))
+    });
+    info!("Audio Capture probe: {:?}", result);
+    Ok(result)
 }
 
 #[cfg(not(target_os = "macos"))]
-pub fn trigger_system_audio_permission() -> Result<bool> {
-    // System audio permissions not required on other platforms
-    info!("System audio permissions not required on this platform");
-    Ok(true)
+pub fn trigger_system_audio_permission() -> Result<SystemAudioProbeResult> {
+    // These platforms have no separate Audio Capture permission prompt.
+    Ok(SystemAudioProbeResult {
+        detected: true,
+        conclusive: true,
+        reason: "permission_not_required",
+    })
 }
 
 /// Trigger Audio Capture permission and test for audible samples for up to five
-/// seconds. False is not a definitive denial status because silence is identical.
+/// seconds. An inaudible probe is inconclusive, even with zero callbacks.
 #[tauri::command]
-pub async fn trigger_system_audio_permission_command() -> Result<bool, String> {
+pub async fn trigger_system_audio_permission_command() -> Result<SystemAudioProbeResult, String> {
     // Run in blocking task to avoid blocking the async runtime
     tokio::task::spawn_blocking(|| {
         trigger_system_audio_permission()

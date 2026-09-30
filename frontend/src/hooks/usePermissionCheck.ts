@@ -1,134 +1,77 @@
 import { useState, useEffect, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { usePlatform } from './usePlatform';
+import { applySystemAudioProbe, readSystemAudioPermission, SystemAudioPermission, SystemAudioProbeResult } from '@/lib/system-audio-permission';
+export { MACOS_SYSTEM_AUDIO_VERIFIED_KEY } from '@/lib/system-audio-permission';
 
 export interface PermissionStatus {
   hasMicrophone: boolean;
-  hasSystemAudio: boolean;
+  systemAudio: SystemAudioPermission;
   isChecking: boolean;
   error: string | null;
 }
 
-// Audible samples are the only reliable proof that the tap works. Keep this
-// session-scoped so a permission revoked between app launches is not trusted.
-export const MACOS_SYSTEM_AUDIO_VERIFIED_KEY = 'macos_system_audio_verified';
-
-// The last result in this window, so a page that mounts again (the recorder)
-// shows the record card at once while the device check re-runs behind it.
-let lastKnown: { hasMicrophone: boolean; hasSystemAudio: boolean } | null = null;
+// Device availability is cached for a smooth remount; permission evidence lives
+// in the versioned session cache and is never inferred from an output device.
+let lastMicrophone: boolean | null = null;
 
 export function usePermissionCheck() {
   const platform = usePlatform();
   const requestInFlight = useRef<Promise<void> | null>(null);
+  const evidence = useRef<SystemAudioPermission>(readSystemAudioPermission());
   const [status, setStatus] = useState<PermissionStatus>(() => ({
-    hasMicrophone: lastKnown?.hasMicrophone ?? false,
-    hasSystemAudio: lastKnown?.hasSystemAudio ?? false,
-    isChecking: lastKnown === null,
+    hasMicrophone: lastMicrophone ?? false,
+    systemAudio: evidence.current,
+    isChecking: lastMicrophone === null,
     error: null,
   }));
 
   const checkPermissions = async () => {
-    // A known result stays on screen during a background re-check.
-    if (lastKnown === null) setStatus(prev => ({ ...prev, isChecking: true, error: null }));
-
     try {
-      // Get audio devices to check for microphone and system audio availability
       const devices = await invoke<Array<{ name: string; device_type: 'Input' | 'Output' }>>('get_audio_devices');
-
-      // Check for microphone devices (Input)
-      const inputDevices = devices.filter(d => d.device_type === 'Input');
-      const hasMicrophone = inputDevices.length > 0;
-
-      // Output availability is separate from macOS Audio Capture authorization;
-      // requestPermissions runs the native tap probe when the user asks.
-      const outputDevices = devices.filter(d => d.device_type === 'Output');
-      const systemAudioVerified =
-        platform !== 'macos' ||
-        window.sessionStorage.getItem(MACOS_SYSTEM_AUDIO_VERIFIED_KEY) === 'true';
-      const hasSystemAudio = outputDevices.length > 0 && systemAudioVerified;
-
-      console.log('Permission check:', {
-        hasMicrophone,
-        hasSystemAudio,
-        inputDevices: inputDevices.length,
-        outputDevices: outputDevices.length
-      });
-
-      lastKnown = { hasMicrophone, hasSystemAudio };
-      setStatus({
-        hasMicrophone,
-        hasSystemAudio,
-        isChecking: false,
-        error: null,
-      });
-
-      return { hasMicrophone, hasSystemAudio };
+      const hasMicrophone = devices.some(d => d.device_type === 'Input');
+      const cached = readSystemAudioPermission();
+      if (cached !== 'unknown') evidence.current = cached;
+      const systemAudio = platform === 'macos' || platform === 'unknown'
+        ? evidence.current
+        : devices.some(d => d.device_type === 'Output') ? 'verified' : 'unknown';
+      lastMicrophone = hasMicrophone;
+      setStatus({ hasMicrophone, systemAudio, isChecking: false, error: null });
     } catch (error) {
-      console.error('Failed to check audio permissions:', error);
-      setStatus({
-        hasMicrophone: false,
-        hasSystemAudio: false,
-        isChecking: false,
-        error: error instanceof Error ? error.message : 'Failed to check permissions',
-      });
-      return { hasMicrophone: false, hasSystemAudio: false };
+      // Enumeration failures do not revoke prior capture evidence.
+      setStatus(prev => ({ ...prev, isChecking: false,
+        error: error instanceof Error ? error.message : 'Failed to check permissions' }));
     }
   };
 
   const requestPermissions = () => {
-    // The native probe runs for up to five seconds; deduplicate Recheck clicks
-    // so an older result cannot overwrite a newer permission attempt.
+    // Deduplicate the bounded native probe; a slower attempt cannot overwrite a
+    // later one in this hook. Silence and IPC errors never poison the cache.
     if (requestInFlight.current) return requestInFlight.current;
-
     const request = (async () => {
       setStatus(prev => ({ ...prev, isChecking: true, error: null }));
       try {
         await invoke('trigger_microphone_permission');
-        let systemAudioDetected: boolean | null = null;
         if (platform === 'macos') {
-          systemAudioDetected = await invoke<boolean>('trigger_system_audio_permission_command');
-          window.sessionStorage.setItem(
-            MACOS_SYSTEM_AUDIO_VERIFIED_KEY,
-            String(systemAudioDetected),
-          );
+          const result = await invoke<SystemAudioProbeResult>('trigger_system_audio_permission_command');
+          evidence.current = applySystemAudioProbe(result, evidence.current);
+          setStatus(prev => ({ ...prev, systemAudio: evidence.current }));
         }
-
         await new Promise(resolve => setTimeout(resolve, 1000));
-        const availability = await checkPermissions();
-        if (systemAudioDetected !== null) {
-          setStatus(prev => ({
-            ...prev,
-            hasSystemAudio: availability.hasSystemAudio && systemAudioDetected,
-          }));
-        }
+        await checkPermissions();
       } catch (error) {
-        console.error('Failed to request permissions:', error);
-        if (platform === 'macos') {
-          window.sessionStorage.setItem(MACOS_SYSTEM_AUDIO_VERIFIED_KEY, 'false');
-        }
-        setStatus(prev => ({
-          ...prev,
-          hasSystemAudio: false,
-          error: error instanceof Error ? error.message : 'Failed to request permissions',
-        }));
+        setStatus(prev => ({ ...prev,
+          error: error instanceof Error ? error.message : 'Could not verify audio. Play audio and check again.' }));
       } finally {
         requestInFlight.current = null;
         setStatus(prev => ({ ...prev, isChecking: false }));
       }
     })();
-
     requestInFlight.current = request;
     return request;
   };
 
-  // Check permissions on mount
-  useEffect(() => {
-    checkPermissions();
-  }, []);
+  useEffect(() => { void checkPermissions(); }, [platform]);
 
-  return {
-    ...status,
-    checkPermissions,
-    requestPermissions,
-  };
+  return { ...status, checkPermissions, requestPermissions };
 }

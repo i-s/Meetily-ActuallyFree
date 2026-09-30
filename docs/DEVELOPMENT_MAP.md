@@ -22,6 +22,10 @@ Speech-start pre-roll, live system speech sensitivity, and real-call replay
 qualification are documented in [LIVE_SPEECH_RETENTION.md](LIVE_SPEECH_RETENTION.md).
 Sample continuity across jittered capture callbacks and issue #40 qualification
 are documented in [AUDIO_CALLBACK_CONTINUITY.md](AUDIO_CALLBACK_CONTINUITY.md).
+Checkpoint encoding, Stop ownership, and the macOS saver deadlock are documented
+in [RECORDING_SHUTDOWN.md](RECORDING_SHUTDOWN.md).
+Recording-stop ownership, diagnostic stages, and shutdown regressions are
+documented in [RECORDING_SHUTDOWN.md](RECORDING_SHUTDOWN.md).
 
 ```text
 recording_commands.rs: start command
@@ -103,6 +107,9 @@ source labels rather than guessing a speaker or switching engines.
 
 Summary-generated title ownership, placeholder rejection and completion refresh
 are documented in [SUMMARY_GENERATED_TITLES.md](SUMMARY_GENERATED_TITLES.md).
+The Codex CLI subscription provider and its subprocess contract are documented
+in [CODEX_CLI.md](CODEX_CLI.md). Ask AI language selection, localized suggestions,
+and answer instructions are documented in [ASK_AI_LANGUAGE.md](ASK_AI_LANGUAGE.md).
 
 `diarization/mod.rs` owns persisted engine settings and offline command dispatch.
 Nemotron is Auto-detect only; manual counts belong to Pyannote. Rerunning speaker

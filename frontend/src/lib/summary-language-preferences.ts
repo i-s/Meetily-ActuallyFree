@@ -1,6 +1,12 @@
 import { invoke } from '@tauri-apps/api/core';
 import { normaliseLanguageCode } from '@/lib/summary-languages';
 
+export const SUMMARY_LANGUAGE_CHANGED_EVENT = 'summary-language-changed';
+
+function announceLanguageChange(): void {
+  if (typeof window !== 'undefined') window.dispatchEvent(new Event(SUMMARY_LANGUAGE_CHANGED_EVENT));
+}
+
 export const SUMMARY_LANGUAGE_RECENTS_KEY = 'summaryLanguageRecents';
 export const SUMMARY_LANGUAGE_DEFAULT_KEY = 'summaryLanguageDefault';
 const SUMMARY_LANGUAGE_FALLBACK_PREFIX = 'summaryLanguageFallback';
@@ -44,6 +50,7 @@ export function writePinnedSummaryLanguageDefault(value: string | null): void {
   try {
     if (value) window.localStorage.setItem(SUMMARY_LANGUAGE_DEFAULT_KEY, value);
     else window.localStorage.removeItem(SUMMARY_LANGUAGE_DEFAULT_KEY);
+    announceLanguageChange();
   } catch {
     // Preference writes are non-critical; meeting-specific persistence happens separately.
   }
@@ -132,6 +139,7 @@ export async function saveMeetingSummaryLanguage(
     if (!writeLanguageFallback(SUMMARY_LANGUAGE_FALLBACK_PREFIX, meetingId, normalised)) {
       throw new Error('Failed to save summary language on this device');
     }
+    announceLanguageChange();
     return {
       language: normalised,
       storage: 'local_fallback',
@@ -139,6 +147,7 @@ export async function saveMeetingSummaryLanguage(
   }
 
   writeLanguageFallback(SUMMARY_LANGUAGE_FALLBACK_PREFIX, meetingId, null);
+  announceLanguageChange();
   return {
     language: normaliseLanguageCode(response.language ?? normalised),
     storage: 'metadata',

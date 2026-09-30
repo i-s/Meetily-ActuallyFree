@@ -6,14 +6,14 @@ import { Button } from '@/components/ui/button';
 import type { PermissionRowProps } from '@/types/onboarding';
 
 export function PermissionRow({ icon, title, description, status, isPending = false, onAction }: PermissionRowProps) {
-  const isAuthorized = status === 'authorized';
+  const isAuthorized = status === 'authorized' || status === 'verified';
   const isDenied = status === 'denied';
   const isChecking = isPending;
 
   const getButtonText = () => {
     if (isChecking) return 'Checking...';
     if (isDenied) return 'Open Settings';
-    return 'Enable';
+    return status === 'unknown' ? 'Check again' : 'Enable';
   };
 
   return (

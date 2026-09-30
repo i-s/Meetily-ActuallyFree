@@ -495,6 +495,13 @@ function handle(cmd: string, args: Args): unknown {
       state.diarization.nemotron_threshold = args.nemotronThreshold;
       state.diarization.pyannote_threshold = args.pyannoteThreshold;
       return null;
+    case 'codex_cli_get_status':
+      return {installed: true, path: '/opt/homebrew/bin/codex', version: 'codex-cli (preview)', logged_in: true, error: null};
+    case 'codex_cli_get_path':
+    case 'codex_cli_save_path':
+      return null;
+    case 'codex_cli_test_connection':
+      return {status: 'success', message: 'Codex CLI responded: ready'};
     case 'claude_cli_get_status':
       return {
         installed: true,

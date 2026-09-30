@@ -3,11 +3,12 @@ import { AlertTriangle, Mic, RefreshCw, Speaker } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { Button } from '@/components/ui/button';
+import type { SystemAudioPermission } from '@/lib/system-audio-permission';
 import { useIsLinux } from '@/hooks/usePlatform';
 
 interface PermissionWarningProps {
   hasMicrophone: boolean;
-  hasSystemAudio: boolean;
+  systemAudio: SystemAudioPermission;
   onRecheck: () => void;
   isRechecking?: boolean;
   className?: string;
@@ -16,12 +17,15 @@ interface PermissionWarningProps {
 /** Explains a missing microphone or system audio permission, with ways to fix it. */
 export function PermissionWarning({
   hasMicrophone,
-  hasSystemAudio,
+  systemAudio,
   onRecheck,
   isRechecking = false,
   className,
 }: PermissionWarningProps) {
   const isLinux = useIsLinux();
+
+  const hasSystemAudio = systemAudio === 'verified';
+  const systemAudioDenied = systemAudio === 'denied';
 
   // Linux has no permission prompts; nothing to explain when both work.
   if (isLinux || (hasMicrophone && hasSystemAudio)) return null;
@@ -32,11 +36,9 @@ export function PermissionWarning({
       console.error(`Failed to open ${preferencePane} settings:`, error),
     );
 
-  const title = !hasMicrophone && !hasSystemAudio
-    ? 'Meetily can’t hear your microphone or computer audio'
-    : !hasMicrophone
-      ? 'Meetily can’t hear your microphone'
-      : 'Meetily can’t record computer audio';
+  const title = !hasMicrophone
+    ? systemAudioDenied ? 'Meetily can’t hear your microphone or computer audio' : 'Meetily can’t hear your microphone'
+    : systemAudioDenied ? 'Computer audio permission was denied' : 'Computer audio has not been verified';
 
   return (
     <Alert variant="warning" className={className}>
@@ -51,10 +53,9 @@ export function PermissionWarning({
         )}
         {!hasSystemAudio && (
           <p>
-            {hasMicrophone
-              ? 'You can still record your microphone, but the other side of the call won’t be captured.'
-              : 'Computer audio capture is unavailable too.'}
-            {isMacOS && ' On macOS, allow Audio Capture for Meetily, play some audio, then check again. Restart Meetily if it stays silent.'}
+            {systemAudioDenied
+              ? 'Allow Audio Capture for Meetily in system settings, then play audio and check again.'
+              : 'Play some computer audio and check again. A quiet check cannot confirm whether capture is available.'}
           </p>
         )}
         <div className="flex flex-wrap gap-2 pt-1">
@@ -64,7 +65,7 @@ export function PermissionWarning({
               Microphone settings
             </Button>
           )}
-          {isMacOS && !hasSystemAudio && (
+          {isMacOS && systemAudioDenied && (
             <Button size="sm" variant="secondary" onClick={() => openSettings('Privacy_AudioCapture')}>
               <Speaker />
               Audio Capture settings

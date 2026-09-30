@@ -12,6 +12,7 @@ function installLocalStorage() {
   Object.defineProperty(globalThis, "window", {
     configurable: true,
     value: {
+      dispatchEvent: (event) => new EventTarget().dispatchEvent(event),
       localStorage: {
         getItem: (key) => values.get(key) ?? null,
         setItem: (key, value) => {
@@ -34,6 +35,7 @@ function installFailingLocalStorage() {
   Object.defineProperty(globalThis, "window", {
     configurable: true,
     value: {
+      dispatchEvent: (event) => new EventTarget().dispatchEvent(event),
       localStorage: {
         getItem: () => null,
         setItem: () => {

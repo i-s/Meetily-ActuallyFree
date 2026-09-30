@@ -1,0 +1,31 @@
+import React from 'react';
+import {act, create, ReactTestRenderer} from 'react-test-renderer';
+import {afterEach, expect, mock, test} from 'bun:test';
+const pending: Array<{path: string; resolve: (status: any) => void}> = [];
+const statuses: any[] = [];
+mock.module('@tauri-apps/api/core', () => ({invoke: (command: string, args: any) => {
+  expect(command).toBe('codex_cli_get_status');
+  return new Promise(resolve => pending.push({path: args.path, resolve}));
+}}));
+mock.module('@/components/ui/button', () => ({Button: (props: any) => <button {...props} />}));
+mock.module('@/components/ui/input', () => ({Input: (props: any) => <input {...props} />}));
+mock.module('@/components/ui/label', () => ({Label: (props: any) => <label {...props} />}));
+const {CodexCliSettings} = await import('../../src/components/CodexCliSettings');
+let root: ReactTestRenderer;
+const onStatusChange = (status: any) => statuses.push(status);
+const panel = (path: string) => <CodexCliSettings path={path} model="default" onPathChange={() => {}} onStatusChange={onStatusChange} />;
+afterEach(async () => {await act(async () => root?.unmount()); pending.length = 0; statuses.length = 0;});
+test('path changes invalidate readiness and discard stale status probes', async () => {
+  await act(async () => {root = create(panel('/old/codex'));});
+  await act(async () => {await new Promise(resolve => setTimeout(resolve, 430));});
+  const old = pending.shift()!;
+  expect(old.path).toBe('/old/codex');
+  await act(async () => root.update(panel('/new/codex')));
+  expect(statuses.at(-1)).toBeNull();
+  await act(async () => {await new Promise(resolve => setTimeout(resolve, 430));});
+  const latest = pending.shift()!;
+  await act(async () => latest.resolve({installed: false, logged_in: false, error: 'Missing executable'}));
+  await act(async () => old.resolve({installed: true, logged_in: true}));
+  expect(statuses.at(-1).error).toBe('Missing executable');
+  expect(root.root.findAllByType('button').find(button => button.children.includes('Test AI call'))!.props.disabled).toBe(true);
+});

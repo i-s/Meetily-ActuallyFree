@@ -1,4 +1,5 @@
 import React, { useEffect, useState, useCallback } from 'react';
+import { applySystemAudioProbe, SystemAudioProbeResult } from '@/lib/system-audio-permission';
 import { invoke } from '@tauri-apps/api/core';
 import { toast } from 'sonner';
 import { Mic, Volume2 } from 'lucide-react';
@@ -77,22 +78,23 @@ export function PermissionsStep() {
     setIsPending(true);
     try {
       console.log('[PermissionsStep] Triggering Audio Capture permission...');
-      // Backend creates Core Audio tap, captures audio, and verifies it's not silence
-      // Returns true if permission granted and audio verified, false if denied (silence)
-      const granted = await invoke<boolean>('trigger_system_audio_permission_command');
-      console.log('[PermissionsStep] System audio permission result:', granted);
-
-      if (granted) {
-        setPermissionStatus('systemAudio', 'authorized');
-        console.log('[PermissionsStep] Audio Capture permission verified - audio is not silence');
-      } else {
-        // Permission was denied (audio is silence)
-        setPermissionStatus('systemAudio', 'denied');
-        console.log('[PermissionsStep] Audio Capture permission denied - audio is silence');
+      const result = await invoke<SystemAudioProbeResult>('trigger_system_audio_permission_command');
+      const previous = permissions.systemAudio === 'verified' || permissions.systemAudio === 'authorized'
+        ? 'verified' : undefined;
+      const status = applySystemAudioProbe(result, previous);
+      setPermissionStatus('systemAudio', status);
+      if (status === 'unknown') {
+        toast.info('Computer audio has not been verified', {
+          description: 'Play some audio and check again. A quiet check does not mean permission was denied.',
+        });
       }
     } catch (err) {
-      console.error('[PermissionsStep] Failed to request system audio permission:', err);
-      setPermissionStatus('systemAudio', 'denied');
+      console.error('[PermissionsStep] Could not verify system audio:', err);
+      // An IPC or initialization failure supplies no new authorization evidence.
+      if (permissions.systemAudio !== 'verified' && permissions.systemAudio !== 'authorized') {
+        setPermissionStatus('systemAudio', 'unknown');
+      }
+      toast.info('Could not verify computer audio', { description: 'Play some audio and check again.' });
     } finally {
       setIsPending(false);
     }
@@ -114,7 +116,7 @@ export function PermissionsStep() {
 
   const allPermissionsGranted =
     permissions.microphone === 'authorized' &&
-    permissions.systemAudio === 'authorized';
+    (permissions.systemAudio === 'verified' || permissions.systemAudio === 'authorized');
 
   return (
     <OnboardingContainer
@@ -142,7 +144,7 @@ export function PermissionsStep() {
           <PermissionRow
             icon={<Volume2 className="w-5 h-5" />}
             title="System Audio"
-            description="Click Enable to grant Audio Capture permission"
+            description="Play some computer audio, then check Audio Capture"
             status={permissions.systemAudio}
             isPending={isPending}
             onAction={handleSystemAudioAction}
@@ -164,7 +166,7 @@ export function PermissionsStep() {
 
           {!allPermissionsGranted && (
             <p className="text-xs text-center text-muted-foreground">
-              Recording won't work without permissions. You can grant them later in settings.
+              You can verify computer audio later by playing audio and checking again.
             </p>
           )}
         </div>
