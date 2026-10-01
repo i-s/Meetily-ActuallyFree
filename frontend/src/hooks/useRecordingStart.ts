@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
+import { useRouter } from 'next/navigation';
 import { transcriptionRuntimeMessage } from '@/lib/transcription-runtime';
 import { invoke } from '@tauri-apps/api/core';
 import { useTranscripts } from '@/contexts/TranscriptContext';
@@ -8,8 +9,9 @@ import { useRecordingState, RecordingStatus } from '@/contexts/RecordingStateCon
 import { recordingService } from '@/services/recordingService';
 import { readPendingGroup } from '@/lib/groups';
 import { automaticTitle, beginLiveSession } from '@/lib/live-session';
-import { AUTO_START_KEY, START_RECORDING_EVENT } from '@/lib/recording-launch';
-import { beginAutomatedRecording, endAutomatedRecording, takeAutomatedStart } from '@/lib/meeting-automation';
+import { AUTO_START_KEY, START_RECORDING_EVENT, requestRecordingStop } from '@/lib/recording-launch';
+import { automatedRecording, beginAutomatedRecording, endAutomatedRecording, hasPendingAutomatedStart, sameAutomatedCall, takeAutomatedStart } from '@/lib/meeting-automation';
+import { loadLabsPreferences } from '@/lib/labs';
 import Analytics from '@/lib/analytics';
 import { showRecordingNotification } from '@/lib/recordingNotification';
 import { toast } from 'sonner';
@@ -67,6 +69,7 @@ export function useRecordingStart(
 ): UseRecordingStartReturn {
   const [isAutoStarting, setIsAutoStarting] = useState(false);
   const runtimeErrorRef = useRef<string | null>(null);
+  const router = useRouter();
 
   const { clearTranscripts, setMeetingTitle } = useTranscripts();
   const { setIsMeetingActive, meetings } = useSidebar();
@@ -181,8 +184,13 @@ export function useRecordingStart(
   const startRecording = useCallback(async (source: StartSource): Promise<boolean> => {
     // A detected call asked for this start (Labs meeting automation). A start
     // from the record button is the user's own and is never stopped for them.
+    const pendingAutomation = hasPendingAutomatedStart();
     const automated = takeAutomatedStart();
     const call = source === 'home_page' ? null : automated;
+    if (source !== 'home_page' && pendingAutomation && !call) {
+      setStatus(RecordingStatus.IDLE);
+      return false;
+    }
     // Readying the model can take several seconds (it loads a large model
     // into memory), so say so from the first step.
     setStatus(RecordingStatus.STARTING, 'Preparing transcription model…');
@@ -193,6 +201,24 @@ export function useRecordingStart(
     }
 
     try {
+      // Model preparation can outlast the call. Recheck the same native
+      // session immediately before capture, not only when the toast arrived.
+      if (call?.session_id !== undefined) {
+        if (!loadLabsPreferences().meetingAutomation) {
+          setStatus(RecordingStatus.IDLE);
+          return false;
+        }
+        const confirmed = await invoke<boolean>('validate_meeting_detection_session', {
+          process: call.process, sessionId: call.session_id,
+        });
+        if (!confirmed || !loadLabsPreferences().meetingAutomation) {
+          setStatus(RecordingStatus.IDLE);
+          toast.info('Automatic recording skipped', {
+            description: 'The call could not be confirmed. You can still record manually.',
+          });
+          return false;
+        }
+      }
       const startedAt = Date.now();
       const group = readPendingGroup();
       const title = automaticTitle(new Date(startedAt), group?.name, meetings.map((meeting) => meeting.title));
@@ -214,6 +240,19 @@ export function useRecordingStart(
       Analytics.trackButtonClick('start_recording', source);
       if (call) {
         beginAutomatedRecording(call);
+        if (call.session_id !== undefined) {
+          // An end may arrive while native start is pending, before ownership
+          // exists. Reconcile the tracker after hand-off; Unknown retains the
+          // session, so losing probe evidence never stops a running recording.
+          void invoke<boolean>('meeting_detection_session_exists', {
+            process: call.process, sessionId: call.session_id,
+          }).then((exists) => {
+            const owner = automatedRecording();
+            if (!exists && owner && sameAutomatedCall(owner, call) && loadLabsPreferences().meetingAutomation) {
+              requestRecordingStop((href) => router.push(href));
+            }
+          }).catch((error) => console.error('Could not reconcile automated recording session:', error));
+        }
         toast(`Recording your ${call.app} call`, {
           description: 'Meeting automation started it, and stops and saves it when the call ends.',
           duration: 10000,
@@ -248,6 +287,7 @@ export function useRecordingStart(
     clearTranscripts,
     setIsMeetingActive,
     markRecordingStarted,
+    router,
   ]);
 
   // Record button on this page.

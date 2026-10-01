@@ -17,9 +17,16 @@ interface MeetingDetectionSettings {
   notify: boolean;
 }
 
+interface DetectionDiagnostics {
+  platform: string;
+  accessibility_required: boolean;
+  accessibility_granted: boolean;
+  apps: { app: string; state: 'Call detected' | 'No call' | 'Unknown'; reason: string }[];
+}
+
 /**
- * Meeting Detection settings panel. Watches running processes for meeting apps
- * (Zoom / Teams / Slack / Webex / Discord / …) and prompts to start recording.
+ * Meeting Detection settings panel. Checks supported apps for call evidence
+ * and prompts to start recording.
  * Fully on-device. Persisted install-locally via Rust.
  */
 export function MeetingDetectionSettings() {
@@ -27,6 +34,10 @@ export function MeetingDetectionSettings() {
   const [ignoredInput, setIgnoredInput] = useState('');
   const { labs } = useLabs();
   const [automationBusy, setAutomationBusy] = useState(false);
+  const [diagnostics, setDiagnostics] = useState<DetectionDiagnostics | null>(null);
+  const [diagnosticsBusy, setDiagnosticsBusy] = useState(false);
+  const [diagnosticsError, setDiagnosticsError] = useState(false);
+  const [hasChecked, setHasChecked] = useState(false);
 
   useEffect(() => {
     invoke<MeetingDetectionSettings>('get_meeting_detection_settings')
@@ -61,6 +72,23 @@ export function MeetingDetectionSettings() {
     }
   };
 
+  const checkDetection = async (requestPermission = false) => {
+    if (diagnosticsBusy) return;
+    setDiagnosticsBusy(true);
+    setDiagnosticsError(false);
+    try {
+      // Only this explicit action may show the macOS permission prompt.
+      if (requestPermission) await invoke<boolean>('request_meeting_detection_accessibility');
+      setDiagnostics(await invoke<DetectionDiagnostics>('get_meeting_detection_diagnostics'));
+    } catch {
+      setDiagnostics(null);
+      setDiagnosticsError(true);
+    } finally {
+      setHasChecked(true);
+      setDiagnosticsBusy(false);
+    }
+  };
+
   if (!md) {
     return <div className="max-w-2xl mx-auto p-6 text-af-text-3">Loading…</div>;
   }
@@ -75,8 +103,8 @@ export function MeetingDetectionSettings() {
               Meeting Detection
             </h3>
             <p className="text-sm text-af-text-2">
-              Watch for meeting apps (Zoom, Teams, Slack, Webex, Discord…) and prompt you to start
-              recording when one starts. Runs entirely on-device — no network, no telemetry.
+              Detect calls in Zoom on macOS and Discord on Windows, and prompt you to record.
+              Checks run entirely on your device.
             </p>
           </div>
           <Switch checked={md.enabled} onCheckedChange={(v) => saveMd({ ...md, enabled: v })} />
@@ -133,6 +161,51 @@ export function MeetingDetectionSettings() {
         )}
       </div>
 
+      <div className="rounded-2xl border border-af-border bg-af-panel-2/40 p-5 space-y-3">
+        <div className="flex items-center justify-between gap-4">
+          <h3 className="text-sm font-semibold text-af-text">Test call detection</h3>
+          <button
+            type="button"
+            disabled={diagnosticsBusy}
+            onClick={() => checkDetection()}
+            className="rounded-lg border border-af-border px-3 py-2 text-sm text-af-text disabled:opacity-50"
+          >
+            {diagnosticsBusy ? 'Checking…' : hasChecked ? 'Refresh detection' : 'Check detection'}
+          </button>
+        </div>
+        <p className="text-xs leading-relaxed text-af-text-3">
+          Check while idle, then join a call and refresh. Muting or moving a call to the background
+          can make evidence unavailable; Unknown does not mean the call ended.
+        </p>
+        <div aria-live="polite" aria-busy={diagnosticsBusy}>
+          {diagnosticsError && <p className="text-sm text-af-text-2">Could not check detection. Try again.</p>}
+          {diagnostics && (
+            <div className="space-y-3">
+              {diagnostics.apps.map((app) => (
+                <div key={app.app} className="text-sm">
+                  <p className="text-af-text"><span className="font-medium">{app.app}</span> · {app.state}</p>
+                  <p className="text-xs text-af-text-3">{app.reason}</p>
+                </div>
+              ))}
+              {diagnostics.accessibility_required && !diagnostics.accessibility_granted && (
+                <div className="space-y-2">
+                  <p className="text-xs text-af-text-3">
+                    Allow Meetily in macOS System Settings → Privacy &amp; Security → Accessibility,
+                    then refresh. This lets detection check Zoom&apos;s call controls.
+                  </p>
+                  <button
+                    type="button"
+                    disabled={diagnosticsBusy}
+                    onClick={() => checkDetection(true)}
+                    className="rounded-lg border border-af-border px-3 py-2 text-sm text-af-text disabled:opacity-50"
+                  >Allow Accessibility</button>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      </div>
+
       <div className="flex items-start gap-4 rounded-2xl border border-af-border bg-af-panel-2/40 p-5">
         <span className="mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-af-accent/[0.12] text-af-accent">
           <Workflow className="h-[18px] w-[18px]" />
@@ -143,8 +216,8 @@ export function MeetingDetectionSettings() {
             <Badge variant="accent" size="xs">Labs</Badge>
           </h3>
           <p className="mt-0.5 text-[13px] leading-relaxed text-af-text-3">
-            Instead of prompting, record a detected call once it uses your microphone or camera, and stop and save when it
-            ends. Recordings you start yourself are never stopped.
+            Instead of prompting, record a confirmed call, then stop and save after its end is
+            confirmed. Recordings you start yourself are never stopped.
           </p>
         </div>
         <Switch

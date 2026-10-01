@@ -1,0 +1,218 @@
+name: "Build - Windows Preview fixes"
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-preview-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: "3"
+  CMAKE_BUILD_PARALLEL_LEVEL: "3"
+  TARGET: x86_64-pc-windows-msvc
+
+jobs:
+  build-windows:
+    name: Windows Preview (${{ matrix.backend }})
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: windows-2022
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [cpu, cuda]
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Checkout exact candidate commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Record candidate
+        id: candidate
+        run: |
+          "commit=$(git rev-parse HEAD)" >> $env:GITHUB_OUTPUT
+          if (!(Test-Path Cargo.lock) -or !(Test-Path frontend/pnpm-lock.yaml)) { throw 'Missing lockfile' }
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
+        with:
+          version: 11.9.0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "24"
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: 1.97.1
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache Rust builds
+        uses: swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          workspaces: ". -> target"
+          key: windows-preview-${{ matrix.backend }}-v1
+          cache-on-failure: true
+
+      - name: Cache LLVM 18 and downloaded native resources
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4
+        with:
+          path: |
+            .build-tools/clang+llvm-18.1.8-x86_64-pc-windows-msvc
+            frontend/src-tauri/binaries/ffmpeg-*.exe
+            frontend/src-tauri/binaries/onnxruntime
+          key: windows-preview-resources-${{ hashFiles('frontend/scripts/bootstrap-llvm18.ps1', 'frontend/src-tauri/build/ffmpeg.rs', 'frontend/src-tauri/build/onnxruntime.rs') }}
+
+      - name: Configure MSVC and CMake
+        timeout-minutes: 5
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (!$vs) { throw 'MSVC installation missing' }
+          $vcvars = Join-Path $vs 'VC\Auxiliary\Build\vcvars64.bat'
+          Write-Host "Configuring MSVC from $vcvars"
+          cmd /c "call `"$vcvars`" >nul 2>&1 && set" | ForEach-Object {
+            if ($_ -match '^([^=]+)=(.*)$') {
+              # Persist only vcvars changes, keeping step-scoped GH_TOKEN scoped
+              # and avoiding writes to GitHub's immutable environment variables.
+              if ([Environment]::GetEnvironmentVariable($matches[1], 'Process') -ne $matches[2]) {
+                "$($matches[1])=$($matches[2])" >> $env:GITHUB_ENV
+                [Environment]::SetEnvironmentVariable($matches[1], $matches[2], 'Process')
+              }
+            }
+          }
+          if ($LASTEXITCODE -ne 0) { throw 'MSVC environment setup failed' }
+          "CMAKE_GENERATOR=Ninja" >> $env:GITHUB_ENV
+          $ninja = Join-Path $vs 'Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja'
+          $ninja >> $env:GITHUB_PATH
+          Write-Host "MSVC ready; Ninja directory: $ninja"
+
+      - name: Download LLVM 18 archive
+        timeout-minutes: 15
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./frontend/scripts/bootstrap-llvm18.ps1 -Phase Download
+
+      - name: Verify LLVM 18 archive SHA-256
+        timeout-minutes: 5
+        run: ./frontend/scripts/bootstrap-llvm18.ps1 -Phase Verify
+
+      - name: Extract LLVM 18 archive
+        timeout-minutes: 15
+        run: ./frontend/scripts/bootstrap-llvm18.ps1 -Phase Extract
+
+      - name: Configure and verify libclang
+        timeout-minutes: 2
+        run: |
+          $llvmBin = Join-Path $env:GITHUB_WORKSPACE '.build-tools/clang+llvm-18.1.8-x86_64-pc-windows-msvc/bin'
+          if (!(Test-Path (Join-Path $llvmBin 'libclang.dll'))) { throw 'LLVM libclang.dll missing after extraction' }
+          "LIBCLANG_PATH=$llvmBin" >> $env:GITHUB_ENV
+          & (Join-Path $llvmBin 'clang.exe') --version
+          if ($LASTEXITCODE -ne 0) { throw 'LLVM clang version check failed' }
+
+      - name: Install CUDA 13.0.2 compiler and runtime
+        if: matrix.backend == 'cuda'
+        timeout-minutes: 25
+        uses: Jimver/cuda-toolkit@b8bf9c6c28f8a92fbb04dcfcaee872e60c57462d # v0.2.36
+        with:
+          cuda: '13.0.2'
+          method: network
+          # CUDA 13 separates CRT/NVVM; Windows calls the CCCL package thrust.
+          # Install build/runtime components only, without a GPU driver.
+          sub-packages: '["nvcc", "crt", "nvvm", "cudart", "thrust", "cublas", "cublas_dev"]'
+          use-github-cache: false
+
+      - name: Configure CUDA toolkit
+        if: matrix.backend == 'cuda'
+        timeout-minutes: 2
+        run: |
+          if (!$env:CUDA_PATH) { throw 'CUDA_PATH missing after toolkit installation' }
+          & (Join-Path $env:CUDA_PATH 'bin/nvcc.exe') --version
+          if ($LASTEXITCODE -ne 0) { throw 'CUDA compiler check failed' }
+          "CUDA_TOOLKIT_ROOT_DIR=$env:CUDA_PATH" >> $env:GITHUB_ENV
+          'CARGO_BUILD_JOBS=2' >> $env:GITHUB_ENV
+          'CMAKE_BUILD_PARALLEL_LEVEL=2' >> $env:GITHUB_ENV
+          'NVCC_APPEND_FLAGS=-std=c++17 -Xcompiler=/Zc:preprocessor -DCCCL_IGNORE_MSVC_TRADITIONAL_PREPROCESSOR_WARNING' >> $env:GITHUB_ENV
+          (Join-Path $env:CUDA_PATH 'bin/x64') >> $env:GITHUB_PATH
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: pnpm install --frozen-lockfile
+
+      - name: Test NSIS payload verification
+        run: node --test frontend/scripts/verify-nsis-payload.test.mjs
+
+      - name: Test CUDA runtime dependency packaging
+        run: ./frontend/scripts/preview-cuda-runtime.test.ps1
+
+      # Keep Next, tsc and native compilation sequential: Next owns frontend/out.
+      - name: Build frontend
+        working-directory: frontend
+        run: pnpm run build
+
+      - name: Check frontend types
+        working-directory: frontend
+        run: pnpm exec tsc --noEmit
+
+      - name: Test Codex CLI and meeting detection frontend integration
+        working-directory: frontend
+        run: |
+          $tests = @(Get-ChildItem tests/codex-cli, tests/meeting-detection -Recurse -File | Where-Object { $_.Name -match '\.test\.tsx?$' } | Sort-Object FullName)
+          if ($tests.Count -eq 0) { throw 'No frontend regressions found' }
+          foreach ($test in $tests) {
+            pnpm dlx bun@1.3.10 test $test.FullName
+            if ($LASTEXITCODE -ne 0) { throw "Frontend regression failed: $test" }
+          }
+
+      - name: Build CPU llama-helper
+        run: |
+          cargo build --locked --release --package llama-helper --target $env:TARGET
+          if ($LASTEXITCODE -ne 0) { throw 'llama-helper build failed' }
+          New-Item -ItemType Directory -Force frontend/src-tauri/binaries | Out-Null
+          Copy-Item "target/$env:TARGET/release/llama-helper.exe" "frontend/src-tauri/binaries/llama-helper-$env:TARGET.exe"
+
+      - name: Run native Windows Codex CLI and meeting detection regressions
+        # Hosted runners have no NVIDIA driver/device. The CPU matrix job runs
+        # these platform regressions; CUDA qualification below checks its payload.
+        if: matrix.backend == 'cpu'
+        working-directory: frontend/src-tauri
+        run: |
+          # Target only synthetic regressions; hosted runners cannot qualify live WASAPI calls.
+          # Release also avoids CPAL debug assertions in unrelated Windows audio setup.
+          foreach ($filter in @('codex_cli', 'meeting_detection')) {
+            cargo test --locked --release -p meetily --lib --target $env:TARGET --no-default-features --features custom-protocol $filter -- --nocapture
+            if ($LASTEXITCODE -ne 0) { throw "Native regression failed: $filter" }
+          }
+
+      - name: Build and verify unsigned Preview installer
+        env:
+          BUILD_COMMIT: ${{ steps.candidate.outputs.commit }}
+          PREVIEW_BACKEND: ${{ matrix.backend }}
+        run: |
+          ./frontend/scripts/build-preview-windows.ps1 -Backend $env:PREVIEW_BACKEND
+          git diff --exit-code -- Cargo.lock frontend/pnpm-lock.yaml frontend/src-tauri/tauri.conf.json
+          if ($LASTEXITCODE -ne 0) { throw 'Preview changed version/configuration or lockfiles' }
+
+      - name: Upload candidate artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: meetily-preview-fixes-${{ steps.candidate.outputs.commit }}-windows-x64-${{ matrix.backend }}
+          path: |
+            dist/windows-preview/*
+          if-no-files-found: error
+          retention-days: 30

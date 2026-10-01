@@ -139,7 +139,7 @@ jobs:
           set -euo pipefail
           while IFS= read -r -d '' test_file; do
             pnpm dlx bun@1.3.10 test "$test_file"
-          done < <(find tests/chat tests/codex-cli -type f \( -name '*.test.ts' -o -name '*.test.tsx' \) -print0 | sort -z)
+          done < <(find tests/chat tests/codex-cli tests/meeting-detection -type f \( -name '*.test.ts' -o -name '*.test.tsx' \) -print0 | sort -z)
           pnpm dlx bun@1.3.10 test tests/hooks/recording-shutdown.test.tsx
           pnpm dlx bun@1.3.10 test tests/hooks/summary-recovery.test.tsx
 
@@ -154,7 +154,7 @@ jobs:
           mkdir -p "$RUNNER_TEMP/meetily-test-sidecars"
           ln -sf "$PWD/binaries/ffmpeg-$TARGET" "$RUNNER_TEMP/meetily-test-sidecars/ffmpeg"
           export PATH="$RUNNER_TEMP/meetily-test-sidecars:$PATH"
-          for filter in audio::stream core_audio audio::permissions audio::pipeline audio::recording_state audio::encode audio::recording_saver codex_cli live_assistant::answer_language_tests; do
+          for filter in audio::stream core_audio audio::permissions audio::pipeline audio::recording_state audio::encode audio::recording_saver codex_cli meeting_detection live_assistant::answer_language_tests; do
             if [[ "$filter" = audio::encode ]]; then
               test -x "$PWD/binaries/ffmpeg-$TARGET"
               test "$(command -v ffmpeg)" = "$RUNNER_TEMP/meetily-test-sidecars/ffmpeg"
