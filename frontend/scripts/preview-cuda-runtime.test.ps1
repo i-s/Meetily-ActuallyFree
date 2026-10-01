@@ -8,6 +8,7 @@ $system = Join-Path $root 'system'
 $script:imports = @{}
 $script:dumpbinFails = $false
 $previousExitCode = $global:LASTEXITCODE
+$previousArchitectures = $env:CMAKE_CUDA_ARCHITECTURES
 function dumpbin.exe($NoLogo, $Dependents, $Path) {
   $global:LASTEXITCODE = if ($script:dumpbinFails) { 1 } else { 0 }
   'Dump of file fixture'
@@ -78,8 +79,43 @@ try {
   $script:dumpbinFails = $true
   Assert-Throws { Get-PreviewPeDependencies 'fixture.exe' } 'Cannot inspect PE dependencies:'
   Write-Host 'PASS: import normalization and dumpbin failure'
+
+  # Windows CUDA can resolve cudart statically while cuBLAS remains a DLL.
+  # A DLL-only cudart guard incorrectly rejected the completed CUDA CI build.
+  Assert-PreviewCudaImports @('KERNEL32.dll', 'cublas64_13.dll', 'cublasLt64_13.dll')
+  Write-Host 'PASS: CUDA application with no cudart DLL import is accepted'
+
+  Assert-PreviewCudaImports @('KERNEL32.dll', 'CUBLAS64_13.dll', 'cudart64_13.dll')
+  Write-Host 'PASS: CUDA application with dynamic cudart is accepted'
+
+  Assert-Throws { Assert-PreviewCudaImports @('KERNEL32.dll', 'vcruntime140.dll') } 'CUDA executable does not import cublas64_13.dll'
+  Assert-Throws { Assert-PreviewCudaImports @() } 'CUDA executable does not import cublas64_13.dll'
+  Write-Host 'PASS: CPU application and empty dependency report are rejected'
+
+  Assert-Throws { Assert-PreviewCudaImports @('KERNEL32.dll', 'cudart64_13.dll') } 'CUDA executable does not import cublas64_13.dll'
+  Assert-Throws { Assert-PreviewCudaImports @('KERNEL32.dll', 'cublas64_12.dll') } 'observed imports: KERNEL32.dll, cublas64_12.dll'
+  Write-Host 'PASS: cudart-only and wrong-major CUDA applications are rejected with evidence'
+
+  $cargoConfig = Join-Path $root 'config.toml'
+  @'
+[env]
+CMAKE_CUDA_ARCHITECTURES = { value = "75;80;86;89;120", force = true }
+'@ | Set-Content $cargoConfig
+  $env:CMAKE_CUDA_ARCHITECTURES = '86'
+  $architectures = Get-PreviewCudaArchitectures $cargoConfig
+  if ($architectures -ne '75;80;86;89;120') { throw "Forced Cargo architectures were ignored: $architectures" }
+  Write-Host 'PASS: forced Cargo architectures override the workflow environment'
+
+  Set-Content $cargoConfig "[env]`nCMAKE_CUDA_ARCHITECTURES = { value = `"86`", force = false }"
+  Assert-Throws { Get-PreviewCudaArchitectures $cargoConfig } 'Cannot determine forced CUDA architectures'
+  Set-Content $cargoConfig "[env]`nCMAKE_CUDA_ARCHITECTURES = { value = `"75;89`", force = true }"
+  Assert-Throws { Get-PreviewCudaArchitectures $cargoConfig } 'CUDA Preview architecture list must include 86'
+  Set-Content $cargoConfig "[build]`nCMAKE_CUDA_ARCHITECTURES = { value = `"86`", force = true }"
+  Assert-Throws { Get-PreviewCudaArchitectures $cargoConfig } 'Cannot determine forced CUDA architectures'
+  Write-Host 'PASS: unforced, missing-sm_86 and misplaced architecture entries fail closed'
 } finally {
   Remove-Item $root -Recurse -Force -ErrorAction SilentlyContinue
   Remove-Item Function:dumpbin.exe
   $global:LASTEXITCODE = $previousExitCode
+  $env:CMAKE_CUDA_ARCHITECTURES = $previousArchitectures
 }

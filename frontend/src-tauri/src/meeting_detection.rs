@@ -158,7 +158,7 @@ fn is_self_process(name: &str) -> bool {
 
 /// Every application has a stable key, independent of process enumeration order,
 /// helper PIDs, focus, notify settings, and microphone mute state.
-fn scan_for_meetings(settings: &MeetingDetectionSettings) -> Vec<Observation> {
+fn scan_for_meetings(settings: &MeetingDetectionSettings, diagnostics: bool) -> Vec<Observation> {
     use sysinfo::System;
     let sys = System::new_all();
     let processes: Vec<(u32, String)> = sys
@@ -216,6 +216,7 @@ fn scan_for_meetings(settings: &MeetingDetectionSettings) -> Vec<Observation> {
                 platform_probe(
                     &key,
                     &pids,
+                    diagnostics,
                     #[cfg(windows)]
                     &media,
                 )
@@ -266,12 +267,15 @@ fn scan_for_meetings(settings: &MeetingDetectionSettings) -> Vec<Observation> {
 fn platform_probe(
     key: &str,
     pids: &[u32],
+    diagnostics: bool,
     #[cfg(windows)] media: &std::collections::HashSet<String>,
 ) -> Probe {
     #[cfg(target_os = "macos")]
     if key == "zoom" {
-        return macos::probe(pids);
+        return macos::probe(pids, diagnostics);
     }
+    #[cfg(not(target_os = "macos"))]
+    let _ = diagnostics;
     #[cfg(windows)]
     {
         if key == "discord" {
@@ -320,6 +324,11 @@ fn diagnostic_reason(reason: &'static str) -> &'static str {
         "accessibility_permission_required" => "Allow Meetily in System Settings > Privacy & Security > Accessibility, then check again.",
         "zoom_enabled_meeting_command" | "zoom_enabled_call_controls" => "Zoom exposes enabled controls for an ongoing meeting.",
         "zoom_idle_home" => "Zoom shows its home screen with no active meeting.",
+        "zoom_scan_timeout" => "Zoom's accessibility scan timed out. Refresh detection writes a technical report to the Meetily log.",
+        "zoom_scan_limit" => "Zoom's accessibility scan reached its safety limit. Refresh detection writes a technical report to the Meetily log.",
+        "zoom_ax_read_failed" => "Accessibility permission is granted, but reading Zoom's interface failed. Refresh detection writes the API error to the Meetily log.",
+        "zoom_ax_incomplete" => "Zoom did not expose a required accessibility attribute. Refresh detection writes a technical report to the Meetily log.",
+        "zoom_controls_not_found" => "Zoom's interface was read, but no supported call controls were found. Refresh detection writes a technical report to the Meetily log.",
         "zoom_ui_unknown" => "Zoom's call controls could not be confirmed. Keep Zoom open and check Accessibility permission.",
         "zoom_not_running" | "discord_process_absent" => "Application is not running.",
         "discord_call_ui_and_capture" => "Discord exposes call controls and an active microphone session.",
@@ -341,7 +350,7 @@ pub async fn get_meeting_detection_diagnostics() -> Result<DetectionDiagnostics,
         .unwrap()
         .clone()
         .unwrap_or_else(load_settings_from_disk);
-    let observations = tokio::task::spawn_blocking(move || scan_for_meetings(&settings))
+    let observations = tokio::task::spawn_blocking(move || scan_for_meetings(&settings, true))
         .await
         .map_err(|e| e.to_string())?;
     #[cfg(target_os = "macos")]
@@ -410,7 +419,7 @@ pub async fn validate_meeting_detection_session(
     {
         return Ok(false);
     }
-    let observations = tokio::task::spawn_blocking(move || scan_for_meetings(&settings))
+    let observations = tokio::task::spawn_blocking(move || scan_for_meetings(&settings, false))
         .await
         .map_err(|e| e.to_string())?;
     Ok(observations
@@ -614,7 +623,8 @@ fn start_monitor<R: Runtime>(app: &AppHandle<R>) {
                 break;
             }
             let scan_settings = current.clone();
-            let scan = tokio::task::spawn_blocking(move || scan_for_meetings(&scan_settings)).await;
+            let scan =
+                tokio::task::spawn_blocking(move || scan_for_meetings(&scan_settings, false)).await;
             if MONITOR_GENERATION.load(Ordering::SeqCst) != generation {
                 break;
             }

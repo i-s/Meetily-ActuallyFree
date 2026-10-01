@@ -34,6 +34,17 @@ Process/helper order and notification/interval edits do not create new sessions.
 Diagnostics in Settings > Meeting detection inspect native state on demand and
 show fixed explanations. They do not expose window titles, channel names, message
 text or audio. The inspection does not advance the tracker's confirmation count.
+On macOS, manual Refresh writes `Zoom AX diagnostic` lines to the Meetily log:
+scan stage, fixed AX attribute name/error code, scan-limit reason, and counts of
+controls matching the existing rules. Background polling does not write these
+reports. Unknown explanations distinguish failed/missing AX attributes, scan
+timeouts/limits, and a completed scan without supported controls. No raw labels
+are logged. Classifier and report fixtures cover these reasons and text omission.
+
+Physical testing on the current Preview still reported Zoom Unknown with
+Accessibility granted, English UI, and an always-visible meeting toolbar. The
+diagnostic instrumentation is intended to identify that failure on the affected
+Mac; it does not change the call rules or establish a fix for this observation.
 
 ## Offers and automation
 
@@ -100,15 +111,25 @@ marker patch, then compares the entire executable byte for byte. All other
 differences fail verification; resource and sidecar hashes remain exact checks.
 
 Windows Preview now builds independent CPU and CUDA matrix jobs, with separate
-Rust caches and artifacts. CUDA targets the requested RTX 3080 Laptop (`sm_86`)
+Rust caches and artifacts. CUDA includes the requested RTX 3080 Laptop (`sm_86`)
 using pinned CUDA 13.0.2 compiler/runtime components, without installing a driver.
+Cargo forces the checked-in architecture list `75;80;86;89;120`; the packager
+reads that list for metadata and verifies that it includes 86. A workflow-only
+architecture variable cannot override Cargo's `force = true` configuration.
 The Preview packager stages CUDA runtime DLLs from that toolkit, follows their
 PE dependency graph, rejects unresolved dependencies, and includes the toolkit
 license. `nvcuda.dll` remains owned by the user's NVIDIA driver. The CUDA app ZIP
 uses 7-Zip to support large CUDA DLLs. Installed executable imports must establish
 CUDA/cuBLAS linkage; installed resources retain byte-for-byte hash checks.
+The main executable must import `cublas64_13.dll`. A dynamic cudart import is
+reported but optional: absence from PE imports alone does not establish whether
+the CUDA backend is present or how its runtime was linked. Actual imports are
+logged before validation. All three packaged CUDA runtime DLLs remain required.
 Dependency fixtures cover transitive imports, cycles, missing DLLs/license,
-system/driver exclusions and the CUDA 13 `bin/x64` layout.
+system/driver exclusions, the CUDA 13 `bin/x64` layout, cuBLAS identity with/without
+dynamic cudart, rejection of CPU/wrong-major imports, and forced architecture
+metadata. The previous candidate compiled and installed but failed the overly
+strict cudart import check, so it did not upload a CUDA artifact.
 
 Hosted runners can verify compilation, NSIS installation and CPU sidecars, but
 cannot establish GPU startup, inference speed or real-call performance. Metadata

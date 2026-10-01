@@ -17,6 +17,65 @@ struct Snapshot {
     windows: Vec<Vec<Control>>,
     menu: Option<Vec<Control>>,
     complete: bool,
+    issues: Vec<ScanIssue>,
+}
+
+// Only fixed API attribute names and numeric errors are retained, never AX text.
+#[derive(Clone, Copy, Debug)]
+enum ScanIssue {
+    Deadline,
+    NodeLimit,
+    ChildLimit,
+    DepthLimit,
+    Ax(&'static str, i32),
+    Missing(&'static str),
+    Invalid(&'static str),
+}
+
+impl ScanIssue {
+    fn reason(&self) -> &'static str {
+        match self {
+            Self::Deadline => "zoom_scan_timeout",
+            Self::NodeLimit | Self::ChildLimit | Self::DepthLimit => "zoom_scan_limit",
+            Self::Ax(_, _) => "zoom_ax_read_failed",
+            Self::Missing(_) | Self::Invalid(_) => "zoom_ax_incomplete",
+        }
+    }
+}
+
+fn diagnostic_summary(snapshot: &Snapshot) -> String {
+    let controls: Vec<_> = snapshot
+        .windows
+        .iter()
+        .flatten()
+        .chain(snapshot.menu.iter().flatten())
+        .collect();
+    let count = |matches: fn(&str) -> bool| {
+        controls
+            .iter()
+            .filter(|c| c.enabled && c.labels.iter().any(|s| matches(&normalized(s))))
+            .count()
+    };
+    format!(
+        "complete={} windows={} window_controls={} menu_controls={} meeting_commands={} generic_leave={} participants={} issues={:?}",
+        snapshot.complete, snapshot.windows.len(),
+        snapshot.windows.iter().map(Vec::len).sum::<usize>(),
+        snapshot.menu.as_ref().map_or(0, Vec::len), count(meeting_command),
+        count(generic_leave_command), count(participants_control), snapshot.issues,
+    )
+}
+
+fn generic_leave_command(label: &str) -> bool {
+    matches!(label, "leave" | "end" | "выйти" | "завершить")
+}
+
+fn participants_control(label: &str) -> bool {
+    ["participants", "участники"].iter().any(|prefix| {
+        label
+            .strip_prefix(prefix)
+            .map(|tail| tail.is_empty() || tail.starts_with([' ', '(']))
+            .unwrap_or(false)
+    })
 }
 
 fn normalized(label: &str) -> String {
@@ -58,16 +117,8 @@ fn classify(snapshot: &Snapshot) -> Probe {
     }
     for window in &snapshot.windows {
         let labels = enabled_labels(window);
-        let leave = labels
-            .iter()
-            .any(|s| matches!(s.as_str(), "leave" | "end" | "выйти" | "завершить"));
-        let participants = labels.iter().any(|s| {
-            ["participants", "участники"].iter().any(|prefix| {
-                s.strip_prefix(prefix)
-                    .map(|tail| tail.is_empty() || tail.starts_with([' ', '(']))
-                    .unwrap_or(false)
-            })
-        });
+        let leave = labels.iter().any(|s| generic_leave_command(s));
+        let participants = labels.iter().any(|s| participants_control(s));
         if labels.iter().any(|s| meeting_command(s)) || (leave && participants) {
             return Probe {
                 presence: Presence::Active,
@@ -106,7 +157,11 @@ fn classify(snapshot: &Snapshot) -> Probe {
     }
     Probe {
         presence: Presence::Unknown,
-        reason: "zoom_ui_unknown",
+        reason: snapshot
+            .issues
+            .first()
+            .map(ScanIssue::reason)
+            .unwrap_or("zoom_controls_not_found"),
     }
 }
 
@@ -131,6 +186,7 @@ mod tests {
                 .collect(),
             menu: menu.map(|m| m.iter().map(|(s, e)| control(s, *e)).collect()),
             complete: true,
+            issues: Vec::new(),
         }
     }
 
@@ -272,6 +328,42 @@ mod tests {
             Presence::Unknown
         );
     }
+
+    #[test]
+    fn unknown_diagnostics_distinguish_read_failure_and_scan_limits() {
+        let mut data = snapshot(&[&[]], None);
+        assert_eq!(classify(&data).reason, "zoom_controls_not_found");
+        for (issue, reason) in [
+            (ScanIssue::Deadline, "zoom_scan_timeout"),
+            (ScanIssue::NodeLimit, "zoom_scan_limit"),
+            (ScanIssue::Ax("AXChildren", -25204), "zoom_ax_read_failed"),
+            (ScanIssue::Missing("AXRole"), "zoom_ax_incomplete"),
+        ] {
+            data.issues = vec![issue];
+            data.complete = false;
+            let result = classify(&data);
+            assert_eq!(result.presence, Presence::Unknown);
+            assert_eq!(result.reason, reason);
+        }
+        // Diagnostic failures cannot override positive controls already read.
+        data.windows.push(vec![control("Leave Meeting", true)]);
+        assert_eq!(classify(&data).presence, Presence::Active);
+    }
+
+    #[test]
+    fn diagnostic_report_counts_controls_without_exposing_their_text() {
+        let data = snapshot(
+            &[&[("Private participant name", true), ("Leave", true)]],
+            None,
+        );
+        let report = diagnostic_summary(&data);
+        assert!(
+            report.contains("generic_leave=1 participants=0"),
+            "{report}"
+        );
+        assert!(!report.contains("Private participant name"));
+        assert!(!report.contains("Leave"));
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -379,27 +471,38 @@ mod native {
         remaining: usize,
     }
     impl Budget {
-        fn check(&self) -> Result<(), ()> {
-            if Instant::now() < self.deadline && self.remaining > 0 {
-                Ok(())
+        fn check(&self) -> Result<(), ScanIssue> {
+            if Instant::now() >= self.deadline {
+                Err(ScanIssue::Deadline)
+            } else if self.remaining == 0 {
+                Err(ScanIssue::NodeLimit)
             } else {
-                Err(())
+                Ok(())
             }
         }
     }
 
-    unsafe fn attribute(element: CFRef, name: &str, budget: &Budget) -> Result<Option<Owned>, ()> {
+    unsafe fn attribute(
+        element: CFRef,
+        name: &'static str,
+        budget: &Budget,
+    ) -> Result<Option<Owned>, ScanIssue> {
         budget.check()?;
         // AX timeouts belong to this exact reference: setting the application
         // root's timeout does not cover its children (AXUIElement.h). Configure
         // each target before IPC without changing the process-wide AX timeout.
-        if AXUIElementSetMessagingTimeout(element, MESSAGE_TIMEOUT) != 0 {
-            return Err(());
+        let timeout_status = AXUIElementSetMessagingTimeout(element, MESSAGE_TIMEOUT);
+        if timeout_status != 0 {
+            return Err(ScanIssue::Ax("SetMessagingTimeout", timeout_status));
         }
-        let name = CString::new(name).map_err(|_| ())?;
-        let key = Owned(CFStringCreateWithCString(ptr::null(), name.as_ptr(), UTF8));
+        let key_name = CString::new(name).map_err(|_| ScanIssue::Invalid(name))?;
+        let key = Owned(CFStringCreateWithCString(
+            ptr::null(),
+            key_name.as_ptr(),
+            UTF8,
+        ));
         if key.0.is_null() {
-            return Err(());
+            return Err(ScanIssue::Invalid(name));
         }
         let mut raw = ptr::null();
         let status = AXUIElementCopyAttributeValue(element, key.0, &mut raw);
@@ -408,16 +511,20 @@ mod native {
             0 if !raw.is_null() => Ok(Some(value)),
             // Unsupported and no-value are normal for optional AX attributes.
             -25205 | -25212 => Ok(None),
-            _ => Err(()),
+            _ => Err(ScanIssue::Ax(name, status)),
         }
     }
 
-    unsafe fn text(element: CFRef, name: &str, budget: &Budget) -> Result<Option<String>, ()> {
+    unsafe fn text(
+        element: CFRef,
+        name: &'static str,
+        budget: &Budget,
+    ) -> Result<Option<String>, ScanIssue> {
         let Some(value) = attribute(element, name, budget)? else {
             return Ok(None);
         };
         if CFGetTypeID(value.0) != CFStringGetTypeID() {
-            return Err(());
+            return Err(ScanIssue::Invalid(name));
         }
         // Control names have a fixed bound; document or message text is never read.
         let mut bytes = [0u8; 2048];
@@ -427,35 +534,46 @@ mod native {
             bytes.len() as isize,
             UTF8,
         ) {
-            return Err(());
+            return Err(ScanIssue::Invalid(name));
         }
-        let end = bytes.iter().position(|b| *b == 0).ok_or(())?;
+        let end = bytes
+            .iter()
+            .position(|b| *b == 0)
+            .ok_or(ScanIssue::Invalid(name))?;
         String::from_utf8(bytes[..end].to_vec())
             .map(Some)
-            .map_err(|_| ())
+            .map_err(|_| ScanIssue::Invalid(name))
     }
 
-    unsafe fn enabled(element: CFRef, budget: &Budget) -> Result<bool, ()> {
-        let value = attribute(element, "AXEnabled", budget)?.ok_or(())?;
+    unsafe fn enabled(element: CFRef, budget: &Budget) -> Result<bool, ScanIssue> {
+        let value =
+            attribute(element, "AXEnabled", budget)?.ok_or(ScanIssue::Missing("AXEnabled"))?;
         if CFGetTypeID(value.0) != CFBooleanGetTypeID() {
-            return Err(());
+            return Err(ScanIssue::Invalid("AXEnabled"));
         }
         Ok(CFBooleanGetValue(value.0))
     }
 
-    unsafe fn elements(array: &Owned, max: usize) -> Result<Vec<Owned>, ()> {
+    unsafe fn elements(
+        array: &Owned,
+        max: usize,
+        name: &'static str,
+    ) -> Result<Vec<Owned>, ScanIssue> {
         if CFGetTypeID(array.0) != CFArrayGetTypeID() {
-            return Err(());
+            return Err(ScanIssue::Invalid(name));
         }
         let count = CFArrayGetCount(array.0);
-        if count < 0 || count as usize > max {
-            return Err(());
+        if count < 0 {
+            return Err(ScanIssue::Invalid(name));
+        }
+        if count as usize > max {
+            return Err(ScanIssue::ChildLimit);
         }
         let mut result = Vec::with_capacity(count as usize);
         for index in 0..count {
             let child = CFArrayGetValueAtIndex(array.0, index);
             if child.is_null() || CFGetTypeID(child) != AXUIElementGetTypeID() {
-                return Err(());
+                return Err(ScanIssue::Invalid(name));
             }
             result.push(Owned(CFRetain(child)));
         }
@@ -467,11 +585,11 @@ mod native {
         menu: bool,
         budget: &mut Budget,
         controls: &mut Vec<Control>,
-    ) -> Result<(), ()> {
+    ) -> Result<(), ScanIssue> {
         let mut stack = vec![(root, 0)];
         while let Some((node, depth)) = stack.pop() {
             budget.check()?;
-            let role = text(node.0, "AXRole", budget)?.ok_or(())?;
+            let role = text(node.0, "AXRole", budget)?.ok_or(ScanIssue::Missing("AXRole"))?;
             if (menu && role == "AXMenuItem")
                 || (!menu && matches!(role.as_str(), "AXButton" | "AXMenuButton"))
             {
@@ -501,12 +619,12 @@ mod native {
                 "AXTextArea" | "AXTextField" | "AXList" | "AXTable"
             ) {
                 if let Some(children) = attribute(node.0, "AXChildren", budget)? {
-                    let children = elements(&children, MAX_CHILDREN)?;
+                    let children = elements(&children, MAX_CHILDREN, "AXChildren")?;
                     if !children.is_empty() && depth >= MAX_DEPTH {
-                        return Err(());
+                        return Err(ScanIssue::DepthLimit);
                     }
                     if stack.len() + children.len() > MAX_NODES {
-                        return Err(());
+                        return Err(ScanIssue::NodeLimit);
                     }
                     for child in children.into_iter().rev() {
                         stack.push((child, depth + 1));
@@ -523,7 +641,7 @@ mod native {
                         | "AXMenu"
                         | "AXMenuBarItem"
                 ) {
-                    return Err(());
+                    return Err(ScanIssue::Missing("AXChildren"));
                 }
             }
             budget.remaining = budget.remaining.saturating_sub(1);
@@ -531,7 +649,7 @@ mod native {
         Ok(())
     }
 
-    unsafe fn inspect(pid: u32, budget: &mut Budget) -> Snapshot {
+    unsafe fn inspect(pid: u32, budget: &mut Budget, diagnostics: bool) -> Snapshot {
         let mut snapshot = Snapshot {
             complete: true,
             ..Snapshot::default()
@@ -539,12 +657,19 @@ mod native {
         let Ok(pid) = i32::try_from(pid) else {
             return Snapshot::default();
         };
-        if pid <= 0 || budget.check().is_err() {
+        if pid <= 0 {
             return Snapshot::default();
+        }
+        if let Err(issue) = budget.check() {
+            snapshot.complete = false;
+            snapshot.issues.push(issue);
+            return snapshot;
         }
         let root = Owned(AXUIElementCreateApplication(pid));
         if root.0.is_null() {
-            return Snapshot::default();
+            snapshot.complete = false;
+            snapshot.issues.push(ScanIssue::Invalid("Application"));
+            return snapshot;
         }
         // Menu evidence survives hidden/background toolbars. Reserve most of the
         // total budget for windows if this optional menu tree is unresponsive.
@@ -557,32 +682,47 @@ mod native {
         let menu_start = menu_budget.remaining;
         let mut commands = Vec::new();
         let menu_result = attribute(root.0, "AXMenuBar", &menu_budget)
-            .and_then(|m| m.ok_or(()))
+            .and_then(|m| m.ok_or(ScanIssue::Missing("AXMenuBar")))
             .and_then(|menu| tree(menu, true, &mut menu_budget, &mut commands));
         budget.remaining = budget
             .remaining
             .saturating_sub(menu_start - menu_budget.remaining);
         // Positive evidence already read remains useful even if a later branch
         // fails; an incomplete menu must never supply negative evidence.
-        if menu_result.is_ok() {
-            snapshot.menu = Some(commands);
-        } else {
+        if let Err(issue) = menu_result {
+            if diagnostics {
+                log::info!("Zoom AX diagnostic: stage=menu issue={issue:?}");
+            }
+            snapshot.issues.push(issue);
             snapshot.complete = false;
             snapshot.menu = Some(commands.into_iter().filter(|c| c.enabled).collect());
+        } else {
+            snapshot.menu = Some(commands);
         }
         if classify(&snapshot).presence == Presence::Active {
             return snapshot;
         }
         let windows = attribute(root.0, "AXWindows", budget)
-            .and_then(|w| w.ok_or(()))
-            .and_then(|w| elements(&w, MAX_WINDOWS));
-        let Ok(windows) = windows else {
-            snapshot.complete = false;
-            return snapshot;
+            .and_then(|w| w.ok_or(ScanIssue::Missing("AXWindows")))
+            .and_then(|w| elements(&w, MAX_WINDOWS, "AXWindows"));
+        let windows = match windows {
+            Ok(windows) => windows,
+            Err(issue) => {
+                if diagnostics {
+                    log::info!("Zoom AX diagnostic: stage=windows issue={issue:?}");
+                }
+                snapshot.complete = false;
+                snapshot.issues.push(issue);
+                return snapshot;
+            }
         };
-        for window in windows {
+        for (index, window) in windows.into_iter().enumerate() {
             let mut controls = Vec::new();
-            if tree(window, false, budget, &mut controls).is_err() {
+            if let Err(issue) = tree(window, false, budget, &mut controls) {
+                if diagnostics {
+                    log::info!("Zoom AX diagnostic: stage=window index={index} issue={issue:?}");
+                }
+                snapshot.issues.push(issue);
                 snapshot.complete = false;
             }
             snapshot.windows.push(controls);
@@ -593,7 +733,7 @@ mod native {
     /// PIDs must already be identified as Zoom's main desktop process by caller.
     /// One shared deadline bounds all processes; a single AX request can exceed
     /// it by at most the configured 50 ms messaging timeout (OS scheduling aside).
-    pub fn probe(pids: &[u32]) -> Probe {
+    pub fn probe(pids: &[u32], diagnostics: bool) -> Probe {
         if pids.is_empty() {
             return Probe {
                 presence: Presence::Inactive,
@@ -610,19 +750,30 @@ mod native {
             deadline: Instant::now() + SCAN_TIME,
             remaining: MAX_NODES,
         };
-        let mut unknown = pids.len() > 8;
+        let mut unknown_reason = (pids.len() > 8).then_some("zoom_scan_limit");
         for pid in pids.iter().take(8) {
-            let observed = classify(&unsafe { inspect(*pid, &mut budget) });
+            let snapshot = unsafe { inspect(*pid, &mut budget, diagnostics) };
+            let observed = classify(&snapshot);
+            if diagnostics {
+                log::info!(
+                    "Zoom AX diagnostic: pid={pid} {} state={:?} reason={}",
+                    diagnostic_summary(&snapshot),
+                    observed.presence,
+                    observed.reason
+                );
+            }
             match observed.presence {
                 Presence::Active => return observed,
-                Presence::Unknown => unknown = true,
+                Presence::Unknown => {
+                    unknown_reason.get_or_insert(observed.reason);
+                }
                 Presence::Inactive => (),
             }
         }
-        if unknown {
+        if let Some(reason) = unknown_reason {
             Probe {
                 presence: Presence::Unknown,
-                reason: "zoom_ui_unknown",
+                reason,
             }
         } else {
             Probe {

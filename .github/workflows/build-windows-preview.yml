@@ -137,7 +137,7 @@ jobs:
           sub-packages: '["nvcc", "crt", "nvvm", "cudart", "thrust", "cublas", "cublas_dev"]'
           use-github-cache: false
 
-      - name: Configure CUDA for RTX 3080 Laptop
+      - name: Configure CUDA toolkit
         if: matrix.backend == 'cuda'
         timeout-minutes: 2
         run: |
@@ -145,7 +145,6 @@ jobs:
           & (Join-Path $env:CUDA_PATH 'bin/nvcc.exe') --version
           if ($LASTEXITCODE -ne 0) { throw 'CUDA compiler check failed' }
           "CUDA_TOOLKIT_ROOT_DIR=$env:CUDA_PATH" >> $env:GITHUB_ENV
-          'CMAKE_CUDA_ARCHITECTURES=86' >> $env:GITHUB_ENV
           'CARGO_BUILD_JOBS=2' >> $env:GITHUB_ENV
           'CMAKE_BUILD_PARALLEL_LEVEL=2' >> $env:GITHUB_ENV
           'NVCC_APPEND_FLAGS=-std=c++17 -Xcompiler=/Zc:preprocessor -DCCCL_IGNORE_MSVC_TRADITIONAL_PREPROCESSOR_WARNING' >> $env:GITHUB_ENV

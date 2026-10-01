@@ -39,7 +39,8 @@ if ($Backend -eq 'cuda') {
   if (!(Test-Path $nvcc)) { throw "CUDA compiler missing: $nvcc" }
   $nvccVersion = @(& $nvcc --version)
   if ($LASTEXITCODE -ne 0 -or "$nvccVersion" -notmatch 'release 13\.0,') { throw 'CUDA Preview requires CUDA 13.0' }
-  if ($env:CMAKE_CUDA_ARCHITECTURES -ne '86') { throw 'CUDA Preview requires CMAKE_CUDA_ARCHITECTURES=86 (RTX 3080 Laptop)' }
+  $cudaArchitectures = Get-PreviewCudaArchitectures (Join-Path $tauri '.cargo/config.toml')
+  Write-Host "CUDA architectures forced by src-tauri/.cargo/config.toml: $cudaArchitectures"
   $env:CUDA_TOOLKIT_ROOT_DIR = $env:CUDA_PATH
   $env:PATH = "$env:CUDA_PATH\bin;$env:CUDA_PATH\bin\x64;$env:PATH"
   $env:NVCC_APPEND_FLAGS = '-std=c++17 -Xcompiler=/Zc:preprocessor -DCCCL_IGNORE_MSVC_TRADITIONAL_PREPROCESSOR_WARNING'
@@ -49,7 +50,8 @@ if ($Backend -eq 'cuda') {
   $features = 'custom-protocol,cuda'
   $cuda = @{
     compiler_version = $nvccVersion
-    architectures = $env:CMAKE_CUDA_ARCHITECTURES
+    architectures = $cudaArchitectures
+    architecture_source = 'frontend/src-tauri/.cargo/config.toml [env], force=true'
     nvcc_append_flags = $env:NVCC_APPEND_FLAGS
     runtime_imports = $cudaImports
     driver_dependency = 'NVIDIA CUDA 13 compatible driver; nvcuda.dll is not redistributed'
@@ -145,17 +147,17 @@ foreach ($sidecar in @('llama-helper', 'ffmpeg')) {
 }
 if ($Backend -eq 'cuda') {
   $mainImports = @(Get-PreviewPeDependencies $main)
-  # whisper-rs-sys 0.11.1 explicitly links cudart and cuBLAS on Windows.
-  # Imports establish compile identity without launching GPU code on the runner.
-  foreach ($dependency in @('cudart64_13.dll', 'cublas64_13.dll')) {
-    if ($mainImports -notcontains $dependency) { throw "CUDA executable does not import $dependency" }
-  }
+  # Print evidence before asserting so failed jobs retain the actual import list.
+  Write-Host "CUDA application PE imports: $($mainImports -join ', ')"
+  Assert-PreviewCudaImports $mainImports
   foreach ($dependency in @('cudart64_13.dll', 'cublas64_13.dll', 'cublasLt64_13.dll', 'CUDA-EULA.txt')) {
     if (!(Test-Path (Join-Path $installed $dependency))) { throw "Installed CUDA payload missing: $dependency" }
   }
   $sidecarImports = @(Get-PreviewPeDependencies (Join-Path $installed 'llama-helper.exe'))
   if ($sidecarImports -match '(?i)(cuda|cublas|nvrtc|nvjitlink)') { throw 'llama-helper must retain its CPU backend' }
   $cuda.application_imports = $mainImports
+  $cuda.required_application_imports = @('cublas64_13.dll')
+  $cuda.cudart_dll_imported = $mainImports -contains 'cudart64_13.dll'
   $cuda.cpu_sidecar_imports = $sidecarImports
   $cuda.compile_identity_verified = $true
 }
@@ -223,6 +225,6 @@ Get-ChildItem $output -File | Where-Object Name -ne 'SHA256SUMS' | Sort-Object N
   "Candidate commit: $env:BUILD_COMMIT"
   "Unsigned x64 $Backend NSIS installer and app ZIP; version 0.2.18 / com.meetily.ai."
   'Silent installation, resource hashes and sidecar smoke tests passed.'
-  if ($Backend -eq 'cuda') { 'CUDA 13 import identity verified for sm_86. GPU startup/inference requires a physical NVIDIA machine.' }
+  if ($Backend -eq 'cuda') { "CUDA 13 import identity verified. Configured architectures: $cudaArchitectures (includes sm_86). GPU startup/inference requires a physical NVIDIA machine." }
   'Live Windows Discord/call detection still requires physical-machine qualification.'
 ) >> $env:GITHUB_STEP_SUMMARY
