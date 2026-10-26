@@ -92,3 +92,49 @@ five-second tail, and decodes all resulting files to check retained duration and
 signal. macOS CI must run against the bundled FFmpeg executable. Portable tests
 and CI are distinct from installing and verifying a corrected capture on a
 physical Mac. No hardware retest or publication is implied by the source fix.
+
+## Durable live meeting identity (issue #3)
+
+Both native Start paths allocate the SQLite meeting before publishing
+`recording-started`. That event and `get_recording_state` carry `meeting_id`;
+`RecordingStateContext.meetingId`, IndexedDB recovery, notes, chat, and Stop use
+that same ID. Pause/resume retains it. A subsequent Start allocates a new UUID;
+the frontend clears the old editor identity while Start is pending. A failed
+capture start removes its unexposed empty meeting. The engine lifecycle mutex
+serializes concurrent starts and stops.
+
+Live turns use globally unique `<meeting-id>:seg_<sequence-id>` IDs in native
+history, SQLite, and the transcript UI. A dedicated writer admits up to 256
+pending operations without blocking capture. Database failure or a full queue
+emits `recording-persistence-error`; the UI shows it, and AI snapshots reject
+until persistence is repaired. Chat and summary await
+`flush_recording_transcripts` before taking their database snapshot. Snapshots
+also reject while native Stop owns finalization, including the interval after
+its writer is detached.
+
+Stop removes the event listener, drains its writer, and retries the complete
+retained native transcript buffer before audio finalization. Frontend Stop
+flushes pending meeting notes before final save/navigation; silent recordings and
+recordings under ten seconds are retained. Final save/recovery updates the
+existing meeting and upserts stable turns, preserving database speaker edits and
+native rows that a reloaded WebView did not receive. It never recreates a deleted
+meeting. Recovery uses only that meeting's stored audio folder; deleting a
+recovery entry deletes its native meeting before clearing notes/recovery drafts.
+
+Live speaker rename, merge, and single-turn reassignment use the existing native
+speaker APIs through the serial writer. This orders edits with incoming turns,
+updates SQLite attribution used by AI, and applies aliases to future turns. The
+native saver retains raw capture provenance; finalization does not overwrite
+already committed display labels with those raw labels.
+
+`tests/hooks/recording-shutdown.test.tsx` covers identity across pause/resume,
+Stop, and the next Start. `tests/hooks/recording-identity.test.tsx` covers a silent
+three-second Stop waiting for pending notes, same-ID silent recovery, and native
+recovery deletion. Run these mock-heavy files separately. Native filters
+`recording_identity` and `audio::recording_commands::persistence_tests` cover real
+SQLite retention, speaker aliases/edits, queue failure/overflow, barriers, and
+Stop snapshot rejection. `scripts/test-recording-identity-portable.py` includes
+production transcript persistence/writer modules with repository-locked Rust
+dependencies; its contact operations are explicitly stubbed, so it does not
+qualify contact management. No physical microphone/call or process-kill test is
+implied by these hook and database regressions.

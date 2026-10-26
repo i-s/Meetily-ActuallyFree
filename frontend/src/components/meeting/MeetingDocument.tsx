@@ -1,8 +1,8 @@
 'use client';
 
 /**
- * The meeting's document, beside the transcript: your notes, the action items,
- * and the AI summary, one continuous page. A second tab holds Ask AI.
+ * The meeting workspace beside the transcript: separate Meeting notes, Summary
+ * (including action items), and persistent Ask AI tabs.
  *
  * Notes and summary edits save themselves. When a summary arrives with an
  * action section, its items move into the action list (see
@@ -35,18 +35,19 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { VisuallyHidden } from '@/components/ui/visually-hidden';
 import { NotesEditor, type NotesContent } from '@/components/editor/NotesEditor';
 import { ActionItemsList } from '@/components/actions/ActionItemsList';
-import { ChatThread } from '@/components/chat/ChatThread';
+import { MeetingChat } from '@/components/chat/MeetingChat';
+import { MeetingNotesEditor, useMeetingNotes } from './MeetingNotesEditor';
+import { flushMeetingNotes } from '@/lib/meeting-notes-store';
 import { useAskAiLanguage } from '@/hooks/useAskAiLanguage';
 import { askAiCopy } from '@/lib/ask-ai-language';
 import { LanguagePickerPopover } from '@/components/LanguagePickerPopover';
 import { ModelSettingsModal, type ModelConfig } from '@/components/ModelSettingsModal';
 import { useAutosave, saveStateLabel, type SaveState } from '@/hooks/useAutosave';
 import {
-  askMeeting,
-  getMeetingNotes,
+  getSummaryInputSnapshot,
+  type SummaryInputSnapshot,
   listActionItems,
   onWorkspaceChange,
-  saveMeetingNotes,
   type ActionItem,
 } from '@/lib/workspace-api';
 import { syncMeetingActionItems, type TranscriptLine } from '@/lib/action-item-sync';
@@ -104,41 +105,50 @@ function SaveIndicator({ state }: { state: SaveState }) {
 }
 
 export function MeetingDocument(props: MeetingDocumentProps) {
-  const [tab, setTab] = useState<'notes' | 'ask'>('notes');
+  return <MeetingDocumentSession key={props.meetingId} {...props} />;
+}
+function MeetingDocumentSession(props: MeetingDocumentProps) {
+  const [tab, setTab] = useState<'notes' | 'summary' | 'ask'>('notes');
+  const notes = useMeetingNotes(props.meetingId);
   const { language, ready } = useAskAiLanguage(props.meetingId, props.transcript);
   const copy = askAiCopy(language);
+  const hasSummary = !!completeSummaryMarkdown(props.aiSummary).trim();
+  const generating = ['processing', 'summarizing', 'regenerating'].includes(props.summaryStatus);
+  const canGenerate = props.hasTranscript || !!notes.content.markdown.trim() || !!notes.content.json?.length;
+  const generate = async () => {
+    try {
+      await flushMeetingNotes(props.meetingId);
+      props.onGenerate();
+      setTab('summary');
+    } catch (error) { toast.error(`Save Meeting notes before generating: ${String(error)}`); }
+  };
+  useEffect(() => { if (props.regenerateRequest?.open) setTab('summary'); }, [props.regenerateRequest]);
   return (
-    <Tabs value={tab} onValueChange={(value) => setTab(value as 'notes' | 'ask')} className="flex h-full min-h-0 flex-col">
+    <Tabs value={tab} onValueChange={(value) => setTab(value as 'notes' | 'summary' | 'ask')} className="flex h-full min-h-0 flex-col">
       <div className="flex h-12 shrink-0 items-center justify-between gap-3 border-b border-af-border px-4">
         <TabsList className="h-8">
-          <TabsTrigger value="notes" className="text-xs">
-            <NotebookPen className="!size-3.5" />
-            Notes
-          </TabsTrigger>
-          <TabsTrigger value="ask" className="text-xs">
-            <Sparkles className="!size-3.5" />
-            {copy.tab}
-          </TabsTrigger>
+          <TabsTrigger value="notes" className="text-xs"><NotebookPen className="!size-3.5" />Meeting notes</TabsTrigger>
+          <TabsTrigger value="summary" className="text-xs" disabled={!hasSummary && !generating && tab !== 'summary'}><Sparkles className="!size-3.5" />Summary</TabsTrigger>
+          <TabsTrigger value="ask" className="text-xs"><Sparkles className="!size-3.5" />{copy.tab}</TabsTrigger>
         </TabsList>
       </div>
-      <TabsContent value="notes" className="mt-0 min-h-0 flex-1 data-[state=active]:flex data-[state=inactive]:hidden" forceMount>
-        <NotesTab {...props} />
+      <TabsContent value="notes" className="mt-0 min-h-0 flex-1 data-[state=active]:flex data-[state=active]:flex-col data-[state=inactive]:hidden" forceMount>
+        <MeetingNotesEditor meetingId={props.meetingId} />
+        {!hasSummary && <div className="shrink-0 border-t border-af-border p-3">
+          <Button disabled={!canGenerate || generating} onClick={() => void generate()}><Sparkles />Generate summary</Button>
+        </div>}
+      </TabsContent>
+      <TabsContent value="summary" className="mt-0 min-h-0 flex-1 data-[state=active]:flex data-[state=inactive]:hidden" forceMount>
+        <SummaryTab {...props} onGenerate={() => void generate()} />
       </TabsContent>
       <TabsContent value="ask" className="mt-0 min-h-0 flex-1 data-[state=inactive]:hidden" forceMount>
-        <ChatThread
-          historyKey={`meeting:${props.meetingId}`}
-          ask={(question, history) => askMeeting(props.meetingId, question, history, language)}
-          language={language}
-          disabled={!ready}
-          {...copy.meeting}
-          onSeek={props.onSeek}
-        />
+        <MeetingChat meetingId={props.meetingId} language={language} disabled={!ready} onSeek={props.onSeek} />
       </TabsContent>
     </Tabs>
   );
 }
 
-function NotesTab({
+function SummaryTab({
   meetingId,
   aiSummary,
   summaryUserEdited,
@@ -162,25 +172,15 @@ function NotesTab({
   regenerateRequest,
   onRegenerateRequestHandled,
 }: MeetingDocumentProps) {
-  // ---- Notes ---------------------------------------------------------------
-  const [notes, setNotes] = useState<{ loaded: boolean; json: unknown[] | null; markdown: string | null }>({
-    loaded: false,
-    json: null,
-    markdown: null,
-  });
+  const notes = useMeetingNotes(meetingId);
+  const canGenerate = hasTranscript || !!notes.content.markdown.trim() || !!notes.content.json?.length;
+  const [snapshot, setSnapshot] = useState<SummaryInputSnapshot | null>(null);
   useEffect(() => {
     let cancelled = false;
-    setNotes({ loaded: false, json: null, markdown: null });
-    void getMeetingNotes(meetingId)
-      .then((stored) => !cancelled && setNotes({ loaded: true, json: stored?.json ?? null, markdown: stored?.markdown ?? null }))
-      .catch(() => !cancelled && setNotes({ loaded: true, json: null, markdown: null }));
-    return () => {
-      cancelled = true;
-    };
-  }, [meetingId]);
-  const notesSaver = useAutosave<NotesContent>((content) =>
-    saveMeetingNotes(meetingId, content.markdown.trim() ? content.markdown : null, content.markdown.trim() ? content.json : null),
-  );
+    void getSummaryInputSnapshot(meetingId).then(value => { if (!cancelled) setSnapshot(value); }).catch(() => {});
+    return () => { cancelled = true; };
+  }, [meetingId, aiSummary, summaryStatus]);
+  const notesChanged = !!snapshot && notes.loaded && (snapshot.notesMarkdown ?? '') !== notes.content.markdown;
 
   // ---- Action items --------------------------------------------------------
   const [items, setItems] = useState<ActionItem[]>([]);
@@ -297,10 +297,13 @@ function NotesTab({
   const submitRegenerate = async () => {
     setRegenerating(true);
     try {
+      await flushMeetingNotes(meetingId);
       await summarySaver.flush();
       await onRegenerate(instructions.trim());
       setUserEdited(false);
       setRegenerateOpen(false);
+    } catch (error) {
+      toast.error(`Could not regenerate: ${String(error)}`);
     } finally {
       setRegenerating(false);
     }
@@ -309,23 +312,7 @@ function NotesTab({
   return (
     <div className="min-h-0 flex-1 overflow-y-auto">
       <div className="mx-auto max-w-3xl space-y-8 px-10 pb-16 pt-6">
-        {/* Notes */}
-        <section>
-          <SectionTitle icon={NotebookPen} aside={<SaveIndicator state={notesSaver.state} />}>
-            Your notes
-          </SectionTitle>
-          {notes.loaded ? (
-            <NotesEditor
-              key={`notes-${meetingId}`}
-              initialBlocks={notes.json}
-              initialMarkdown={notes.markdown}
-              placeholder="Write your own notes. They stay yours: summaries never overwrite them."
-              onChange={notesSaver.schedule}
-            />
-          ) : (
-            <Skeleton className="h-16 w-full" />
-          )}
-        </section>
+        {notesChanged && <p role="status" className="rounded-lg border border-af-warning/30 bg-af-warning/[0.08] p-3 text-xs text-af-text-2">Meeting notes changed since this summary was generated. Regenerate to include your changes.</p>}
 
         {/* Action items */}
         <section>
@@ -447,7 +434,7 @@ function NotesTab({
                   Stop
                 </Button>
               ) : hasSummary ? (
-                <Button variant="secondary" size="sm" className="h-7 text-xs" onClick={() => setRegenerateOpen(true)} disabled={!hasTranscript}>
+                <Button variant="secondary" size="sm" className="h-7 text-xs" onClick={() => setRegenerateOpen(true)} disabled={!canGenerate}>
                   <RefreshCw />
                   Regenerate
                 </Button>
@@ -495,13 +482,13 @@ function NotesTab({
               <span className="mx-auto mb-3 flex h-10 w-10 items-center justify-center rounded-xl bg-af-accent/[0.12] text-af-accent">
                 <Sparkles className="h-4 w-4" />
               </span>
-              <p className="text-sm font-medium text-af-text">{hasTranscript ? 'No summary yet' : 'Nothing to summarize yet'}</p>
+              <p className="text-sm font-medium text-af-text">{canGenerate ? 'No summary yet' : 'Nothing to summarize yet'}</p>
               <p className="mx-auto mt-1 max-w-sm text-xs leading-relaxed text-af-text-3">
-                {hasTranscript
+                {canGenerate
                   ? `Uses ${modelLabel} with the ${templateName} template. Action items it finds are added to the list above.`
-                  : 'A summary can be written once the meeting has a transcript.'}
+                  : 'Add Meeting notes or record a conversation to generate a summary.'}
               </p>
-              {hasTranscript && (
+              {canGenerate && (
                 <Button className="mt-4" onClick={onGenerate}>
                   <Sparkles />
                   Generate summary

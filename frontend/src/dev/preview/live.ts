@@ -19,7 +19,14 @@ const SCRIPT: Array<[string, string]> = [
   ['Speaker 3', 'Then I think that covers it.'],
 ];
 
+export interface PreviewRecordingPersistence {
+  create: (title: string, startedAt: string) => string;
+  append: (meetingId: string, line: PreviewTranscript) => void;
+  stop: (meetingId: string, duration: number) => void;
+}
+
 interface LiveState {
+  meetingId: string | null;
   recording: boolean;
   paused: boolean;
   startedAt: number;
@@ -33,6 +40,7 @@ interface LiveState {
 }
 
 const live: LiveState = {
+  meetingId: null,
   recording: false,
   paused: false,
   startedAt: 0,
@@ -53,6 +61,7 @@ function elapsed(): number {
 export function liveRecordingState() {
   const seconds = live.recording ? elapsed() : null;
   return {
+    meeting_id: live.meetingId,
     is_recording: live.recording,
     is_paused: live.paused,
     is_microphone_muted: live.micMuted,
@@ -66,7 +75,7 @@ export function liveRecordingState() {
 }
 
 /** Handles recording commands; returns undefined for anything else. */
-export function handleLiveCommand(cmd: string, args: Record<string, any>): unknown {
+export function handleLiveCommand(cmd: string, args: Record<string, any>, persistence: PreviewRecordingPersistence): unknown {
   switch (cmd) {
     case 'is_recording':
       return live.recording;
@@ -77,7 +86,10 @@ export function handleLiveCommand(cmd: string, args: Record<string, any>): unkno
     case 'start_recording':
     case 'start_recording_with_devices_and_meeting': {
       if (live.recording) return null;
+      const title = args.meetingName ?? args.meeting_name ?? 'New Meeting';
+      const meetingId = persistence.create(title, new Date().toISOString());
       Object.assign(live, {
+        meetingId,
         recording: true,
         paused: false,
         startedAt: Date.now(),
@@ -94,7 +106,7 @@ export function handleLiveCommand(cmd: string, args: Record<string, any>): unkno
         const [speaker, text] = SCRIPT[index++];
         const start = Math.max(0, elapsed() - 2.5);
         const line: PreviewTranscript = {
-          id: `live-${index}`,
+          id: `${meetingId}:seg_${index}`,
           text,
           timestamp: new Date().toISOString(),
           audio_start_time: start,
@@ -104,6 +116,7 @@ export function handleLiveCommand(cmd: string, args: Record<string, any>): unkno
           confidence: 0.93,
         };
         live.lines.push(line);
+        persistence.append(meetingId, line);
         void emit('transcript-update', {
           text,
           timestamp: line.timestamp,
@@ -117,7 +130,7 @@ export function handleLiveCommand(cmd: string, args: Record<string, any>): unkno
           duration: 2.4,
         });
       }, 2600);
-      setTimeout(() => void emit('recording-started'), 50);
+      void emit('recording-started', { meeting_id: meetingId });
       return null;
     }
     case 'pause_recording':
@@ -145,12 +158,15 @@ export function handleLiveCommand(cmd: string, args: Record<string, any>): unkno
       if (!live.recording) return false;
       if (live.timer) clearInterval(live.timer);
       live.timer = null;
+      const meetingId = live.meetingId!;
+      const meetingName = live.meetingName;
+      persistence.stop(meetingId, elapsed());
       live.recording = false;
       live.paused = false;
       const folder = `/preview/live-${Date.now()}`;
       setTimeout(() => {
-        void emit('recording-stopped', { message: 'stopped', folder_path: folder, meeting_name: live.meetingName });
-        void emit('recording-stop-complete', { call_api: true, folder_path: folder, meeting_name: live.meetingName });
+        void emit('recording-stopped', { message: 'stopped', folder_path: folder, meeting_name: meetingName, meeting_id: meetingId });
+        void emit('recording-stop-complete', { call_api: true, folder_path: folder, meeting_name: meetingName, meeting_id: meetingId });
       }, 100);
       return true;
     }

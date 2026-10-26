@@ -26,6 +26,8 @@ import { LivePanel, type LivePanelTab } from '@/components/recording/LivePanel';
 import { automaticTitle, onLiveSessionChange, readLiveTitle, writeLiveTitle, type LiveTitle } from '@/lib/live-session';
 import { formatClock } from '@/lib/dates';
 import type { LiveLine } from '@/lib/live-context';
+import { useAskAiContext } from '@/hooks/useAskAiContext';
+import { askBoundaryLabel } from '@/lib/ask-ai-context';
 
 const PANEL_KEY = 'af-live-panel-open';
 const PANEL_WIDTH = 340;
@@ -54,7 +56,7 @@ export function LiveSession({
     meetingTitle,
     setMeetingTitle,
   } = useTranscripts();
-  const { isRecording, isPaused, statusMessage } = useRecordingState();
+  const { isRecording, isPaused, statusMessage, meetingId } = useRecordingState();
   const { transcriptModelConfig } = useConfig();
   const { groupById } = useWorkspace();
   const { meetings } = useSidebar();
@@ -63,7 +65,7 @@ export function LiveSession({
 
   const [live, setLive] = useState<LiveTitle | null>(null);
   const [panelOpen, setPanelOpen] = useState(true);
-  const [tab, setTab] = useState<LivePanelTab>('speakers');
+  const [tab, setTab] = useState<LivePanelTab>('notes');
   const [identity, setIdentity] = useState<{ speaker: string; transcriptId: string | null } | null>(null);
   const [highlight, setHighlight] = useState<string | null>(null);
   const rootRef = useRef<HTMLDivElement>(null);
@@ -163,6 +165,7 @@ export function LiveSession({
     () => transcripts.map((t) => ({ id: t.id, time: t.audio_start_time ?? 0, speaker: t.speaker, text: t.text })),
     [transcripts],
   );
+  const askContext = useAskAiContext(meetingId, transcripts, isRecording);
 
   const named = detectedSpeakers.filter((speaker) => !speaker.isUser && !isGeneric(speaker.name)).map((speaker) => speaker.name);
   const unnamed = detectedSpeakers.filter((speaker) => isGeneric(speaker.name)).length;
@@ -247,9 +250,13 @@ export function LiveSession({
           </div>
         </header>
 
+        {askContext.error && <p role="status" className="px-4 py-2 text-xs text-af-warning">Не удалось обновить границу Ask AI: {askContext.error}</p>}
+        {askContext.range?.truncated && <p className="px-4 py-2 text-xs text-af-text-3">{askBoundaryLabel(askContext.range)}</p>}
+
         <div className="min-h-0 flex-1">
           <VirtualizedTranscriptView
             segments={segments}
+            askContextBoundary={askContext.range}
             isRecording={isRecording}
             isPaused={isPaused}
             isProcessing={isProcessingStop}
@@ -297,7 +304,7 @@ export function LiveSession({
             lines={lines}
             sessionKey={String(live?.startedAt ?? 'current')}
             onIdentify={(speaker) => setIdentity({ speaker, transcriptId: null })}
-            onMarkMe={(speaker) => renameSpeaker(speaker, 'You')}
+            onMarkMe={(speaker) => { void renameSpeaker(speaker, 'You').catch(() => {}); }}
             onJumpTo={jumpTo}
           />
         </div>
@@ -311,8 +318,8 @@ export function LiveSession({
         speakers={detectedSpeakers.map((speaker) => speaker.name)}
         onRenameLive={(from, to, scope) => {
           const target = to.trim() || genericLabel();
-          if (scope === 'line' && identity?.transcriptId) reassignSegment(identity.transcriptId, target);
-          else renameSpeaker(from, target);
+          if (scope === 'line' && identity?.transcriptId) return reassignSegment(identity.transcriptId, target);
+          return renameSpeaker(from, target);
         }}
         onMerge={(source, target) => mergeSpeakers(source, target)}
         colorIndexOf={(label) => detectedSpeakers.find((speaker) => speaker.name === label)?.colorIndex}

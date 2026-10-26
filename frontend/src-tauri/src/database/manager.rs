@@ -52,6 +52,10 @@ impl DatabaseManager {
         migration_pool.close().await;
         let pool = SqlitePool::connect(tauri_db_path).await?;
 
+        // No provider task survives process exit. Keep interrupted questions
+        // and their context visible instead of leaving them pending forever.
+        crate::meeting_chat::recover_interrupted(&pool).await.map_err(sqlx::Error::Protocol)?;
+
         Ok(DatabaseManager { pool })
     }
 

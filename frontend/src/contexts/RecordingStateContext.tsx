@@ -3,6 +3,7 @@
 import React, { createContext, useContext, useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { recordingService } from '@/services/recordingService';
 import { listen } from '@tauri-apps/api/event';
+import { toast } from 'sonner';
 
 /**
  * Recording state synchronized with backend
@@ -26,6 +27,7 @@ export enum RecordingStatus {
 }
 
 interface RecordingState {
+  meetingId: string | null;
   isRecording: boolean;           // Is a recording session active
   isPaused: boolean;              // Is the recording paused
   isMicrophoneMuted: boolean;     // Is only the microphone silenced
@@ -61,6 +63,7 @@ export const useRecordingState = () => {
 
 export function RecordingStateProvider({ children }: { children: React.ReactNode }) {
   const [state, setState] = useState<RecordingState>({
+    meetingId: null,
     isRecording: false,
     isPaused: false,
     isMicrophoneMuted: false,
@@ -81,6 +84,7 @@ export function RecordingStateProvider({ children }: { children: React.ReactNode
     setState(prev => ({
       ...prev,
       status,
+      meetingId: status === RecordingStatus.STARTING ? null : prev.meetingId,
       statusMessage: message,
     }));
   }, [state.status, state.isRecording, state.isPaused]);
@@ -95,6 +99,7 @@ export function RecordingStateProvider({ children }: { children: React.ReactNode
 
       setState(prev => ({
         ...prev,
+        meetingId: prev.status === RecordingStatus.STARTING && !backendState.is_recording ? null : (backendState.meeting_id ?? prev.meetingId),
         isRecording: backendState.is_recording,
         isPaused: backendState.is_paused,
         isMicrophoneMuted: backendState.is_microphone_muted,
@@ -156,6 +161,15 @@ export function RecordingStateProvider({ children }: { children: React.ReactNode
     return () => { disposed = true; unlisten?.(); };
   }, []);
 
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void listen<{ meeting_id: string; message: string }>('recording-persistence-error', ({ payload }) => {
+      if (!disposed) toast.error('Live transcript could not be saved', { description: payload.message, duration: 10000 });
+    }).then(cleanup => { if (disposed) cleanup(); else unlisten = cleanup; });
+    return () => { disposed = true; unlisten?.(); };
+  }, []);
+
   /**
    * Set up event listeners for backend state changes
    */
@@ -166,10 +180,11 @@ export function RecordingStateProvider({ children }: { children: React.ReactNode
     const setupListeners = async () => {
       try {
         // Recording started
-        const unlistenStarted = await recordingService.onRecordingStarted(() => {
+        const unlistenStarted = await recordingService.onRecordingStarted((payload) => {
           console.log('[RecordingStateContext] Recording started event');
           setState(prev => ({
             ...prev,
+            meetingId: payload?.meeting_id ?? null,
             isRecording: true,
             isPaused: false,
             isMicrophoneMuted: false,

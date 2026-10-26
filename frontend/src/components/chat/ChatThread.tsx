@@ -3,8 +3,8 @@
 /**
  * The one Ask-AI conversation used for meetings, people, and the live
  * recorder. Answers are Markdown; citations like [12:34] become buttons that
- * seek the recording. Conversations are kept per subject for the session, so
- * leaving a page and coming back keeps the thread.
+ * seek the recording. MeetingChat supplies durable meeting turns; other
+ * subjects retain their existing session-scoped conversation.
  */
 import { useCallback, useEffect, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
@@ -13,12 +13,14 @@ import { ArrowUp, RotateCcw, Sparkles, Trash2 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { Hint } from '@/components/ui/tooltip';
 import { askAiCopy } from '@/lib/ask-ai-language';
+import type { AskAiContextRange } from '@/lib/workspace-api';
 
 export interface ChatMessage {
   id: string;
   question: string;
   answer?: string;
   status: 'pending' | 'done' | 'error';
+  context?: AskAiContextRange;
 }
 
 const threads = new Map<string, ChatMessage[]>();
@@ -74,7 +76,9 @@ export interface ChatThreadProps {
   historyKey: string;
   language?: string;
   disabled?: boolean;
-  ask: (question: string, history: Array<{ question: string; answer: string }>) => Promise<string>;
+  ask?: (question: string, history: Array<{ question: string; answer: string }>) => Promise<string>;
+  messages?: ChatMessage[];
+  onSend?: (question: string) => Promise<boolean>;
   suggestions?: string[];
   placeholder?: string;
   emptyTitle?: string;
@@ -90,6 +94,8 @@ export function ChatThread({
   language = 'en',
   disabled = false,
   ask,
+  messages: persistedMessages,
+  onSend,
   suggestions = [],
   placeholder,
   emptyTitle,
@@ -100,7 +106,8 @@ export function ChatThread({
   compact = false,
 }: ChatThreadProps) {
   const copy = askAiCopy(language);
-  const [messages, update] = useChatHistory(historyKey);
+  const [sessionMessages, update] = useChatHistory(historyKey);
+  const messages = persistedMessages ?? sessionMessages;
   const [draft, setDraft] = useState('');
   const scrollRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
@@ -114,6 +121,11 @@ export function ChatThread({
   const send = async (question: string) => {
     const text = question.trim();
     if (!text || busy || disabled) return;
+    if (onSend) {
+      if (await onSend(text)) setDraft(current => current.trim() === text ? '' : current);
+      return;
+    }
+    if (!ask) return;
     const id = `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
     const history = messages.filter((m) => m.status === 'done' && m.answer).map((m) => ({ question: m.question, answer: m.answer! }));
     update((current) => [...current, { id, question: text, status: 'pending' }]);
@@ -129,7 +141,7 @@ export function ChatThread({
   };
 
   const retry = (message: ChatMessage) => {
-    update((current) => current.filter((m) => m.id !== message.id));
+    if (!onSend) update((current) => current.filter((m) => m.id !== message.id));
     void send(message.question);
   };
 
@@ -214,6 +226,9 @@ export function ChatThread({
                     </div>
                   )}
                 </div>
+                {message.context && <p className="text-[10px] leading-relaxed text-af-text-3">
+                  {formatChatContext(message.context)}
+                </p>}
               </div>
             ))}
           </div>
@@ -246,7 +261,7 @@ export function ChatThread({
             placeholder={placeholder ?? copy.placeholder}
             className="af-bare max-h-[120px] min-h-[32px] flex-1 resize-none bg-transparent py-1.5 text-[13px] leading-relaxed text-af-text outline-none placeholder:text-af-text-4"
           />
-          {messages.length > 0 && (
+          {messages.length > 0 && !persistedMessages && (
             <Hint label={copy.clear}>
               <button
                 type="button"
@@ -272,4 +287,17 @@ export function ChatThread({
       </div>
     </div>
   );
+}
+
+function formatChatContext(context: AskAiContextRange): string {
+  const time = (seconds: number) => {
+    const total = Math.max(0, Math.floor(seconds));
+    return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, '0')}`;
+  };
+  const range = context.totalChars === 0 ? 'No transcript' : context.startTime === null ? 'Transcript (timestamps unavailable)' : `Transcript ${time(context.startTime)}–${time(context.endTime ?? context.startTime)}`;
+  const cut = context.truncated ? ` · ${context.includedChars.toLocaleString()} of ${context.totalChars.toLocaleString()} characters` : ' · Full transcript at request time';
+  const offset = context.startOffsetChars > 0 ? ` · starts ${context.startOffsetChars} characters into the first turn` : '';
+  const history = context.historyTurnsTotal > context.historyTurnsIncluded ? ` · ${context.historyTurnsIncluded} of ${context.historyTurnsTotal} previous answers included` : '';
+  const characters = context.totalChars > 0 ? ` · characters ${context.startChar}–${context.endChar}` : '';
+  return `${range}${context.totalChars === 0 ? '' : cut}${characters}${offset} · Meeting notes included in full${history}`;
 }

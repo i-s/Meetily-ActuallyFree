@@ -6,7 +6,7 @@
  * mount (remount with a new `key` to load different content), and every edit
  * reports both BlockNote JSON (exact) and markdown (for search, export, AI).
  */
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import type { Block, PartialBlock } from '@blocknote/core';
 import { GridSuggestionMenuController, SuggestionMenuController, useCreateBlockNote } from '@blocknote/react';
@@ -85,6 +85,8 @@ export interface NotesEditorProps {
   placeholder?: string;
   editable?: boolean;
   onChange?: (content: NotesContent) => void;
+  /** Synchronous JSON recovery draft; await markdown before generating or stopping. */
+  onDraft?: (content: NotesContent, markdown: Promise<string>) => void;
   className?: string;
   /** Called once the initial content is in the editor. */
   onReady?: () => void;
@@ -96,6 +98,7 @@ export function NotesEditor({
   placeholder = 'Write your notes…',
   editable = true,
   onChange,
+  onDraft,
   className,
   onReady,
 }: NotesEditorProps) {
@@ -103,8 +106,12 @@ export function NotesEditor({
   const dark = themeInfo(theme).dark;
   const menuLayer = useBlockNoteLayer(dark);
   const loaded = useRef(false);
+  const [ready, setReady] = useState(false);
   const onChangeRef = useRef(onChange);
   onChangeRef.current = onChange;
+  const onDraftRef = useRef(onDraft);
+  onDraftRef.current = onDraft;
+  const publishRef = useRef<() => void>(() => {});
 
   const editor = useCreateBlockNote({
     initialContent: initialBlocks && initialBlocks.length > 0 ? (initialBlocks as PartialBlock[]) : undefined,
@@ -127,6 +134,9 @@ export function NotesEditor({
       window.setTimeout(() => {
         if (cancelled) return;
         loaded.current = true;
+        setReady(true);
+        // Reconcile a recovered JSON draft even if its last conversion was interrupted.
+        if (onDraftRef.current) publishRef.current();
         onReady?.();
       }, 60);
     };
@@ -138,24 +148,40 @@ export function NotesEditor({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [editor]);
 
-  // If converting to markdown ever fails, keep the last good markdown rather
-  // than saving an empty one next to the (still correct) blocks.
+  // Preserve exact JSON before conversion starts. A failed conversion leaves
+  // the recovery draft intact and blocks an AI snapshot of stale markdown.
   const lastMarkdown = useRef(initialMarkdown ?? '');
   useEffect(() => {
-    return editor.onChange(async () => {
-      if (!loaded.current || !onChangeRef.current) return;
-      const result = await blocksToMarkdownSafely(editor, editor.document, { source: 'notes-editor', fallbackMarkdown: lastMarkdown.current });
-      if (result.ok && result.markdown !== undefined) lastMarkdown.current = result.markdown;
-      onChangeRef.current?.({ json: editor.document, markdown: result.markdown ?? lastMarkdown.current });
-    });
-  }, [editor]);
+    let revision = 0;
+    const publish = () => {
+      if (!loaded.current || (!onChangeRef.current && !onDraftRef.current)) return;
+      const currentRevision = ++revision;
+      const json = structuredClone(editor.document);
+      const converted = blocksToMarkdownSafely(editor, json, { source: 'notes-editor', fallbackMarkdown: lastMarkdown.current });
+      const markdown = converted.then(result => {
+        if (!result.ok || result.markdown === undefined) throw new Error('Could not prepare Meeting notes for saving. Edit or retry the notes.');
+        return result.markdown;
+      });
+      onDraftRef.current?.({ json, markdown: lastMarkdown.current }, markdown);
+      void markdown.then(value => {
+        if (currentRevision !== revision) return;
+        lastMarkdown.current = value;
+        onChangeRef.current?.({ json, markdown: value });
+      }).catch(() => {});
+    };
+    publishRef.current = publish;
+    // BlockNote remounts its Tiptap view when editable changes, removing
+    // listeners. Reattach after the readiness transition as well as external
+    // editable changes; editor object identity itself stays the same.
+    return editor.onChange(publish);
+  }, [editor, editable, ready]);
 
   return (
     <div className={cn('af-notes-editor', className)}>
       <BlockNoteLayerProvider value={menuLayer}>
         <BlockNoteView
           editor={editor}
-          editable={editable}
+          editable={editable && ready}
           theme={dark ? 'dark' : 'light'}
           shadCNComponents={blockNoteMenus}
           slashMenu={false}

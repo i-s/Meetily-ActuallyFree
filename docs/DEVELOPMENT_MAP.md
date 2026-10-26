@@ -105,6 +105,10 @@ source labels rather than guessing a speaker or switching engines.
 
 ## 3. Post-call processing and model selection
 
+Per-recording notes/chat identity, immutable summary inputs, Ask AI context limits,
+and issue #3 acceptance evidence are documented in
+[MEETING_WORKSPACE.md](MEETING_WORKSPACE.md).
+
 Summary-generated title ownership, placeholder rejection and completion refresh
 are documented in [SUMMARY_GENERATED_TITLES.md](SUMMARY_GENERATED_TITLES.md).
 The Codex CLI subscription provider and its subprocess contract are documented

@@ -13,8 +13,9 @@ import {
   applyPinnedSummaryLanguageToMeeting,
   detectAndCacheSummaryLanguage,
 } from '@/lib/summary-language-preferences';
-import { endLiveSession, finalLiveTitle, readLiveNotes, writeLiveTitle } from '@/lib/live-session';
-import { announceChange, saveMeetingNotes } from '@/lib/workspace-api';
+import { endLiveSession, finalLiveTitle } from '@/lib/live-session';
+import { announceChange } from '@/lib/workspace-api';
+import { flushMeetingNotes } from '@/lib/meeting-notes-store';
 import { endAutomatedRecording } from '@/lib/meeting-automation';
 
 type SummaryStatus = 'idle' | 'processing' | 'summarizing' | 'regenerating' | 'completed' | 'error';
@@ -85,56 +86,11 @@ export function useRecordingStop(
     stopInProgressRef.current = true;
     endAutomatedRecording();
 
-    // Accidental taps: under 10s → discard, no meeting note.
-    const MIN_MEETING_SECS = 10;
-    let elapsedSecs = recordingState.recordingDuration ?? 0;
-    let recordingStartedAtMs = 0;
-    let recordingStartFallbackAtMs = 0;
-    try {
-      recordingStartedAtMs = Number(sessionStorage.getItem('recording_started_at') || '0');
-      recordingStartFallbackAtMs = Number(sessionStorage.getItem('recording_start_fallback_at') || '0');
-      if (recordingStartedAtMs > 0) {
-        elapsedSecs = Math.max(elapsedSecs, (Date.now() - recordingStartedAtMs) / 1000);
-      }
-      sessionStorage.removeItem('recording_started_at');
-      sessionStorage.removeItem('recording_start_fallback_at');
-    } catch {
-      /* ignore */
-    }
-
-    if (elapsedSecs > 0 && elapsedSecs < MIN_MEETING_SECS) {
-      console.log(`Recording too short (${elapsedSecs.toFixed(1)}s) — discarding`);
-      setStatus(RecordingStatus.IDLE);
-      setIsRecording(false);
-      setIsRecordingDisabled(false);
-      setIsMeetingActive(false);
-      clearTranscripts();
-      endLiveSession();
-      try {
-        // stop_recording may still be publishing folder_path — brief wait.
-        let folderPath = sessionStorage.getItem('last_recording_folder_path');
-        if (!folderPath) {
-          await new Promise((r) => setTimeout(r, 400));
-          folderPath = sessionStorage.getItem('last_recording_folder_path');
-        }
-        sessionStorage.removeItem('last_recording_folder_path');
-        sessionStorage.removeItem('last_recording_meeting_name');
-        if (folderPath) {
-          await invoke('discard_recording_folder', { folderPath }).catch((e) =>
-            console.warn('Failed to discard short recording folder:', e),
-          );
-        }
-      } catch {
-        /* ignore cleanup errors */
-      }
-      toast.message('Recording cancelled', {
-        description: `That take was under ${MIN_MEETING_SECS} seconds, so nothing was saved.`,
-        duration: 5000,
-      });
-      Analytics.trackButtonClick('recording_discarded_too_short', 'home_page');
-      stopInProgressRef.current = false;
-      return;
-    }
+    // Silent and short recordings still own notes and chat.
+    const durableMeetingId = sessionStorage.getItem('last_recording_meeting_id') || recordingState.meetingId;
+    const recordingStartFallbackAtMs = Number(sessionStorage.getItem('recording_start_fallback_at') || '0');
+    sessionStorage.removeItem('recording_started_at');
+    sessionStorage.removeItem('recording_start_fallback_at');
 
     // Set status to STOPPING immediately
     setStatus(RecordingStatus.STOPPING);
@@ -143,6 +99,8 @@ export function useRecordingStop(
     const stopStartTime = Date.now();
 
     try {
+      if (!durableMeetingId) throw new Error('Missing native recording meeting ID');
+      await flushMeetingNotes(durableMeetingId);
       console.log('Post-stop processing (new implementation)...', {
         stop_initiated_at: new Date(stopStartTime).toISOString(),
         current_transcript_count: transcriptsRef.current.length
@@ -270,7 +228,8 @@ export function useRecordingStop(
             meetingName,
             freshTranscripts,
             folderPath,
-            recordingStartedAt
+            recordingStartedAt,
+            durableMeetingId
           );
 
           const meetingId = responseData.meeting_id;
@@ -290,23 +249,7 @@ export function useRecordingStop(
             } catch (error) {
               console.warn('Could not file this meeting into its group', error);
             }
-            // Notes typed during the call become the meeting's notes. If that
-            // fails they stay in the draft rather than being dropped.
-            const liveNotes = readLiveNotes();
-            let notesSaved = true;
-            if (liveNotes?.markdown.trim()) {
-              try {
-                await saveMeetingNotes(meetingId, liveNotes.markdown, liveNotes.json);
-              } catch (error) {
-                notesSaved = false;
-                console.warn('Could not save the notes taken during the call', error);
-                toast.warning('Your call notes were not saved to the meeting', {
-                  description: 'Copy them from the Notes tab on the recorder before starting another recording.',
-                });
-              }
-            }
-            if (notesSaved) endLiveSession();
-            else writeLiveTitle(null);
+            endLiveSession();
           }
           if (!meetingId) {
             console.error('No meeting_id in response:', responseData);
@@ -353,6 +296,7 @@ export function useRecordingStop(
           // Clean up session storage
           sessionStorage.removeItem('last_recording_folder_path');
           sessionStorage.removeItem('last_recording_meeting_name');
+          sessionStorage.removeItem('last_recording_meeting_id');
           // Clean up IndexedDB meeting ID (redundant with markMeetingAsSaved cleanup, but ensures cleanup)
           sessionStorage.removeItem('indexeddb_current_meeting_id');
 
@@ -476,6 +420,7 @@ export function useRecordingStop(
     setIsMeetingActive,
     router,
     recordingState.recordingDuration,
+    recordingState.meetingId,
   ]);
 
   // Expose handleRecordingStop function to window for Rust callbacks

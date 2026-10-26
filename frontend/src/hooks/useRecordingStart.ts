@@ -225,6 +225,8 @@ export function useRecordingStart(
       setMeetingTitle(title);
       setStatus(RecordingStatus.STARTING, 'Starting audio capture…');
 
+      // Clear the previous session before native Start publishes any new turns.
+      clearTranscripts();
       await recordingService.startRecordingWithDevices(
         selectedDevices?.micDevice || null,
         selectedDevices?.systemDevice || null,
@@ -234,7 +236,6 @@ export function useRecordingStart(
       // RECORDING status itself arrives from Rust via RecordingStateContext.
       beginLiveSession(title, startedAt);
       setIsRecording(true);
-      clearTranscripts();
       setIsMeetingActive(true);
       markRecordingStarted(startedAt);
       Analytics.trackButtonClick('start_recording', source);

@@ -8,6 +8,8 @@
  * browser. It is never bundled into production builds.
  */
 import { mockIPC, mockWindows } from '@tauri-apps/api/mocks';
+import { emit } from '@tauri-apps/api/event';
+import type { AskAiContextRange, AskAiContextSettings, MeetingChatTurn, SummaryInputSnapshot } from '@/lib/workspace-api';
 import { MotionGlobalConfig } from 'framer-motion';
 import * as fx from './fixtures';
 import { handleLiveCommand } from './live';
@@ -40,6 +42,11 @@ const state = {
   links: fx.speakerLinks.map((link) => ({ ...link })),
   notes: new Map<string, { markdown: string | null; json: unknown[] | null; updatedAt: string }>(),
   summaries: new Map<string, string | null>(),
+  summarySnapshots: new Map<string, SummaryInputSnapshot>(),
+  summaryProcesses: new Map<string, string>(),
+  chat: new Map<string, MeetingChatTurn[]>(),
+  contextSettings: { mode: 'recent', maxChars: 10000 } as AskAiContextSettings,
+  summaryLanguages: new Map<string, string | null>(),
   actionItems: [] as ActionItemRow[],
   actionSynced: new Set<string>(),
   transcripts: new Map<string, fx.PreviewTranscript[]>(),
@@ -324,8 +331,48 @@ const notificationSettings = {
 
 let storeRid = 1;
 
+function createPreviewMeeting(title: string, createdAt: string) {
+  const id = newId('meeting');
+  state.meetings.push({ id, title, created_at: createdAt, duration_seconds: 0, group_id: null, folder_path: `/preview/${id}` });
+  state.transcripts.set(id, []);
+  state.summaries.set(id, null);
+  return id;
+}
+function requireMeeting(id: string) {
+  const row = meeting(id);
+  if (!row) throw new Error('Meeting not found');
+  return row;
+}
+/** Mirrors native scalar-character counting for fixture display only. The browser
+ * preview has no database/model and is not evidence of native persistence. */
+function previewContext(meetingId: string): AskAiContextRange {
+  requireMeeting(meetingId);
+  const rows = transcripts(meetingId);
+  const totalChars = rows.reduce((sum, row) => sum + Array.from(row.text).length, 0);
+  const includedChars = state.contextSettings.mode === 'all' ? totalChars : Math.min(totalChars, state.contextSettings.maxChars);
+  const startChar = totalChars - includedChars;
+  const range: AskAiContextRange = { settings: {...state.contextSettings}, totalChars, includedChars, startChar, endChar: totalChars, startTime: null, endTime: null, startTranscriptId: null, endTranscriptId: null, startOffsetChars: 0, truncated: startChar > 0, historyTurnsIncluded: 0, historyTurnsTotal: 0 };
+  let position = 0;
+  for (const row of rows) {
+    const length = Array.from(row.text).length;
+    if (position + length > startChar && length > 0) {
+      if (range.startTranscriptId === null) { range.startTranscriptId = row.id; range.startTime = row.audio_start_time ?? null; range.startOffsetChars = Math.max(0, startChar - position); }
+      range.endTranscriptId = row.id; range.endTime = row.audio_end_time ?? row.audio_start_time ?? null;
+    }
+    position += length;
+  }
+  const history = (state.chat.get(meetingId) ?? []).filter(turn => turn.status === 'completed');
+  range.historyTurnsTotal = history.length;
+  range.historyTurnsIncluded = Math.min(20, history.length);
+  return range;
+}
+
 function handle(cmd: string, args: Args): unknown {
-  const liveResult = handleLiveCommand(cmd, args);
+  const liveResult = handleLiveCommand(cmd, args, {
+    create: createPreviewMeeting,
+    append: (id, line) => { if (meeting(id)) transcripts(id).push(line); },
+    stop: (id, duration) => { const row = meeting(id); if (row) row.duration_seconds = Math.round(duration); },
+  });
   if (liveResult !== undefined) return liveResult;
   // @tauri-apps/plugin-store: an empty store that accepts writes.
   if (cmd.startsWith('plugin:store|')) {
@@ -366,6 +413,7 @@ function handle(cmd: string, args: Args): unknown {
     case 'get_default_recordings_folder_path':
       return 'C:/Users/preview/Music/meetily-recordings';
     case 'get_ollama_models':
+      return [{ name: 'llama3.2:3b', id: 'llama3.2:3b' }];
     case 'whisper_get_available_models':
     case 'builtin_ai_list_models':
     case 'get_meeting_history':
@@ -535,7 +583,14 @@ function handle(cmd: string, args: Args): unknown {
     case 'get_meeting_folder_path':
       return meeting(args.meetingId)?.folder_path ?? null;
     case 'api_get_meeting_summary_language':
-      return { language: null, storage: 'metadata' };
+      return { language: state.summaryLanguages.get(args.meetingId) ?? null, storage: 'metadata' };
+    case 'api_save_meeting_summary_language':
+      state.summaryLanguages.set(args.meetingId, args.summaryLanguage ?? null);
+      return { language: args.summaryLanguage ?? null, storage: 'metadata' };
+    case 'api_get_meeting_detected_summary_language':
+      return { language: 'en', storage: 'metadata' };
+    case 'api_detect_transcript_summary_language':
+      return { language: 'en', reason: 'preview fixture' };
 
     // ---- Meetings --------------------------------------------------------
     case 'api_get_meetings':
@@ -567,22 +622,16 @@ function handle(cmd: string, args: Args): unknown {
       return null;
     }
     case 'api_save_transcript': {
-      // The simulated recording's save: add it to the library like the real one.
-      const id = newId('meeting');
+      const id = args.meetingId ?? createPreviewMeeting(args.meetingTitle ?? 'New Meeting', args.recordingStartedAt ?? now());
+      const entry = requireMeeting(id);
       const rows = (args.transcripts ?? []) as Array<Record<string, any>>;
-      const createdAt = args.recordingStartedAt ?? now();
-      state.meetings.push({
-        id,
-        title: args.meetingTitle ?? 'New Meeting',
-        created_at: createdAt,
-        duration_seconds: Math.round(rows.reduce((max, row) => Math.max(max, row.audio_end_time ?? 0), 0)),
-        group_id: null,
-        folder_path: args.folderPath ?? '/preview/live',
-      });
+      entry.title = args.meetingTitle ?? entry.title;
+      entry.duration_seconds = Math.max(entry.duration_seconds, Math.round(rows.reduce((max, row) => Math.max(max, row.audio_end_time ?? 0), 0)));
+      entry.folder_path = args.folderPath ?? entry.folder_path;
       state.transcripts.set(
         id,
         rows.map((row, index) => ({
-          id: `${id}-t${index}`,
+          id: row.id ?? `${id}:seg_${row.sequence_id ?? index + 1}`,
           text: row.text,
           timestamp: row.timestamp ?? now(),
           audio_start_time: row.audio_start_time ?? 0,
@@ -592,7 +641,6 @@ function handle(cmd: string, args: Args): unknown {
           confidence: row.confidence,
         })),
       );
-      state.summaries.set(id, null);
       return { meeting_id: id };
     }
     case 'api_save_meeting_title': {
@@ -603,6 +651,9 @@ function handle(cmd: string, args: Args): unknown {
     case 'api_delete_meeting':
       state.meetings = state.meetings.filter((entry) => entry.id !== args.meetingId);
       state.actionItems = state.actionItems.filter((item) => item.meetingId !== args.meetingId);
+      state.notes.delete(args.meetingId); state.chat.delete(args.meetingId); state.transcripts.delete(args.meetingId);
+      state.summaries.delete(args.meetingId); state.summarySnapshots.delete(args.meetingId); state.summaryProcesses.delete(args.meetingId);
+      state.links = state.links.filter(link => link.meetingId !== args.meetingId);
       return null;
     case 'api_set_meetings_group':
       for (const entry of state.meetings) {
@@ -610,10 +661,12 @@ function handle(cmd: string, args: Args): unknown {
       }
       return (args.meetingIds as string[]).length;
     case 'api_get_meeting_notes': {
+      requireMeeting(args.meetingId);
       const notes = state.notes.get(args.meetingId);
       return notes ?? null;
     }
     case 'api_save_meeting_notes':
+      requireMeeting(args.meetingId);
       state.notes.set(args.meetingId, { markdown: args.markdown ?? null, json: args.json ?? null, updatedAt: now() });
       return null;
     case 'api_get_meeting_audio':
@@ -854,6 +907,65 @@ function handle(cmd: string, args: Args): unknown {
     }
     case 'api_list_unsynced_action_meetings':
       return [];
+
+    // ---- Meeting workspace preview fixtures -----------------------------
+    case 'get_ask_ai_context_settings':
+      return { ...state.contextSettings };
+    case 'set_ask_ai_context_settings': {
+      const settings = args.settings as AskAiContextSettings;
+      if (!settings || !['recent', 'all'].includes(settings.mode) || !Number.isSafeInteger(settings.maxChars) || settings.maxChars < 1) throw new Error('Invalid Ask AI context settings');
+      state.contextSettings = { ...settings };
+      void emit('ask-ai-context-settings-changed', state.contextSettings);
+      return { ...state.contextSettings };
+    }
+    case 'get_meeting_chat_context':
+      return previewContext(args.meetingId);
+    case 'get_meeting_chat':
+      requireMeeting(args.meetingId);
+      return structuredClone(state.chat.get(args.meetingId) ?? []);
+    case 'send_meeting_chat': {
+      const meetingId = args.meetingId as string;
+      requireMeeting(meetingId);
+      const question = String(args.question ?? '').trim();
+      if (!question) throw new Error('Question cannot be empty');
+      const turns = state.chat.get(meetingId) ?? [];
+      if (turns.some(turn => turn.status === 'pending')) throw new Error('A response is already pending for this meeting');
+      const turn: MeetingChatTurn = { id: newId('turn'), meetingId, question, answer: null, status: 'pending', error: null, createdAt: now(), completedAt: null, context: previewContext(meetingId) };
+      turns.push(turn); state.chat.set(meetingId, turns);
+      void emit('meeting-chat-updated', { meetingId, turnId: turn.id });
+      setTimeout(() => {
+        if (!meeting(meetingId)) return;
+        const first = turn.context.startTime;
+        const stamp = first === null ? '' : ` [${Math.floor(first / 60)}:${String(Math.floor(first % 60)).padStart(2, '0')}]`;
+        turn.answer = `Preview fixture answer${stamp}. This demonstrates the saved chat layout; no AI model was called.`;
+        turn.status = 'completed'; turn.completedAt = now();
+        void emit('meeting-chat-updated', { meetingId, turnId: turn.id });
+      }, 700);
+      return structuredClone(turn);
+    }
+    case 'api_get_summary_input_snapshot':
+      requireMeeting(args.meetingId);
+      return structuredClone(state.summarySnapshots.get(args.meetingId) ?? null);
+    case 'api_process_transcript': {
+      const meetingId = args.meetingId as string;
+      requireMeeting(meetingId);
+      const notes = structuredClone(state.notes.get(meetingId));
+      const conversation = transcripts(meetingId).map(row => row.text).join('\n');
+      const processId = newId('summary');
+      const snapshot: SummaryInputSnapshot = { capturedAt: now(), notesMarkdown: notes?.markdown ?? null, notesJson: notes?.json ? JSON.stringify(notes.json) : null };
+      state.summaryProcesses.set(meetingId, processId);
+      setTimeout(() => {
+        if (!meeting(meetingId) || state.summaryProcesses.get(meetingId) !== processId) return;
+        const markdown = `## Preview summary\n\nThis is a browser fixture; no AI model was called.\n\n### Transcript\n\n${conversation || '(No speech)'}\n\n### Meeting notes\n\n${snapshot.notesMarkdown || '(No notes)'}`;
+        state.summaries.set(meetingId, markdown); state.summarySnapshots.set(meetingId, snapshot);
+        state.summaryProcesses.delete(meetingId);
+        void emit('summary-progress', { meetingId, processId, stage: 'completed', data: { markdown } });
+      }, 750);
+      return { process_id: processId };
+    }
+    case 'api_cancel_summary':
+      state.summaryProcesses.delete(args.meetingId);
+      return null;
 
     // ---- Search and AI ---------------------------------------------------
     case 'api_global_search':
