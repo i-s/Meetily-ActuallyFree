@@ -14,6 +14,8 @@ import { ParakeetModelManager } from './ParakeetModelManager';
 import type { RawModelInfo } from '@/hooks/useTranscriptionModels';
 import { isVisibleParakeetModel } from '@/lib/parakeet';
 import { useLabs } from '@/hooks/useLabs';
+import { useConfig } from '@/contexts/ConfigContext';
+import { LanguageSelection } from './LanguageSelection';
 
 export interface TranscriptModelProps {
     provider: 'localWhisper' | 'parakeet' | 'deepgram' | 'elevenLabs' | 'groq' | 'openai';
@@ -48,6 +50,7 @@ const DEFAULT_POST_CALL_CONFIG: PostCallTranscriptConfig = {
 };
 
 export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelConfig, onModelSelect }: TranscriptSettingsProps) {
+    const { selectedLanguage, setSelectedLanguage } = useConfig();
     const [uiProvider, setUiProvider] = useState<TranscriptModelProps['provider']>(transcriptModelConfig.provider);
     const [whisperManagerOpen, setWhisperManagerOpen] = useState(false);
     const [installedModels, setInstalledModels] = useState<InstalledModel[]>([]);
@@ -610,6 +613,20 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
                         />
                     </div>
                 </details>
+            </section>
+
+            <section aria-label="Whisper language" className="space-y-3 rounded-xl border border-af-border bg-af-panel-2 p-4 text-af-text">
+                <LanguageSelection
+                    label="Default Whisper language"
+                    selectedLanguage={selectedLanguage}
+                    onLanguageChange={setSelectedLanguage}
+                    provider="localWhisper"
+                />
+                <p className="text-xs text-muted-foreground">
+                    Used whenever Whisper transcribes audio, including post-call enhancement while Parakeet is selected for live recording.
+                    Choose the language spoken in your meetings, or Auto Detect (Original Language) to preserve it.
+                    You can override this default when enhancing an individual meeting.
+                </p>
             </section>
 
             <section className={`space-y-3 rounded-xl border border-[var(--af-border)] bg-[var(--af-panel-2)] p-4 text-[var(--af-text)] ${whisperIsActive ? '' : 'opacity-60'}`}>

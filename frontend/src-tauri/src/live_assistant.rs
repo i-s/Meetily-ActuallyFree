@@ -17,7 +17,7 @@ use crate::database::repositories::setting::SettingsRepository;
 use crate::summary::llm_client::{generate_summary, LLMProvider};
 use sqlx::SqlitePool;
 use std::path::PathBuf;
-use tauri::{AppHandle, Runtime, State};
+use tauri::{AppHandle, Emitter, Runtime, State};
 use tracing::info;
 
 struct ResolvedAssistantModel {
@@ -230,6 +230,100 @@ skimmable; use Markdown (bullets, short paragraphs, code blocks when relevant).{
         answer.len()
     );
     Ok(answer)
+}
+
+/// Both live and saved meeting views use this native-owned operation. Returning
+/// the committed pending row gives the UI durable identity before inference.
+#[tauri::command]
+pub async fn send_meeting_chat<R: Runtime>(
+    app: AppHandle<R>,
+    state: State<'_, crate::state::AppState>,
+    meeting_id: String,
+    question: String,
+    answer_language: Option<String>,
+) -> Result<crate::meeting_chat::ChatTurn, String> {
+    crate::audio::recording_commands::flush_recording_transcripts(&meeting_id).await?;
+    let pool = state.db_manager.pool().clone();
+    let prepared = crate::meeting_chat::prepare_turn(&pool, &meeting_id, &question).await?;
+    let turn = prepared.turn.clone();
+    let turn_id = turn.id.clone();
+    // The runtime task owns the pool, prompt and application handle. Navigating
+    // away or destroying the invoking WebView cannot abandon the terminal write.
+    let worker_app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let system_prompt = format!(
+            "{}{}",
+            crate::meeting_chat::SYSTEM_PROMPT,
+            answer_language_guidance(answer_language.as_deref())
+        );
+        let worker_pool = pool.clone();
+        let worker = tauri::async_runtime::spawn(async move {
+            let model = resolve_assistant_model(&worker_pool).await?;
+            tokio::time::timeout(
+                std::time::Duration::from_secs(600),
+                generate_assistant_answer(&model, &system_prompt, &prepared.user_prompt, 1024, 0.2),
+            )
+            .await
+            .map_err(|_| {
+                "Answer generation timed out. Send the question again to retry.".to_string()
+            })?
+        });
+        // A provider panic is a visible failed turn, not an eternal reading state.
+        let result = match worker.await {
+            Ok(result) => result,
+            Err(error) => Err(format!("Answer worker stopped: {error}")),
+        };
+        match crate::meeting_chat::finish_turn(&pool, &turn_id, result).await {
+            Ok(true) => {
+                let _ = worker_app.emit(
+                    "meeting-chat-updated",
+                    serde_json::json!({"meetingId": meeting_id, "turnId": turn_id}),
+                );
+            }
+            Ok(false) => {} // The meeting was deleted; never recreate it.
+            Err(error) => tracing::error!("Failed to persist meeting chat completion: {error}"),
+        }
+    });
+    let _ = app.emit(
+        "meeting-chat-updated",
+        serde_json::json!({"meetingId": turn.meeting_id, "turnId": turn.id}),
+    );
+    Ok(turn)
+}
+
+#[tauri::command]
+pub async fn get_meeting_chat(
+    state: State<'_, crate::state::AppState>,
+    meeting_id: String,
+) -> Result<Vec<crate::meeting_chat::ChatTurn>, String> {
+    crate::meeting_chat::load_turns(state.db_manager.pool(), &meeting_id).await
+}
+
+#[tauri::command]
+pub async fn get_meeting_chat_context(
+    state: State<'_, crate::state::AppState>,
+    meeting_id: String,
+) -> Result<crate::meeting_chat::ContextRange, String> {
+    crate::audio::recording_commands::flush_recording_transcripts(&meeting_id).await?;
+    crate::meeting_chat::preview_context(state.db_manager.pool(), &meeting_id).await
+}
+
+#[tauri::command]
+pub async fn get_ask_ai_context_settings(
+    state: State<'_, crate::state::AppState>,
+) -> Result<crate::meeting_chat::ContextSettings, String> {
+    crate::meeting_chat::load_settings(state.db_manager.pool()).await
+}
+
+#[tauri::command]
+pub async fn set_ask_ai_context_settings<R: Runtime>(
+    app: AppHandle<R>,
+    state: State<'_, crate::state::AppState>,
+    settings: crate::meeting_chat::ContextSettings,
+) -> Result<crate::meeting_chat::ContextSettings, String> {
+    let saved = crate::meeting_chat::save_settings(state.db_manager.pool(), settings).await?;
+    let _ = app.emit("ask-ai-context-settings-changed", &saved);
+    Ok(saved)
 }
 
 /// Ask about a durable person profile using only explicitly attributed SQLite

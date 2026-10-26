@@ -45,13 +45,15 @@ export function RecordingPostProcessingProvider({ children }: { children: React.
         // Listen for recording-stop-complete event from Rust
         const unlisten = await listen<{
           call_api: boolean;
+          meeting_id?: string;
           folder_path?: string | null;
           meeting_name?: string | null;
           audio_save_error?: string | null;
         }>('recording-stop-complete', (event) => {
           console.log('[RecordingPostProcessing] Received recording-stop-complete event:', event.payload);
 
-          const { call_api, folder_path, meeting_name, audio_save_error } = event.payload;
+          const { call_api, meeting_id, folder_path, meeting_name, audio_save_error } = event.payload;
+          if (meeting_id) sessionStorage.setItem('last_recording_meeting_id', meeting_id);
           if (audio_save_error) {
             toast.error('Some or all meeting audio could not be saved. The transcript will still be kept.', {
               description: audio_save_error,

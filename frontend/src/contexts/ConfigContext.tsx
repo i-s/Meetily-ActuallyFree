@@ -134,19 +134,12 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
     systemDevice: null
   });
 
-  // Language preference: saved choice wins; otherwise English if the OS is
-  // English, auto-detect for any other system language.
+  // The system/UI locale does not identify the language spoken in a meeting.
+  // Preserve an explicit choice; otherwise transcribe the original language.
   const [selectedLanguage, setSelectedLanguage] = useState<string>(() => {
-    if (typeof window === 'undefined') return 'en';
+    if (typeof window === 'undefined') return 'auto';
     const saved = localStorage.getItem('primaryLanguage');
-    if (saved) return saved;
-    try {
-      const locale = (navigator.language || (navigator as any).userLanguage || 'en').toLowerCase();
-      const primary = locale.split(/[-_]/)[0] || 'en';
-      return primary === 'en' ? 'en' : 'auto';
-    } catch {
-      return 'en';
-    }
+    return saved || 'auto';
   });
 
   // UI preferences state

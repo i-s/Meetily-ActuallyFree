@@ -2,7 +2,6 @@ import React, { useState, useEffect } from 'react';
 import { AlertTriangle, Globe, Info, Languages } from 'lucide-react';
 import Analytics from '@/lib/analytics';
 import { toast } from 'sonner';
-import { useConfig } from '@/contexts/ConfigContext';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 
 export interface Language {
@@ -118,6 +117,7 @@ const LANGUAGES: Language[] = [
 import type { TranscriptModelProps } from './TranscriptSettings';
 
 interface LanguageSelectionProps {
+  label?: string;
   selectedLanguage: string;
   onLanguageChange: (language: string) => void;
   disabled?: boolean;
@@ -125,13 +125,13 @@ interface LanguageSelectionProps {
 }
 
 export function LanguageSelection({
+  label = 'Transcription language',
   selectedLanguage,
   onLanguageChange,
   disabled = false,
   provider = 'localWhisper'
 }: LanguageSelectionProps) {
   const [saving, setSaving] = useState(false);
-  const { setSelectedLanguage } = useConfig();
 
   // Parakeet only supports auto-detection (doesn't support manual language selection)
   const isParakeet = provider === 'parakeet';
@@ -143,7 +143,6 @@ export function LanguageSelection({
     setSaving(true);
     try {
       // Save language preference to localStorage and sync to backend
-      setSelectedLanguage(languageCode);
       onLanguageChange(languageCode);
       console.log('Language preference saved:', languageCode);
 
@@ -181,13 +180,13 @@ export function LanguageSelection({
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-2">
           <Globe className="h-4 w-4 text-af-text-2" />
-          <h4 className="text-sm font-medium text-af-text">Transcription Language</h4>
+          <h4 className="text-sm font-medium text-af-text">{label}</h4>
         </div>
       </div>
 
       <div className="space-y-2">
         <Select value={selectedLanguage} onValueChange={handleLanguageChange} disabled={disabled || saving}>
-          <SelectTrigger aria-label="Transcription language">
+          <SelectTrigger aria-label={label}>
             <SelectValue />
           </SelectTrigger>
           <SelectContent>
