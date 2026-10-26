@@ -142,6 +142,7 @@ jobs:
           done < <(find tests/chat tests/codex-cli tests/meeting-detection tests/meeting-workspace -type f \( -name '*.test.ts' -o -name '*.test.tsx' \) -print0 | sort -z)
           pnpm dlx bun@1.3.10 test tests/hooks/recording-shutdown.test.tsx
           pnpm dlx bun@1.3.10 test tests/hooks/summary-recovery.test.tsx
+          pnpm dlx bun@1.3.10 test tests/hooks/whisper-language-default.test.tsx
 
       - name: Run native macOS audio and AI regressions
         working-directory: frontend/src-tauri

@@ -125,6 +125,9 @@ Frontend post-call sequencing lives in
 speaker/retranscription dialogs. `useDiarizationEngine.ts` refreshes selected-engine
 state for dialogs, including native activation events and stale-response guards.
 
+The shared Whisper language preference and its regression coverage are documented
+in [WHISPER_LANGUAGE.md](WHISPER_LANGUAGE.md).
+
 Live ASR and post-call ASR defaults are independent. Optional Whisper activation
 saves the **post-call** default; it must not replace the live Parakeet selection.
 

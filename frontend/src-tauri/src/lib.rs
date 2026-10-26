@@ -77,10 +77,10 @@ use tokio::sync::RwLock;
 
 static RECORDING_FLAG: AtomicBool = AtomicBool::new(false);
 
-// Global language preference storage (default to "auto-translate" for automatic translation to English)
-// Frontend overwrites on startup from OS locale (en if English, else auto).
+// Detect the spoken language until the frontend restores an explicit preference.
+// The operating system locale must not force English transcription or translation.
 static LANGUAGE_PREFERENCE: std::sync::LazyLock<StdMutex<String>> =
-    std::sync::LazyLock::new(|| StdMutex::new("en".to_string()));
+    std::sync::LazyLock::new(|| StdMutex::new("auto".to_string()));
 
 #[tauri::command]
 fn get_check_updates_on_launch() -> bool {
