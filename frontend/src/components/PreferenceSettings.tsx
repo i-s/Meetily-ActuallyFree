@@ -8,6 +8,7 @@ import { toast } from "sonner"
 import Analytics from "@/lib/analytics"
 import { useConfig, NotificationSettings } from "@/contexts/ConfigContext"
 import { ThemePicker } from "@/components/settings/ThemePicker"
+import { AskAiContextSettings } from "@/components/AskAiContextSettings"
 
 export function PreferenceSettings() {
   const {
@@ -192,6 +193,7 @@ export function PreferenceSettings() {
 
   return (
     <div className="space-y-6">
+      <AskAiContextSettings />
       {/* Appearance / Theme Section */}
       <div className="rounded-2xl border border-af-border bg-af-panel-2/40 p-5">
         <h3 className="text-[15px] font-semibold text-af-text mb-1">Theme</h3>

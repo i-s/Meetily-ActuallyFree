@@ -1,3 +1,4 @@
+import { flushMeetingNotes } from '@/lib/meeting-notes-store';
 import {getCodexCliStatus, codexCliBlockingReason} from '@/lib/codex-cli';
 import { useState, useCallback, useEffect, useRef } from 'react';
 import { Transcript, Summary } from '@/types';
@@ -14,9 +15,7 @@ import {
   getClaudeCliStatus,
 } from '@/lib/claude-cli';
 import {
-  detectAndCacheSummaryLanguage,
   readMeetingSummaryLanguage,
-  readCachedDetectedSummaryLanguage,
 } from '@/lib/summary-language-preferences';
 
 /**
@@ -45,8 +44,7 @@ async function codexCliPreflight(path?: string | null): Promise<string | null> {
 }
 
 async function resolveSummaryLanguage(
-  meetingId: string,
-  transcriptTexts: string[]
+  meetingId: string
 ): Promise<string | null> {
   try {
     const perMeeting = await readMeetingSummaryLanguage(meetingId);
@@ -58,25 +56,9 @@ async function resolveSummaryLanguage(
     });
   }
 
-  try {
-    const cachedDetected = await readCachedDetectedSummaryLanguage(meetingId);
-    if (cachedDetected) return cachedDetected;
-  } catch (err) {
-    console.warn('Failed to load cached detected summary language:', err);
-  }
-
-  try {
-    const detection = await detectAndCacheSummaryLanguage(meetingId, transcriptTexts);
-    if (detection.reason === 'tie') {
-      toast.warning('Bilingual transcript detected', {
-        description: 'Pick a summary language manually if Auto chooses the wrong fallback.',
-      });
-    }
-    return detection.language;
-  } catch (err) {
-    console.warn('Failed to detect transcript summary language:', err);
-    return null;
-  }
+  // Auto language detection uses the immutable native input, not a paginated
+  // WebView transcript or a second, independently timed read.
+  return null;
 }
 
 type SummaryStatus = 'idle' | 'processing' | 'summarizing' | 'regenerating' | 'completed' | 'error';
@@ -91,7 +73,7 @@ interface UseSummaryGenerationProps {
   onMeetingUpdated?: () => Promise<void>;
   setAiSummary: (summary: Summary | null) => void;
   onOpenModelSettings?: () => void;
-  /** Tidies each line before it is sent (Labs clean transcript). The saved transcript is not changed. */
+  /** Display preference only; summaries snapshot the complete saved transcript. */
   cleanText?: (text: string) => string;
 }
 
@@ -116,8 +98,6 @@ export function useSummaryGeneration({
   const mountedRef = useRef(true);
   const summaryRequestGenerationRef = useRef(0);
   const setAiSummaryRef = useRef(setAiSummary);
-  const cleanTextRef = useRef(cleanText);
-  cleanTextRef.current = cleanText;
   const onMeetingUpdatedRef = useRef(onMeetingUpdated);
   const stopSummaryPollingRef = useRef(stopSummaryPolling);
   setAiSummaryRef.current = setAiSummary;
@@ -291,14 +271,10 @@ export function useSummaryGeneration({
 
   // Unified summary processing logic
   const processSummary = useCallback(async ({
-    transcriptText,
-    transcriptTexts,
     customPrompt = '',
     isRegeneration = false,
     requestGeneration: providedRequestGeneration,
   }: {
-    transcriptText: string;
-    transcriptTexts?: string[];
     customPrompt?: string;
     isRegeneration?: boolean;
     requestGeneration?: number;
@@ -317,10 +293,6 @@ export function useSummaryGeneration({
     let backendAccepted = false;
 
     try {
-      if (!transcriptText.trim()) {
-        throw new Error('No transcript text available. Please add some text first.');
-      }
-
       console.log('Processing transcript with template:', selectedTemplate);
 
       // Calculate time since recording
@@ -330,7 +302,7 @@ export function useSummaryGeneration({
       await Analytics.trackSummaryGenerationStarted(
         modelConfig.provider,
         modelConfig.model,
-        transcriptText.length,
+        0, // Native snapshots own the source text; no frontend copy is sent.
         timeSinceRecording
       );
       if (!isCurrentRequest()) return false;
@@ -348,15 +320,16 @@ export function useSummaryGeneration({
       });
 
       // Resolve explicit metadata override first; Auto detects the transcript language.
-      const summaryLanguage = await resolveSummaryLanguage(
-        meeting.id,
-        transcriptTexts?.length ? transcriptTexts : [transcriptText]
-      );
+      const summaryLanguage = await resolveSummaryLanguage(meeting.id);
       if (!isCurrentRequest()) return false;
 
-      // Process transcript and get process_id
+      // A pending editor debounce must reach SQLite before native code captures
+      // both sources. Save failure blocks generation instead of losing new notes.
+      await flushMeetingNotes(requestMeetingId);
+      if (!isCurrentRequest()) return false;
+
+      // Native code reads all transcript rows and notes in one transaction.
       const result = await invokeTauri('api_process_transcript', {
-        text: transcriptText,
         model: modelConfig.provider,
         modelName: modelConfig.model,
         meetingId: meeting.id,
@@ -616,65 +589,6 @@ export function useSummaryGeneration({
     onMeetingUpdated,
   ]);
 
-  // Helper function to fetch ALL transcripts for summary generation
-  const fetchAllTranscripts = useCallback(async (meetingId: string): Promise<Transcript[]> => {
-    try {
-      console.log('📊 Fetching all transcripts for meeting:', meetingId);
-
-      // First, get total count by fetching first page
-      const firstPage = await invokeTauri('api_get_meeting_transcripts', {
-        meetingId,
-        limit: 1,
-        offset: 0,
-      }) as { transcripts: Transcript[]; total_count: number; has_more: boolean };
-
-      const totalCount = firstPage.total_count;
-      console.log(`📊 Total transcripts in database: ${totalCount}`);
-
-      if (totalCount === 0) {
-        return [];
-      }
-
-      // Fetch all transcripts in one call
-      const allData = await invokeTauri('api_get_meeting_transcripts', {
-        meetingId,
-        limit: totalCount,
-        offset: 0,
-      }) as { transcripts: Transcript[]; total_count: number; has_more: boolean };
-
-      console.log(`✅ Fetched ${allData.transcripts.length} transcripts from database`);
-      return allData.transcripts;
-    } catch (error) {
-      console.error('❌ Error fetching all transcripts:', error);
-      toast.error('Failed to fetch transcripts for summary generation');
-      return [];
-    }
-  }, []);
-
-  const buildSummaryTranscriptPayload = useCallback((allTranscripts: Transcript[]) => {
-    const formatTime = (seconds: number | undefined, fallbackTimestamp: string): string => {
-      if (seconds === undefined) {
-        return fallbackTimestamp;
-      }
-      const totalSecs = Math.floor(seconds);
-      const mins = Math.floor(totalSecs / 60);
-      const secs = totalSecs % 60;
-      return `[${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}]`;
-    };
-
-    const clean = cleanTextRef.current;
-    const textOf = (t: Transcript) => (clean ? clean(t.text) || t.text : t.text);
-    return {
-      transcriptText: allTranscripts
-        .map(t => {
-          const speaker = t.speaker ? `${t.speaker}: ` : '';
-          return `${formatTime(t.audio_start_time, t.timestamp)} ${speaker}${textOf(t)}`;
-        })
-        .join('\n'),
-      transcriptTexts: allTranscripts.map(textOf),
-    };
-  }, []);
-
   // Public API: Generate summary from transcripts
   const handleGenerateSummary = useCallback(async (customPrompt: string = ''): Promise<boolean> => {
     const requestMeetingId = meeting.id;
@@ -696,21 +610,6 @@ export function useSummaryGeneration({
     // "Generate summary" button up for the whole prep phase.
     setSummaryStatus('processing');
     setSummaryError(null);
-
-    // CHANGE: Fetch ALL transcripts from database, not from pagination state
-    console.log('📊 Fetching all transcripts for summary generation...');
-    const allTranscripts = await fetchAllTranscripts(meeting.id);
-    if (!isCurrentRequest()) return false;
-
-    if (!allTranscripts.length) {
-      const error_msg = 'No transcripts available for summary';
-      console.log(error_msg);
-      setSummaryStatus('idle');
-      toast.error(error_msg);
-      return false;
-    }
-
-    console.log(`✅ Proceeding with ${allTranscripts.length} transcripts`);
 
     console.log('🚀 Starting summary generation with config:', {
       provider: modelConfig.provider,
@@ -927,15 +826,13 @@ export function useSummaryGeneration({
       }
     }
 
-    const summaryPayload = buildSummaryTranscriptPayload(allTranscripts);
     if (!isCurrentRequest()) return false;
 
     return processSummary({
-      ...summaryPayload,
       customPrompt,
       requestGeneration,
     });
-  }, [meeting.id, fetchAllTranscripts, buildSummaryTranscriptPayload, processSummary, modelConfig, isModelConfigLoading, selectedTemplate, onOpenModelSettings]);
+  }, [meeting.id, processSummary, modelConfig, isModelConfigLoading, selectedTemplate, onOpenModelSettings]);
 
   // Public API: Regenerate summary from the current saved transcript
   const handleRegenerateSummary = useCallback(async (customPrompt = '') => {
@@ -946,16 +843,6 @@ export function useSummaryGeneration({
       summaryRequestGenerationRef.current === requestGeneration;
     setSummaryStatus('regenerating');
     setSummaryError(null);
-
-    const allTranscripts = await fetchAllTranscripts(meeting.id);
-    if (!isCurrentRequest()) return;
-
-    if (!allTranscripts.length) {
-      console.error('No transcripts available for regeneration');
-      setSummaryStatus('idle');
-      toast.error('No transcripts available for summary regeneration');
-      return;
-    }
 
     if (modelConfig.provider === 'codex-cli') {
       const problem = await codexCliPreflight(modelConfig.codexCliPath);
@@ -1021,12 +908,11 @@ export function useSummaryGeneration({
     }
 
     await processSummary({
-      ...buildSummaryTranscriptPayload(allTranscripts),
       customPrompt,
       isRegeneration: true,
       requestGeneration,
     });
-  }, [meeting.id, fetchAllTranscripts, buildSummaryTranscriptPayload, processSummary, modelConfig, onOpenModelSettings]);
+  }, [meeting.id, processSummary, modelConfig, onOpenModelSettings]);
 
   // Public API: Stop ongoing summary generation
   const handleStopGeneration = useCallback(async () => {

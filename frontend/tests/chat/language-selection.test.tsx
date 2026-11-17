@@ -41,7 +41,7 @@ test('saved Auto uses transcript detection even when new meetings are pinned Eng
   storage.set('summaryLanguageDefault', 'en');
   expect(await resolveAskAiLanguage('meeting', transcript)).toBe('ru');
   expect(receivedTexts).toEqual(transcript);
-  expect(askAiCopy('ru').meeting.suggestions[0]).toBe('Что было решено?');
+  expect(askAiCopy('ru').meeting.suggestions[0]).toBe('Что обсуждали за последние 5 минут?');
 });
 
 test('live pin beats detection; Auto detects the current transcript', async () => {
@@ -92,4 +92,10 @@ test('live view refreshes when the pinned default changes', async () => {
   await act(async () => { await settle(); });
   expect(view!.root.findByType('span').children).toEqual(['en']);
   act(() => view!.unmount());
+});
+
+test('live and saved conversations offer the same four meeting questions', () => {
+  expect(askAiCopy('ru').live.suggestions).toEqual(['Что обсуждали за последние 5 минут?', 'Какие решения были приняты?', 'Какие задачи появились?', 'Какие вопросы остались открытыми?']);
+  expect(askAiCopy('ru').meeting.suggestions).toEqual(askAiCopy('ru').live.suggestions);
+  expect(askAiCopy('en').meeting.suggestions).toEqual(askAiCopy('en').live.suggestions);
 });

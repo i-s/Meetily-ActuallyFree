@@ -149,7 +149,7 @@ impl SummaryProcessesRepository {
         let result = sqlx::query(
             r#"
             UPDATE summary_processes
-            SET status = 'completed', result = ?, updated_at = ?, end_time = ?, chunk_count = ?, processing_time = ?, error = NULL, result_backup = NULL, result_backup_timestamp = NULL, user_edited = 0
+            SET status = 'completed', result = ?, updated_at = ?, end_time = ?, chunk_count = ?, processing_time = ?, error = NULL, input_snapshot = pending_input_snapshot, pending_input_snapshot = NULL, result_backup = NULL, result_backup_timestamp = NULL, user_edited = 0
             WHERE meeting_id = ? AND status = 'PENDING'
             "#
         )
@@ -196,7 +196,8 @@ impl SummaryProcessesRepository {
                 end_time = ?,
                 result = COALESCE(result_backup, result),
                 result_backup = NULL,
-                result_backup_timestamp = NULL
+                result_backup_timestamp = NULL,
+                pending_input_snapshot = NULL
             WHERE meeting_id = ? AND status = 'PENDING'
             "#,
         )
@@ -230,7 +231,8 @@ impl SummaryProcessesRepository {
                 error = 'Generation was cancelled by user',
                 result = COALESCE(result_backup, result),
                 result_backup = NULL,
-                result_backup_timestamp = NULL
+                result_backup_timestamp = NULL,
+                pending_input_snapshot = NULL
             WHERE meeting_id = ? AND status = 'PENDING'
             "#,
         )

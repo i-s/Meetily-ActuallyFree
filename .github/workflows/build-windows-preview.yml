@@ -172,7 +172,7 @@ jobs:
       - name: Test Codex CLI and meeting detection frontend integration
         working-directory: frontend
         run: |
-          $tests = @(Get-ChildItem tests/codex-cli, tests/meeting-detection -Recurse -File | Where-Object { $_.Name -match '\.test\.tsx?$' } | Sort-Object FullName)
+          $tests = @(Get-ChildItem tests/codex-cli, tests/meeting-detection, tests/meeting-workspace -Recurse -File | Where-Object { $_.Name -match '\.test\.tsx?$' } | Sort-Object FullName)
           if ($tests.Count -eq 0) { throw 'No frontend regressions found' }
           foreach ($test in $tests) {
             pnpm dlx bun@1.3.10 test $test.FullName
@@ -194,7 +194,7 @@ jobs:
         run: |
           # Target only synthetic regressions; hosted runners cannot qualify live WASAPI calls.
           # Release also avoids CPAL debug assertions in unrelated Windows audio setup.
-          foreach ($filter in @('codex_cli', 'meeting_detection')) {
+          foreach ($filter in @('codex_cli', 'meeting_detection', 'meeting_chat', 'summary::input_snapshot', 'database::repositories::transcript', 'recording_identity', 'audio::recording_commands::persistence_tests')) {
             cargo test --locked --release -p meetily --lib --target $env:TARGET --no-default-features --features custom-protocol $filter -- --nocapture
             if ($LASTEXITCODE -ne 0) { throw "Native regression failed: $filter" }
           }

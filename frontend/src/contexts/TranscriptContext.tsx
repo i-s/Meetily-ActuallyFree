@@ -3,6 +3,7 @@
 import React, { createContext, useContext, useState, useEffect, useRef, useCallback, ReactNode, MutableRefObject, useMemo } from 'react';
 import { Transcript, TranscriptUpdate, DetectedSpeaker } from '@/types';
 import { toast } from 'sonner';
+import { invoke } from '@tauri-apps/api/core';
 import { useRecordingState } from './RecordingStateContext';
 import { transcriptService } from '@/services/transcriptService';
 import { recordingService } from '@/services/recordingService';
@@ -23,9 +24,9 @@ interface TranscriptContextType {
   markMeetingAsSaved: () => Promise<void>;
   detectedSpeakers: DetectedSpeaker[];
   speakerMap: Record<string, string>;
-  renameSpeaker: (oldName: string, newName: string) => void;
-  reassignSegment: (segmentId: string, newSpeaker: string) => void;
-  mergeSpeakers: (sourceSpeaker: string, targetSpeaker: string) => void;
+  renameSpeaker: (oldName: string, newName: string) => Promise<void>;
+  reassignSegment: (segmentId: string, newSpeaker: string) => Promise<void>;
+  mergeSpeakers: (sourceSpeaker: string, targetSpeaker: string) => Promise<void>;
 }
 
 const TranscriptContext = createContext<TranscriptContextType | undefined>(undefined);
@@ -43,6 +44,13 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
 
   // Recording state context - provides backend-synced state
   const recordingState = useRecordingState();
+
+  useEffect(() => {
+    if (recordingState.meetingId && recordingState.isRecording) {
+      setCurrentMeetingId(recordingState.meetingId);
+      sessionStorage.setItem('indexeddb_current_meeting_id', recordingState.meetingId);
+    }
+  }, [recordingState.meetingId, recordingState.isRecording]);
 
   // Refs for transcript management
   const transcriptsRef = useRef<Transcript[]>(transcripts);
@@ -65,10 +73,10 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
         await indexedDBService.init();
 
         // Listen for recording-started event
-        unlistenRecordingStarted = await recordingService.onRecordingStarted(async () => {
+        unlistenRecordingStarted = await recordingService.onRecordingStarted(async (payload) => {
           try {
-            // Generate unique meeting ID
-            const meetingId = `meeting-${Date.now()}`;
+            const meetingId = payload.meeting_id;
+            if (!meetingId) throw new Error('Native Start did not supply a meeting ID');
             setCurrentMeetingId(meetingId);
 
             // Store in sessionStorage as fallback for markMeetingAsSaved
@@ -118,7 +126,7 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
         // Listen for recording-stopped event
         unlistenRecordingStopped = await recordingService.onRecordingStopped(async (payload) => {
           try {
-            const meetingId = currentMeetingId || sessionStorage.getItem('indexeddb_current_meeting_id');
+            const meetingId = sessionStorage.getItem('indexeddb_current_meeting_id') || currentMeetingId;
             if (meetingId) {
               // Update folder path in IndexedDB
               const metadata = await indexedDBService.getMeetingMetadata(meetingId);
@@ -154,7 +162,6 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
   // Main transcript buffering logic with sequence_id ordering
   useEffect(() => {
     let unlistenFn: (() => void) | undefined;
-    let transcriptCounter = 0;
     let transcriptBuffer = new Map<number, Transcript>();
     transcriptBufferRef.current = transcriptBuffer;
     let lastProcessedSequence = 0;
@@ -282,7 +289,7 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
           const effectiveSpeaker = editedSpeaker(activeSpeakerMeeting(), update.sequence_id, rawSpeaker);
 
           const newTranscript: Transcript = {
-            id: `${Date.now()}-${transcriptCounter++}`,
+            id: `${sessionStorage.getItem('indexeddb_current_meeting_id')}:seg_${update.sequence_id}`,
             text: update.text,
             timestamp: update.timestamp,
             sequence_id: update.sequence_id,
@@ -301,7 +308,7 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
           console.log(`✅ MAIN LISTENER: Buffered transcript with sequence_id ${update.sequence_id}. Buffer size: ${transcriptBuffer.size}, Last processed: ${lastProcessedSequence}`);
 
           // Save to IndexedDB (non-blocking)
-          const meetingId = currentMeetingId || sessionStorage.getItem('indexeddb_current_meeting_id');
+          const meetingId = sessionStorage.getItem('indexeddb_current_meeting_id') || currentMeetingId;
           if (meetingId) {
             indexedDBService.saveTranscript(meetingId, update)
               .catch(err => console.warn('IndexedDB save failed:', err));
@@ -398,7 +405,7 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
     const effectiveSpeaker = editedSpeaker(activeSpeakerMeeting(), update.sequence_id, rawSpeaker);
 
     const newTranscript: Transcript = {
-      id: update.sequence_id ? update.sequence_id.toString() : Date.now().toString(),
+      id: `${sessionStorage.getItem('indexeddb_current_meeting_id')}:seg_${update.sequence_id}`,
       text: update.text,
       timestamp: update.timestamp,
       sequence_id: update.sequence_id || 0,
@@ -466,15 +473,17 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
   }, []);
 
   // Rename speaker across active session
-  const renameSpeaker = useCallback((oldName: string, newName: string) => {
+  const renameSpeaker = useCallback(async (oldName: string, newName: string) => {
     const trimmedOld = oldName.trim();
     const trimmedNew = newName.trim();
     if (!trimmedOld || !trimmedNew || trimmedOld === trimmedNew) return;
     try {
       const id = activeSpeakerMeeting();
       if (!id) throw new Error('No active meeting');
+      await invoke('rename_meeting_speaker', { meetingId: id, from: trimmedOld, to: trimmedNew });
       persistSpeakerRename(id, trimmedOld, trimmedNew);
-    } catch { toast.error('Could not save speaker name. Please retry.'); return; }
+      if (activeSpeakerMeeting() !== id) return;
+    } catch (error) { toast.error('Could not save speaker name. Please retry.'); throw error; }
 
     setSpeakerMap(prev => {
       const next = { ...prev, [trimmedOld]: trimmedNew };
@@ -504,15 +513,18 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
-  const reassignSegment = useCallback((segmentId: string, newSpeaker: string) => {
-    const nextSpeaker = newSpeaker.trim();
+  const reassignSegment = useCallback(async (segmentId: string, newSpeaker: string) => {
+    let nextSpeaker = newSpeaker.trim();
     if (!segmentId) return;
     try {
       const id = activeSpeakerMeeting();
       const turn = transcriptsRef.current.find(t => t.id === segmentId);
       if (!id || turn?.sequence_id === undefined) throw new Error('No active transcript');
+      const result = await invoke<{ speaker: string }>('reassign_transcript_speaker', { meetingId: id, transcriptId: segmentId, to: nextSpeaker });
+      nextSpeaker = result.speaker;
       persistTurnSpeaker(id, turn.sequence_id, nextSpeaker);
-    } catch { toast.error('Could not save speaker assignment. Please retry.'); return; }
+      if (activeSpeakerMeeting() !== id) return;
+    } catch (error) { toast.error('Could not save speaker assignment. Please retry.'); throw error; }
     const speaker = nextSpeaker || undefined;
     transcriptsRef.current = transcriptsRef.current.map((t) =>
       t.id === segmentId ? { ...t, speaker } : t
@@ -525,46 +537,11 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
-  // Merge speakers across active session
-  const mergeSpeakers = useCallback((sourceSpeaker: string, targetSpeaker: string) => {
-    const trimmedSource = sourceSpeaker.trim();
-    const trimmedTarget = targetSpeaker.trim();
-    if (!trimmedSource || !trimmedTarget || trimmedSource === trimmedTarget) return;
-    try {
-      const id = activeSpeakerMeeting();
-      if (!id) throw new Error('No active meeting');
-      persistSpeakerRename(id, trimmedSource, trimmedTarget);
-    } catch { toast.error('Could not save speaker merge. Please retry.'); return; }
-
-    setSpeakerMap(prev => {
-      const next = { ...prev, [trimmedSource]: trimmedTarget };
-      for (const [k, v] of Object.entries(prev)) {
-        if (v === trimmedSource) {
-          next[k] = trimmedTarget;
-        }
-      }
-      speakerMapRef.current = next;
-      return next;
-    });
-
-    transcriptsRef.current = transcriptsRef.current.map(t =>
-      t.speaker?.trim() === trimmedSource ? { ...t, speaker: trimmedTarget } : t
-    );
-
-    setTranscripts(prev =>
-      prev.map(t => (t.speaker?.trim() === trimmedSource ? { ...t, speaker: trimmedTarget } : t))
-    );
-
-    if (transcriptBufferRef.current) {
-      for (const [seqId, t] of transcriptBufferRef.current.entries()) {
-        if (t.speaker?.trim() === trimmedSource) {
-          transcriptBufferRef.current.set(seqId, { ...t, speaker: trimmedTarget });
-        }
-      }
-    }
-
-    toast.success(`Merged "${trimmedSource}" into "${trimmedTarget}"`);
-  }, []);
+  // Merge uses the same serialized native rename as ordinary speaker edits.
+  const mergeSpeakers = useCallback(async (sourceSpeaker: string, targetSpeaker: string) => {
+    await renameSpeaker(sourceSpeaker, targetSpeaker);
+    toast.success(`Merged "${sourceSpeaker}" into "${targetSpeaker}"`);
+  }, [renameSpeaker]);
 
   // Dynamic list of detected speakers in this meeting
   const detectedSpeakers = useMemo<DetectedSpeaker[]>(() => {
@@ -605,7 +582,7 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
 
   // Mark current meeting as saved in IndexedDB
   const markMeetingAsSaved = useCallback(async () => {
-    const meetingId = currentMeetingId || sessionStorage.getItem('indexeddb_current_meeting_id');
+    const meetingId = sessionStorage.getItem('indexeddb_current_meeting_id') || currentMeetingId;
 
     if (!meetingId) {
       console.error('[IndexedDB] ❌ Cannot mark meeting as saved: No meeting ID available!');

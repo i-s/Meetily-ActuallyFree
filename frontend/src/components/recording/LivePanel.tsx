@@ -4,25 +4,23 @@
  * The right-hand panel while recording: who is talking (and naming them),
  * notes typed during the call, and Ask AI about the call so far.
  */
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { invoke } from '@tauri-apps/api/core';
+import { useMemo, useRef } from 'react';
 import { NotebookPen, Sparkles, UserCheck, Users } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Hint } from '@/components/ui/tooltip';
-import { NotesEditor, type NotesContent } from '@/components/editor/NotesEditor';
-import { ChatThread } from '@/components/chat/ChatThread';
+import { MeetingNotesEditor } from '@/components/meeting/MeetingNotesEditor';
+import { useRecordingState } from '@/contexts/RecordingStateContext';
+import { LiveMeetingSummary, useLiveMeetingSummary } from './LiveMeetingSummary';
+import { MeetingChat } from '@/components/chat/MeetingChat';
 import { useAskAiLanguage } from '@/hooks/useAskAiLanguage';
 import { askAiCopy } from '@/lib/ask-ai-language';
 import { useUserName } from '@/hooks/useUserName';
 import { displaySpeaker, isUserSpeaker, speakerDot, speakerKey } from '@/utils/speakerUtils';
-import { buildLiveContext, lineAt, type LiveLine } from '@/lib/live-context';
-import { readLiveNotes, writeLiveNotes } from '@/lib/live-session';
+import { lineAt, type LiveLine } from '@/lib/live-context';
 import type { DetectedSpeaker } from '@/types';
 
-export type LivePanelTab = 'speakers' | 'notes' | 'ask';
-
-const NOTES_SAVE_DELAY = 400;
+export type LivePanelTab = 'speakers' | 'notes' | 'summary' | 'ask';
 
 function SpeakersTab({
   speakers,
@@ -113,42 +111,11 @@ function SpeakersTab({
   );
 }
 
-function NotesTab() {
-  // Read once: the editor owns the content after that.
-  const [initial] = useState(() => readLiveNotes());
-  const timer = useRef<number | null>(null);
-  const latest = useRef<NotesContent | null>(null);
-
-  const flush = useCallback(() => {
-    if (timer.current !== null) window.clearTimeout(timer.current);
-    timer.current = null;
-    if (latest.current) writeLiveNotes({ markdown: latest.current.markdown, json: latest.current.json });
-  }, []);
-
-  useEffect(() => flush, [flush]);
-
-  return (
-    <div className="h-full overflow-y-auto px-5 py-4 pl-11">
-      <NotesEditor
-        initialBlocks={initial?.json ?? null}
-        initialMarkdown={initial?.json ? null : initial?.markdown ?? null}
-        placeholder="Type notes as the call goes. They are saved to this meeting when you stop."
-        onChange={(content) => {
-          latest.current = content;
-          if (timer.current !== null) window.clearTimeout(timer.current);
-          timer.current = window.setTimeout(flush, NOTES_SAVE_DELAY);
-        }}
-      />
-    </div>
-  );
-}
-
 export function LivePanel({
   tab,
   onTabChange,
   speakers,
   lines,
-  sessionKey,
   onIdentify,
   onMarkMe,
   onJumpTo,
@@ -157,59 +124,30 @@ export function LivePanel({
   onTabChange: (tab: LivePanelTab) => void;
   speakers: DetectedSpeaker[];
   lines: LiveLine[];
-  /** Changes per recording, so each call gets its own Ask AI thread. */
+  /** Existing view identity; durable notes/chat use RecordingState.meetingId. */
   sessionKey: string;
   onIdentify: (speaker: string) => void;
   onMarkMe: (speaker: string) => void;
   /** A cited moment was clicked. */
   onJumpTo: (lineId: string) => void;
 }) {
-  const userName = useUserName();
-  const { language, ready } = useAskAiLanguage(undefined, lines);
+  const { meetingId } = useRecordingState();
+  const summary = useLiveMeetingSummary(meetingId);
+  const { language, ready } = useAskAiLanguage(meetingId ?? undefined, lines);
   const copy = askAiCopy(language);
   const linesRef = useRef(lines);
   linesRef.current = lines;
 
-  const ask = useCallback(
-    async (question: string, history: Array<{ question: string; answer: string }>) => {
-      const context = buildLiveContext(linesRef.current, question, 12_000, (speaker) =>
-        isUserSpeaker(speaker) ? `${userName || 'The user'} (the user)` : speaker,
-      );
-      const notes = readLiveNotes()?.markdown.trim();
-      const guidance = [
-        'When you rely on something said in the call, cite its timestamp in square brackets, like [12:34].',
-        notes ? `The user's own notes from this call:\n${notes.slice(0, 3_000)}` : '',
-        history.length
-          ? `Earlier in this conversation:\n${history
-              .slice(-4)
-              .map((turn) => `Q: ${turn.question}\nA: ${turn.answer.slice(0, 800)}`)
-              .join('\n\n')}`
-          : '',
-      ]
-        .filter(Boolean)
-        .join('\n\n');
-      if (!context.trim()) throw new Error(copy.noTranscript);
-      return invoke<string>('ask_live_assistant', { question, transcriptContext: context, persona: guidance, answerLanguage: language });
-    },
-    [userName, language, copy],
-  );
-
   return (
     <Tabs value={tab} onValueChange={(value) => onTabChange(value as LivePanelTab)} className="flex h-full min-h-0 flex-col">
       <div className="shrink-0 border-b border-af-border px-3 py-2.5">
-        <TabsList className="grid w-full grid-cols-3">
+        <TabsList className="flex w-full [&>button]:min-w-0 [&>button]:flex-auto [&>button]:px-1 [&>button]:text-xs [&_svg]:hidden">
+          <TabsTrigger value="notes"><NotebookPen />Meeting notes</TabsTrigger>
+          <TabsTrigger value="summary" disabled={!summary.markdown} title={summary.markdown ? undefined : "Available after summary generation"}><Sparkles />Summary</TabsTrigger>
+          <TabsTrigger value="ask"><Sparkles />{copy.tab}</TabsTrigger>
           <TabsTrigger value="speakers">
-            <Users />
-            Speakers
+            <Users />Speakers
             {speakers.length > 0 && <span className="text-[11px] tabular-nums text-af-text-4">{speakers.length}</span>}
-          </TabsTrigger>
-          <TabsTrigger value="notes">
-            <NotebookPen />
-            Notes
-          </TabsTrigger>
-          <TabsTrigger value="ask">
-            <Sparkles />
-            {copy.tab}
           </TabsTrigger>
         </TabsList>
       </div>
@@ -218,21 +156,17 @@ export function LivePanel({
         <SpeakersTab speakers={speakers} onIdentify={onIdentify} onMarkMe={onMarkMe} />
       </TabsContent>
       <TabsContent value="notes" forceMount className="mt-0 min-h-0 flex-1 data-[state=inactive]:hidden">
-        <NotesTab key={sessionKey} />
+        {meetingId ? <MeetingNotesEditor key={meetingId} meetingId={meetingId} /> : <p className="p-4 text-xs text-af-text-3">Preparing Meeting notes…</p>}
+      </TabsContent>
+      <TabsContent value="summary" className="mt-0 min-h-0 flex-1 data-[state=inactive]:hidden">
+        <LiveMeetingSummary {...summary} />
       </TabsContent>
       <TabsContent value="ask" className="mt-0 min-h-0 flex-1 data-[state=inactive]:hidden">
-        <ChatThread
-          historyKey={`live:${sessionKey}`}
-          ask={ask}
-          compact
-          language={language}
-          disabled={!ready}
-          {...copy.live}
+        {meetingId && <MeetingChat meetingId={meetingId} compact language={language} disabled={!ready}
           onSeek={(seconds) => {
             const target = lineAt(linesRef.current, seconds);
             if (target) onJumpTo(target.id);
-          }}
-        />
+          }} /> }
       </TabsContent>
     </Tabs>
   );

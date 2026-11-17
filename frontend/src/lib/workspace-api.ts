@@ -280,3 +280,38 @@ export function onWorkspaceChange(
   window.addEventListener(CHANGE_EVENT, listener);
   return () => window.removeEventListener(CHANGE_EVENT, listener);
 }
+
+// ---- Persistent meeting conversation (shared by live and saved views) ----------
+export interface AskAiContextSettings { mode: 'recent' | 'all'; maxChars: number; }
+export interface AskAiContextRange {
+  settings: AskAiContextSettings;
+  totalChars: number;
+  includedChars: number;
+  startChar: number;
+  endChar: number;
+  startTime: number | null;
+  endTime: number | null;
+  startTranscriptId: string | null;
+  endTranscriptId: string | null;
+  startOffsetChars: number;
+  truncated: boolean;
+  historyTurnsIncluded: number;
+  historyTurnsTotal: number;
+}
+export interface MeetingChatTurn {
+  id: string;
+  meetingId: string;
+  question: string;
+  answer: string | null;
+  status: 'pending' | 'completed' | 'error' | 'interrupted';
+  error: string | null;
+  createdAt: string;
+  completedAt: string | null;
+  context: AskAiContextRange;
+}
+export const getMeetingChat = (meetingId: string) => invoke<MeetingChatTurn[]>('get_meeting_chat', { meetingId });
+export const sendMeetingChat = (meetingId: string, question: string, answerLanguage?: string) =>
+  invoke<MeetingChatTurn>('send_meeting_chat', { meetingId, question, answerLanguage });
+export const getMeetingChatContext = (meetingId: string) => invoke<AskAiContextRange>('get_meeting_chat_context', { meetingId });
+export interface SummaryInputSnapshot { capturedAt: string; notesMarkdown: string | null; notesJson: string | null; }
+export const getSummaryInputSnapshot = (meetingId: string) => invoke<SummaryInputSnapshot | null>('api_get_summary_input_snapshot', { meetingId });
