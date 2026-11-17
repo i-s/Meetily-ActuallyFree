@@ -85,19 +85,46 @@ cargo test --locked -p meetily --lib --target aarch64-apple-darwin audio::pipeli
 
 These commands are pending, not claimed passes. Frontend behavior was not changed.
 
-## Build handoff: repin required after review
+## Build handoff: local workflow candidate, remote import blocked
 
-The artifact workflow still hard-pins source `589f538...` and tree `ea192e5...`.
-**A branch push alone will not build this correction.** After the parent's Sol
-review, publish/import the accepted source through the authorized route, verify
-its exact tree, and update SOURCE_SHA, SOURCE_TREE and ORIGINAL_LOCAL_SHA with
-truthful provenance. If import changes commit metadata, record actual checkout
-and original local SHA separately. Add/run the native test filters above in the
-artifact job against that new source before packaging. Keep workflow SHA and
-source SHA distinct. Do not reuse the previous DMG/hash as fixed evidence.
+The approved original local source is `91bd839947b60f339b8f835a1a22ba10fd17f37c`,
+with tree `8a75052991eaebdaa82f6ccf69f64cbcdffec9ab`. The local workflow candidate
+uses that source metadata, but **it is not yet a remotely available checkout**.
+On 2026-11-17 the remote task branch and PR #21 remained at
+`d9d186c1b2141b53b252c6690552c28d68ac45ba`; a source-only push failed because
+Git could not read GitHub credentials. The GitHub App object-import tools were
+not exposed in this implementation context. No source upload is claimed.
 
-No push, workflow dispatch, release, merge, installation or Mac data operation
-is part of this local correction. Issue #5 remains blocked; #6/#7 do not start.
+Before any workflow upload, use the supported App import path, recheck the
+remote head without overwriting concurrent updates, verify its imported tree
+against the approved tree, and replace SOURCE_SHA with the actual remote commit.
+Keep ORIGINAL_LOCAL_SHA at the approved local commit even if import metadata
+changes its SHA. Record workflow SHA and source SHA separately. Do not reuse the
+previous DMG/hash as fixed evidence.
+
+The local workflow installs locked frontend dependencies, builds frontend assets,
+builds/copies the ARM64 Metal llama-helper sidecar, then runs the three native
+filters above. The app build script supplies FFmpeg during Cargo's build phase.
+Only after those tests pass does the existing sidecar/DMG packaging script run;
+it may repeat cached frontend/helper builds. Tests use synthetic in-process
+fixtures, not models or real capture. All native execution remains pending in
+Actions. Failure artifacts now retain test/build logs as well as text diagnostics.
+
+This workflow change must receive parent Sol review before it is pushed or a new
+native run starts. No release, merge, installation or Mac data operation is
+permitted. Issue #5 remains blocked; #6/#7 do not start.
+
+Local preparation checks (2026-11-17): actionlint passed; all six multiline shell
+blocks passed `bash -n`; `git diff --check` and approved source/tree assertion
+passed. Using the isolated Rust 1.97.1 toolchain, the portable suite passed
+20/20 and the buffer suite passed 7/7 plus non-test compilation. Initial attempts
+without that toolchain on PATH failed because Cargo was unavailable; these were
+rerun successfully, not counted as passes. Native macOS filters, packaging,
+remote tree verification, and post-upload path-filter behavior remain untested.
+PR #21 was open/unmerged with `auto_merge: null`; public rulesets returned `[]`,
+while branch protection details required authentication. No merge-queue workflow
+trigger or automatic merge command was found in the checked-in workflows.
+
 
 ## Physical regression protocol (owner-executed, not yet performed)
 

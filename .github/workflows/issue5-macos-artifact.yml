@@ -16,9 +16,11 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  SOURCE_SHA: 589f538793cf1c648cfce2e79807a23b7793c466
-  SOURCE_TREE: ea192e5a5c6928f8b25890b57d21263c90e3fe6b
-  ORIGINAL_LOCAL_SHA: bd782bfedabb2f1d5b8057cb89baa3ded1656b93
+  # Candidate source metadata; update SOURCE_SHA after the authorized remote import
+  # and keep ORIGINAL_LOCAL_SHA equal to the local approved commit below.
+  SOURCE_SHA: aa97cdf06c5c99c16f43994f3af104e007911a25
+  SOURCE_TREE: 8a75052991eaebdaa82f6ccf69f64cbcdffec9ab
+  ORIGINAL_LOCAL_SHA: 91bd839947b60f339b8f835a1a22ba10fd17f37c
   MACOSX_DEPLOYMENT_TARGET: '14.2'
   PNPM_CONFIG_ENABLE_GLOBAL_VIRTUAL_STORE: 'false'
   NEXT_TELEMETRY_DISABLED: '1'
@@ -83,6 +85,36 @@ jobs:
       - name: Install locked frontend dependencies
         working-directory: frontend
         run: pnpm install --frozen-lockfile
+      - name: Prepare frontend assets and native test sidecar
+        run: |
+          set -euo pipefail
+          OPENSSL_PREFIX=$(brew --prefix openssl@3)
+          {
+            echo "OPENSSL_DIR=$OPENSSL_PREFIX"
+            echo "OPENSSL_ROOT_DIR=$OPENSSL_PREFIX"
+            echo "CMAKE_PREFIX_PATH=$OPENSSL_PREFIX"
+            echo "PKG_CONFIG_PATH=$OPENSSL_PREFIX/lib/pkgconfig"
+          } >> "$GITHUB_ENV"
+          export OPENSSL_DIR="$OPENSSL_PREFIX"
+          export OPENSSL_ROOT_DIR="$OPENSSL_PREFIX"
+          export CMAKE_PREFIX_PATH="$OPENSSL_PREFIX"
+          export PKG_CONFIG_PATH="$OPENSSL_PREFIX/lib/pkgconfig"
+          (cd frontend && pnpm build)
+          cargo build --locked --release --package llama-helper --target "$TARGET" --features metal
+          mkdir -p frontend/src-tauri/binaries
+          cp "target/$TARGET/release/llama-helper" "frontend/src-tauri/binaries/llama-helper-$TARGET"
+          chmod +x "frontend/src-tauri/binaries/llama-helper-$TARGET"
+      - name: Run native audio regression tests
+        run: |
+          set -euo pipefail
+          {
+            echo '== audio::stream =='
+            cargo test --locked -p meetily --lib --target "$TARGET" audio::stream
+            echo '== core_audio =='
+            cargo test --locked -p meetily --lib --target "$TARGET" core_audio
+            echo '== audio::pipeline =='
+            cargo test --locked -p meetily --lib --target "$TARGET" audio::pipeline
+          } 2>&1 | tee dist/native-audio-tests.log
       - name: Build pinned source with sidecars
         run: |
           set -euo pipefail
@@ -150,6 +182,8 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: issue5-failure-${{ github.run_id }}-${{ github.run_attempt }}
-          path: dist/*.txt
+          path: |
+            dist/*.txt
+            dist/*.log
           if-no-files-found: ignore
           retention-days: 7
