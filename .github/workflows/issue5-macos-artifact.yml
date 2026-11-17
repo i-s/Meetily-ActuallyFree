@@ -1,11 +1,10 @@
 name: Issue 5 - pinned macOS artifact only
 
-# Contents-API update starts the first push run after branch creation.
-# A branch push is deliberate: a new workflow cannot be dispatched until it
-# exists on the default branch. This avoids changing main or the release flow.
+# PR-scoped artifact build; never uses pull_request_target or release credentials.
 on:
-  push:
-    branches: [meetily/issue-5-actions-build]
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
     paths: [.github/workflows/issue5-macos-artifact.yml]
 
 permissions:
@@ -23,10 +22,15 @@ env:
   PNPM_CONFIG_ENABLE_GLOBAL_VIRTUAL_STORE: 'false'
   NEXT_TELEMETRY_DISABLED: '1'
   TARGET: aarch64-apple-darwin
+  WORKFLOW_SHA: ${{ github.workflow_sha }}
+  WORKFLOW_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
 
 jobs:
   artifact:
-    if: github.repository == 'i-s/Meetily-ActuallyFree' && github.ref == 'refs/heads/meetily/issue-5-actions-build'
+    if: >-
+      github.repository == 'i-s/Meetily-ActuallyFree' &&
+      github.head_ref == 'meetily/issue-5-actions-build' &&
+      github.event.pull_request.head.repo.full_name == 'i-s/Meetily-ActuallyFree'
     runs-on: macos-15
     timeout-minutes: 90
     # No release environment, signing secrets, write token, tags, or publisher.
@@ -123,12 +127,13 @@ jobs:
           VERSION=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Contents/Info.plist")
           DMG_SHA=$(shasum -a 256 dist/Meetily-issue5-aarch64.dmg | awk '{print $1}')
           jq -n --arg source_sha "$(git rev-parse HEAD)" --arg source_tree "$(git rev-parse HEAD^{tree})" \
-            --arg original_local_sha "$ORIGINAL_LOCAL_SHA" --arg workflow_sha "$GITHUB_SHA" \
+            --arg original_local_sha "$ORIGINAL_LOCAL_SHA" --arg workflow_sha "$WORKFLOW_SHA" \
+            --arg workflow_head_sha "$WORKFLOW_HEAD_SHA" --arg event_sha "$GITHUB_SHA" \
             --arg run_id "$GITHUB_RUN_ID" --arg run_attempt "$GITHUB_RUN_ATTEMPT" \
             --arg run_url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
             --arg version "$VERSION" --arg dmg_sha256 "$DMG_SHA" \
             '{source_sha:$source_sha,source_tree:$source_tree,original_local_sha:$original_local_sha,
-              workflow_sha:$workflow_sha,run_id:$run_id,run_attempt:$run_attempt,run_url:$run_url,
+              workflow_sha:$workflow_sha,workflow_head_sha:$workflow_head_sha,event_sha:$event_sha,run_id:$run_id,run_attempt:$run_attempt,run_url:$run_url,
               version:$version,dmg_sha256:$dmg_sha256,notarized:false,physical_test_attested:false}' \
             > dist/issue5-provenance.json
           cat dist/issue5-provenance.json >> "$GITHUB_STEP_SUMMARY"

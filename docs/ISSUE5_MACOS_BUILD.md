@@ -15,7 +15,9 @@ imported the exact source tree as commit
 `ea192e5a5c6928f8b25890b57d21263c90e3fe6b`. Commit metadata differs, files do not.
 The workflow checks out **589f538...**, and records it as `source_sha`; it never
 claims to have checked out bd782bf. `original_local_sha` records that origin.
-The workflow revision is a separate `workflow_sha`, obtained from `GITHUB_SHA`.
+The workflow revision is a separate `workflow_sha` (`github.workflow_sha`);
+`workflow_head_sha` records the task branch head, and `event_sha` records the PR
+merge-ref SHA from `GITHUB_SHA`. These may differ; none is the app checkout SHA.
 
 `.github/workflows/issue5-macos-artifact.yml` builds only this pinned source on
 hosted Apple Silicon `macos-15`, using Rust 1.97.1, Node 24 and pnpm 11.9.0.
@@ -25,14 +27,19 @@ artifact. Build inputs record exact SDK, OS, tool versions, lockfile and bundled
 model hashes. It checks sidecar startup and synthetic FFmpeg encode/decode;
 it does not claim a physical microphone test, ASR quality, or installed-app test.
 
-The new workflow is triggered only by a push changing its own file on
-`meetily/issue-5-actions-build`, with an additional repository/ref job guard.
-This permits a new workflow to run without adding it to main to enable manual
-dispatch. It has contents-read permissions, no release environment, signing
-secrets, release/tag writes, reusable publisher or deployment. The existing
-main-only `build-macos.yml` / `macos-release` protection is unchanged. Before
-each branch update recheck live workflow triggers and any PR auto-merge/queue.
-There were no workflow_run triggers in the audited default/source workflows.
+The artifact workflow runs on opened/synchronized/reopened pull requests to
+main that change its file, guarded to the exact same-repository head branch
+`meetily/issue-5-actions-build`. It uses `pull_request`, never
+`pull_request_target`. A previous push-only attempt produced no Actions run
+through the available app/API route; manual dispatch was 404 because the new
+workflow is absent on main. The PR route leaves main/release flow untouched.
+The job checks out the fixed reviewed source, not PR application code.
+It has contents-read permissions, no release environment, signing secrets,
+release/tag writes, reusable publisher or deployment. Existing main-only
+`build-macos.yml` / `macos-release` protection is unchanged. Before each branch
+update recheck live workflow triggers and PR auto-merge/queue. No workflow_run
+triggers were present in the audited default/source workflows. Leave the PR
+open and unmerged; the coordinator owns waiting for its checks.
 
 Download `issue5-macos-<run-id>-<attempt>` from the successful run, not from
 GitHub Releases. It contains `Meetily-issue5-aarch64.dmg`, `SHA256SUMS.txt`,
