@@ -175,8 +175,9 @@ changing the signed executable payloads.
 
 ## 6. Tests, qualification, and historical notes
 
-Issue #5 local Apple Silicon build prerequisites, sidecar ordering, locked
-dependencies, model provenance and physical mic/system/restart qualification
+Issue #5 artifact-only Actions build (pinned source/tree vs workflow SHA),
+sidecar ordering, locked dependencies, model provenance, same-account backup/
+rollback proposal and physical mic/system/restart qualification
 are documented in [ISSUE5_MACOS_BUILD.md](ISSUE5_MACOS_BUILD.md). The portable
 `tests/test_macos_build.py` checks script orchestration only; neither target Mac
 has been qualified by those tests.

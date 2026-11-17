@@ -2,89 +2,150 @@
 
 Issue: https://github.com/i-s/Meetily-ActuallyFree/issues/5
 
-Status: **prepared locally; blocked on physical Mac build/install/recording**.
-No DMG was built or installed in this work. No release was published. Neither
-M4 Pro / 48 GB nor M1 Pro / 32 GB has been tested. Linux checks below establish
-script orchestration only, never macOS capture or ASR quality.
+Status: **Actions artifact preparation; physical installation/capture gate blocked**.
+No release is authorized. No agent may install or change data on the user's Mac.
 
-## Source and build preparation
+## Source and Actions build
 
-The inspected starting source and merge-base with `origin/main` are both
-`e091a7a99b0681553b8ef6bb6a8e4b3948f8a940`. This identifies source, **not an
-installed DMG**. Build the final issue-5 commit (record `git rev-parse HEAD`),
-which includes the local-script fix; keep the starting SHA separately. Do not
-substitute a published preview based on matching version strings.
+Starting base: `e091a7a99b0681553b8ef6bb6a8e4b3948f8a940`.
+Reviewed local source: `bd782bfedabb2f1d5b8057cb89baa3ded1656b93`.
+Git push with the runtime CLI credential returned 403. The supported GitHub App
+imported the exact source tree as commit
+`589f538793cf1c648cfce2e79807a23b7793c466`; both commits have tree
+`ea192e5a5c6928f8b25890b57d21263c90e3fe6b`. Commit metadata differs, files do not.
+The workflow checks out **589f538...**, and records it as `source_sha`; it never
+claims to have checked out bd782bf. `original_local_sha` records that origin.
+The workflow revision is a separate `workflow_sha`, obtained from `GITHUB_SHA`.
 
-Use a disposable macOS account for qualification: this app shares its data
-roots and bundle identifier with existing installs. Do not replace a working
-installation or open its live database for this test. The owner performs the
-installation below; full-stop does not authorize the agent to install it.
+`.github/workflows/issue5-macos-artifact.yml` builds only this pinned source on
+hosted Apple Silicon `macos-15`, using Rust 1.97.1, Node 24 and pnpm 11.9.0.
+It installs OpenSSL 3, invokes the locked source build script (Metal sidecar
+first, Tauri/Next/FFmpeg second), verifies the DMG and uploads an Actions
+artifact. Build inputs record exact SDK, OS, tool versions, lockfile and bundled
+model hashes. It checks sidecar startup and synthetic FFmpeg encode/decode;
+it does not claim a physical microphone test, ASR quality, or installed-app test.
 
-On a physical Apple Silicon Mac, macOS 14.2 or newer, native ARM64 Terminal:
+The new workflow is triggered only by a push changing its own file on
+`meetily/issue-5-actions-build`, with an additional repository/ref job guard.
+This permits a new workflow to run without adding it to main to enable manual
+dispatch. It has contents-read permissions, no release environment, signing
+secrets, release/tag writes, reusable publisher or deployment. The existing
+main-only `build-macos.yml` / `macos-release` protection is unchanged. Before
+each branch update recheck live workflow triggers and any PR auto-merge/queue.
+There were no workflow_run triggers in the audited default/source workflows.
 
-1. Install Xcode Command Line Tools (`xcode-select --install`), Homebrew, native
-   Rust/rustup, Node 24, and pnpm 11.9.0. The current candidate workflow uses
-   Rust 1.97.1; use that toolchain for this reproduction. Record exact patch
-   versions and SDK, rather than assuming the workflow proves a local build.
-2. `brew install cmake pkg-config openssl@3`. Builds/downloads require network
-   access; allow disk space for dependencies, Rust output, DMG, ASR weights and
-   recordings. Neither 32 GB nor 48 GB RAM alone proves runtime performance.
-3. Clone into a new folder. Fetch the task commit from the coordinator's branch
-   or import its local Git bundle; check it out detached. No checkout/reset of
-   the planning workspace is needed. Check `git status --short` is empty.
-4. From that checkout, run the following. Use `set -o pipefail` so a failed build
-   cannot be hidden by `tee`. Keep evidence outside Git and private recordings
-   out of PRs/issues.
+Download `issue5-macos-<run-id>-<attempt>` from the successful run, not from
+GitHub Releases. It contains `Meetily-issue5-aarch64.dmg`, `SHA256SUMS.txt`,
+`issue5-provenance.json`, `build-inputs.txt`, binary inspection and build logs.
+Record the actual run URL/ID, workflow SHA, source SHA/tree, artifact id/digest
+and the locally recomputed DMG hash. Check metadata and `shasum -a 256 -c
+SHA256SUMS.txt` agree before mounting. Artifact retention is 14 days; preserve
+the downloaded artifact locally. A failed run's diagnostics are not a DMG.
 
-```bash
-set -euo pipefail
-rustup toolchain install 1.97.1 --profile minimal
-rustup override set 1.97.1
-export MACOSX_DEPLOYMENT_TARGET=14.2
-export PNPM_CONFIG_ENABLE_GLOBAL_VIRTUAL_STORE=false
-EVIDENCE_DIR="$(mktemp -d "$HOME/meetily-issue5.XXXXXX")"
-{
-  git rev-parse HEAD
-  git status --short
-  sw_vers
-  uname -m
-  system_profiler SPHardwareDataType | sed '/Serial Number/d; /Hardware UUID/d; /Provisioning UDID/d'
-  xcode-select -p
-  xcodebuild -version || xcrun --version
-  xcrun --show-sdk-version
-  rustc -Vv
-  cargo -V
-  node -v
-  pnpm -v
-  brew list --versions cmake pkg-config openssl@3
-  shasum -a 256 Cargo.lock frontend/pnpm-lock.yaml
-} > "$EVIDENCE_DIR/environment.txt" 2>&1
-(cd frontend && pnpm install --frozen-lockfile)
-python3 -m unittest discover -s tests -p 'test_macos_build.py' -v
-(cd frontend && pnpm dlx bun@1.3.10 scripts/test-isolated.mjs)
-(cd frontend && pnpm exec tsc --noEmit)
-bash frontend/scripts/build-macos-apple-silicon.sh 2>&1 | tee "$EVIDENCE_DIR/build.log"
-(cd frontend && pnpm exec tsc --noEmit)
-printf 'Evidence: %s\n' "$EVIDENCE_DIR"
-```
+## User-reported physical preparation (not agent observation)
 
-The script rejects Linux/Intel/Rosetta, configures OpenSSL 3 for the Metal
-`llama-helper`, builds/stages that sidecar first, then invokes Tauri with locked
-Cargo dependencies. Tauri runs the Next build and merges `tauri.macos.conf.json`
-(minimum OS 14.2, DMG, templates and diarization resources). `build/ffmpeg.rs`
-downloads/caches FFmpeg for the target. Both `llama-helper` and FFmpeg must be in
-the final bundle. Do not run native builds/tests embedding `frontend/out`
-concurrently with Next builds, or standalone typecheck during a Next build.
+The owner reports a clean checkout of bd782bf on MacBook Pro M4 Pro / 48 GB,
+macOS 26.2 (25C56): bundle hash matched, `git bundle verify` passed, 3 Python
+checks / 26 isolated frontend files / TypeScript / Next build passed. Native
+compilation stopped at cidre because full Xcode was unavailable. No DMG was
+produced, installed app/data were unchanged, and permissions/capture/restart
+were not checked. M1 Pro / 32 GB remains untested. **Do not fix Xcode or
+continue local native compilation; Actions is the build route now.**
 
-This is a repeatable procedure, not a claim of bit-for-bit reproducible DMGs:
-SDK/Homebrew versions, timestamps/signatures, cached/downloaded FFmpeg and
-runtime model downloads are additional inputs. Record their hashes. No version
-bump or publication is needed for a development rebuild.
+This is a repeatable build procedure, not a claim of bit-identical DMGs:
+SDK/Homebrew versions, signatures/timestamps and downloaded/cached FFmpeg are
+additional inputs. No application version bump, release or local native build
+is needed for this task.
+
+## Proposed same-account test boundary — owner decision required
+
+No new macOS account, bundle identifier, application data path or migration
+change is proposed. Merely renaming/copying the app or setting HOME does not
+isolate it. First download/hash/mount/inspect the DMG without launching Meetily.
+That phase leaves application data unopened. Installation, permissions and all
+steps touching existing data below wait for the owner's decision.
+
+Source evidence for shared state:
+
+- `frontend/src-tauri/src/paths.rs:install_data_root` always resolves macOS
+  storage to `~/Library/Application Support/Meetily`: SQLite (including WAL/SHM),
+  models, settings, crash/session records and other app-managed files share it.
+- `paths.rs:migrate_legacy_data` runs at startup (`lib.rs`) and copies known
+  legacy data from Tauri's `app_data_dir`, identified by `com.meetily.ai`, when
+  absent in the main root. Moving only one of these roots is insufficient.
+- `audio/recording_preferences.rs` loads `recording_preferences.json` via Tauri
+  Store and supports a custom `save_folder`; the default is
+  `~/Movies/meetily-recordings`. Record both actual and default roots before
+  proceeding. A new recording directory does not isolate database/settings.
+- `database/manager.rs` opens the shared database and applies migrations during
+  startup, before a user can choose a test folder. A separate .app path cannot
+  protect an existing database from those writes.
+- `lib.rs` registers a single-instance plugin and requests notification consent
+  during setup. All existing Meetily instances/helpers must be stopped; use the
+  explicit candidate executable path rather than `open -a` which may resolve
+  the working app. Never run both versions concurrently.
+- Frontend IndexedDB (`services/indexedDBService.ts`, startup recovery hooks)
+  and localStorage (`ConfigContext.tsx`, transcript edits/theme/preferences)
+  are persistent WebKit state. Source sets no custom WebView data directory.
+  Identifier-scoped WebKit/cache/preferences locations must be inventoried on
+  the actual Mac before launch; do not assume the two data roots are exhaustive.
+- No direct Keychain/keyring calls were found in the app Rust source/dependency
+  declarations. This does not establish absence of framework/plugin/OS state.
+  TCC microphone/audio/notification grants are OS-managed and may be reused or
+  changed for the same identifier/ad-hoc signature. File backups do not undo
+  them. Keychain, TCC and LaunchServices are not isolated by a different folder.
+
+Proposed reversible maintenance window, **not yet authorized to execute**:
+
+1. Keep the working .app untouched at its current location, record its version
+   and executable hash, and stop Meetily and its sidecars. Check for open DB/
+   recording handles before copying. Do not kill unrelated audio applications.
+2. Read-only inventory the two Application Support roots, actual/default audio
+   roots, symlink targets, and identifier-scoped state in `~/Library/WebKit`,
+   `~/Library/Caches`, `~/Library/Preferences`, `~/Library/HTTPStorages` and
+   `~/Library/Saved Application State`. These are inventory candidates, not
+   proven exact WebKit paths; report actual paths and stop if ownership is unclear.
+3. With the app closed, take a dated local backup on encrypted storage of the
+   entire two data roots (not only SQLite), all recordings/custom roots and the
+   identified WebKit/preferences state, preserving ACLs/xattrs/resource forks
+   (for example `ditto --rsrc --extattr --acl`). Include DB WAL/SHM if present.
+   Hash source/backup files, inspect the copied DB read-only with `PRAGMA
+   quick_check`, and verify restore space. Keep an owner-managed Time Machine/
+   APFS backup as a broader recovery option; its existence/restore capability
+   has not been verified here. Do not regard copying the .app as a data backup.
+4. After approval and verified backups, hold originals of both Application
+   Support roots and identified app-owned WebKit state aside on the same volume,
+   preserving a path manifest and original absence/presence. Do not delete or
+   merge them. macOS preferences/WebKit may have caching/background processes:
+   confirm state is quiescent, otherwise stop. This is a rollback scheme for
+   known files, not proven full OS isolation. Do not restore or reset TCC or
+   Keychain databases programmatically.
+5. Copy the candidate to a dedicated directory such as
+   `~/Applications/Meetily-Issue5/Meetily - Actually Free.app` without replacing
+   the working app. User launches that exact copy and handles Gatekeeper/TCC.
+   Configure a dedicated empty test recordings folder before recording; keep
+   summary/Q&A, cloud providers and auto-call recording off. Use only test data.
+6. After recording/restart checks, quit candidate/helpers, preserve its test
+   roots/results separately, then restore held originals to their **empty**
+   original locations, including verified WebKit state; never overlay candidate
+   migrations/settings onto old data. Restore initially absent paths to absence
+   only after identifying them as newly generated test state. Reopen the original
+   executable and verify its history, audio paths and settings against the
+   pre-test inventory. If rollback fails, stop and use the verified backup.
+
+Residual risk requiring explicit acceptance: TCC grants, notification consent,
+LaunchServices registration, preference caches and possible framework Keychain
+state may persist despite file rollback; the original app could need permission
+regrant. No complete same-account isolation is established. If the owner does
+not accept this bounded rollback/OS-permission risk, stop at read-only DMG
+inspection; do not launch either candidate or a migration on working data.
+The coordinator must obtain that decision and the actual-path inventory before
+installation/data operations. No backup/move/install/TCC operation has run.
 
 ## Inspect the exact DMG before installation
 
-Find the new DMG under `target/aarch64-apple-darwin/release/bundle/dmg/`.
-Set `DMG` to that exact file (do not accidentally select an old candidate):
+Use the exact DMG downloaded from the Actions artifact. Create a local evidence
+folder for inspection logs and set `EVIDENCE_DIR` to it. Set `DMG` to that file:
 
 ```bash
 DMG='/absolute/path/to/the-new-candidate.dmg'
@@ -118,14 +179,12 @@ For full packaging/encode/decode checks see
 [the existing release runbook](../.github/workflows/MACOS_RELEASE.md). Do not
 run its publish steps for issue #5.
 
-In the disposable account, copy the mounted app into that account's
-`~/Applications` (create it if needed), eject the DMG and launch that installed
-copy. Keep the working app in `/Applications` untouched. Ad-hoc signing is not notarization. If
-Gatekeeper blocks it, use Privacy & Security → Open Anyway for this known
-candidate; do not disable Gatekeeper globally. Grant Microphone and Audio
-Capture (wording varies by OS) and retry the meters while audible media plays.
-Record grant/deny/retry behavior and any requested app restart. Do not treat a
-silent system meter as proof of permission while nothing is playing.
+Do not launch or install yet. After the coordinator obtains approval for the
+same-account boundary above, the owner installs only in the agreed candidate
+folder and handles Privacy & Security → Open Anyway (ad-hoc signed, not
+notarized), Microphone and Audio Capture permissions. No global Gatekeeper
+or TCC disable/reset. Record grant/deny/retry and requested restart; play audible
+media during the system-meter probe. Static inspection below is not capture.
 
 ## Models, privacy, and short recording
 
@@ -176,7 +235,7 @@ audio and transcripts remain accessible without recovery/re-recording.
 ```bash
 # Set TAKE to the actual meeting folder; keep these artifacts private/local.
 TAKE='/absolute/path/to/one/test-meeting'
-APP="$HOME/Applications/Meetily - Actually Free.app"
+APP="$HOME/Applications/Meetily-Issue5/Meetily - Actually Free.app"
 for name in audio mic system; do
   test -s "$TAKE/$name.mp4"
   shasum -a 256 "$TAKE/$name.mp4"
@@ -200,7 +259,7 @@ retain recordings locally. Mark every missing check **not tested**, never pass.
 
 | Field | M4 Pro / 48 GB | M1 Pro / 32 GB |
 | --- | --- | --- |
-| Physical date/operator, exact macOS/build | Not tested | Not tested |
+| Physical date/operator, exact macOS/build | User-reported M4 Pro, macOS 26.2 (25C56); no capture | Not tested |
 | Source SHA / dirty state / DMG SHA-256 / app version | Not tested | Not tested |
 | Tool/SDK versions, binary architecture/deployment/dependencies/signature | Not tested | Not tested |
 | Zoom / Discord versions; tested client | Not tested | Not tested |
@@ -209,7 +268,7 @@ retain recordings locally. Mark every missing check **not tested**, never pass.
 | Permission prompts / deny / grant / retry | Not tested | Not tested |
 | Three take ids, durations, track hashes and listening results | Not tested | Not tested |
 | Transcript text/time/source before and after Cmd-Q/relaunch | Not tested | Not tested |
-| Errors and limits (including other Mac) | No physical access | No physical access |
+| Errors and limits (including other Mac) | User reports cidre/Xcode native build stop; Actions requested | Not tested |
 
 Issue acceptance status:
 
@@ -217,7 +276,7 @@ Issue acceptance status:
 - AC2: repeatable preparation/build/install instructions supplied; actual Mac
   execution and installability **pending**.
 - AC3: source-track and restart protocol supplied; recording/persistence **pending**.
-- AC4: neither Mac tested, second-Mac limitation explicit; Linux is not capture
+- AC4: M4 user-reported preparation only, second-Mac limitation explicit; Linux is not capture
   evidence. Gate remains blocked until at least the chosen physical Mac passes
   and the other Mac's untested limits are recorded.
 

@@ -1,0 +1,148 @@
+name: Issue 5 - pinned macOS artifact only
+
+# A branch push is deliberate: a new workflow cannot be dispatched until it
+# exists on the default branch. This avoids changing main or the release flow.
+on:
+  push:
+    branches: [meetily/issue-5-actions-build]
+    paths: [.github/workflows/issue5-macos-artifact.yml]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: issue5-macos-artifact
+  cancel-in-progress: false
+
+env:
+  SOURCE_SHA: 589f538793cf1c648cfce2e79807a23b7793c466
+  SOURCE_TREE: ea192e5a5c6928f8b25890b57d21263c90e3fe6b
+  ORIGINAL_LOCAL_SHA: bd782bfedabb2f1d5b8057cb89baa3ded1656b93
+  MACOSX_DEPLOYMENT_TARGET: '14.2'
+  PNPM_CONFIG_ENABLE_GLOBAL_VIRTUAL_STORE: 'false'
+  NEXT_TELEMETRY_DISABLED: '1'
+  TARGET: aarch64-apple-darwin
+
+jobs:
+  artifact:
+    if: github.repository == 'i-s/Meetily-ActuallyFree' && github.ref == 'refs/heads/meetily/issue-5-actions-build'
+    runs-on: macos-15
+    timeout-minutes: 90
+    # No release environment, signing secrets, write token, tags, or publisher.
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          persist-credentials: false
+      - name: Verify checked-out source
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          test "$(git rev-parse HEAD^{tree})" = "$SOURCE_TREE"
+          test -z "$(git status --porcelain)"
+      - uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa
+        with:
+          version: 11.9.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '24'
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: 1.97.1
+          targets: aarch64-apple-darwin
+      - uses: swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c
+        with:
+          workspaces: '. -> target'
+          key: issue5-artifact-openssl3
+      - name: Prerequisites and build inputs
+        run: |
+          set -euo pipefail
+          brew install cmake pkg-config openssl@3
+          mkdir -p dist
+          {
+            sw_vers
+            uname -m
+            xcodebuild -version
+            xcrun --show-sdk-version
+            rustc -Vv
+            cargo -V
+            node -v
+            pnpm -v
+            brew list --versions cmake pkg-config openssl@3
+            shasum -a 256 Cargo.lock frontend/pnpm-lock.yaml
+            find frontend/src-tauri/resources/diarization -type f -exec shasum -a 256 {} \;
+          } > dist/build-inputs.txt
+      - name: Install locked frontend dependencies
+        working-directory: frontend
+        run: pnpm install --frozen-lockfile
+      - name: Build pinned source with sidecars
+        run: |
+          set -euo pipefail
+          bash frontend/scripts/build-macos-apple-silicon.sh 2>&1 | tee dist/build.log
+      - name: Verify and identify the exact DMG
+        run: |
+          set -euo pipefail
+          # A fresh hosted runner must produce exactly one candidate.
+          find "target/$TARGET/release/bundle/dmg" -maxdepth 1 -name '*.dmg' -type f > dist/dmg-paths.txt
+          test "$(wc -l < dist/dmg-paths.txt | tr -d ' ')" = 1
+          DMG=$(cat dist/dmg-paths.txt)
+          cp "$DMG" dist/Meetily-issue5-aarch64.dmg
+          (cd dist && shasum -a 256 Meetily-issue5-aarch64.dmg > SHA256SUMS.txt)
+          MOUNT="$RUNNER_TEMP/issue5-dmg"
+          mkdir -p "$MOUNT"
+          hdiutil attach "$DMG" -readonly -nobrowse -mountpoint "$MOUNT"
+          trap 'hdiutil detach "$MOUNT" >/dev/null 2>&1 || true' EXIT
+          APP="$MOUNT/Meetily - Actually Free.app"
+          codesign --verify --deep --strict "$APP"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$APP/Contents/Info.plist")" = 14.2
+          for name in meetily llama-helper ffmpeg; do
+            BIN="$APP/Contents/MacOS/$name"
+            test -x "$BIN"
+            file "$BIN" | tee -a dist/binaries.txt | grep -q arm64
+            MINOS=$(xcrun vtool -arch arm64 -show-build "$BIN" | tee -a dist/binaries.txt | awk '$1 == "minos" {print $2; exit}')
+            python3 -c 'import sys; v=tuple(map(int,sys.argv[1].split("."))); assert (v+(0,0,0))[:3] <= (14,2,0), v' "$MINOS"
+            otool -L "$BIN" | tee -a dist/binaries.txt
+            if otool -L "$BIN" | sed '1d' | grep -Eq '/(opt/homebrew|usr/local|Users|private)/'; then
+              echo "Build-host dependency in $name; cannot qualify a standalone DMG."
+              exit 1
+            fi
+            shasum -a 256 "$BIN" >> dist/binaries.txt
+          done
+          "$APP/Contents/MacOS/ffmpeg" -version >> dist/binaries.txt
+          "$APP/Contents/MacOS/ffmpeg" -v error -f lavfi -i 'anullsrc=r=48000:cl=mono' -t 0.25 -c:a aac "$RUNNER_TEMP/probe.m4a"
+          "$APP/Contents/MacOS/ffmpeg" -v error -i "$RUNNER_TEMP/probe.m4a" -f null -
+          printf '%s\n' '{"type":"ping"}' '{"type":"shutdown"}' | "$APP/Contents/MacOS/llama-helper" > dist/llama-smoke.txt
+          grep -q '"type":"pong"' dist/llama-smoke.txt
+          grep -q '"type":"goodbye"' dist/llama-smoke.txt
+          for model in segmentation-3.0-fp16.onnx wespeaker-resnet34-LM.onnx xvec_transform.npz; do
+            test -s "$APP/Contents/Resources/resources/diarization/$model"
+          done
+          VERSION=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Contents/Info.plist")
+          DMG_SHA=$(shasum -a 256 dist/Meetily-issue5-aarch64.dmg | awk '{print $1}')
+          jq -n --arg source_sha "$(git rev-parse HEAD)" --arg source_tree "$(git rev-parse HEAD^{tree})" \
+            --arg original_local_sha "$ORIGINAL_LOCAL_SHA" --arg workflow_sha "$GITHUB_SHA" \
+            --arg run_id "$GITHUB_RUN_ID" --arg run_attempt "$GITHUB_RUN_ATTEMPT" \
+            --arg run_url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --arg version "$VERSION" --arg dmg_sha256 "$DMG_SHA" \
+            '{source_sha:$source_sha,source_tree:$source_tree,original_local_sha:$original_local_sha,
+              workflow_sha:$workflow_sha,run_id:$run_id,run_attempt:$run_attempt,run_url:$run_url,
+              version:$version,dmg_sha256:$dmg_sha256,notarized:false,physical_test_attested:false}' \
+            > dist/issue5-provenance.json
+          cat dist/issue5-provenance.json >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload artifact only
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: issue5-macos-${{ github.run_id }}-${{ github.run_attempt }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
+      - name: Retain failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: issue5-failure-${{ github.run_id }}-${{ github.run_attempt }}
+          path: dist/*.txt
+          if-no-files-found: ignore
+          retention-days: 7
