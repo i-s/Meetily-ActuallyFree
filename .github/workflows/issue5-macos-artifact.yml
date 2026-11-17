@@ -1,5 +1,6 @@
 name: Issue 5 - pinned macOS artifact only
 
+# Retrigger after owner enabled Actions; executable workflow is unchanged.
 # PR-scoped artifact build; never uses pull_request_target or release credentials.
 on:
   pull_request:
