@@ -5,6 +5,13 @@ Issue: https://github.com/i-s/Meetily-ActuallyFree/issues/5
 Status: **Actions artifact preparation; physical installation/capture gate blocked**.
 No release is authorized. No agent may install or change data on the user's Mac.
 
+Subsequent owner test: the Actions DMG launches on M4 Pro / 48 GB, macOS 26.2
+(25C56), but recording without system playback stops with a channel-closed error.
+The earlier unexecuted checklist below is historical, not a physical pass.
+See [MACOS_IDLE_AUDIO.md](MACOS_IDLE_AUDIO.md) for the reproduced production-loop
+failure, restored prior fork fix, pending reviewed-source repin and regression
+protocol. Installation success alone does not pass the recording/persistence gate.
+
 ## Source and Actions build
 
 Starting base: `e091a7a99b0681553b8ef6bb6a8e4b3948f8a940`.

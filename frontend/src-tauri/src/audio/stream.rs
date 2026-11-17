@@ -12,8 +12,8 @@ use super::capture::{AudioCaptureBackend, get_current_backend};
 
 #[cfg(target_os = "macos")]
 use super::capture::CoreAudioCapture;
-#[cfg(target_os = "macos")]
-use super::recording_state::AudioError;
+#[cfg(any(target_os = "macos", test))]
+pub(super) mod core_audio_processing;
 
 /// Stream backend implementation
 pub enum StreamBackend {
@@ -204,79 +204,14 @@ impl AudioStream {
         // The stream needs to be polled continuously to produce samples
         let device_name = device.name.clone();
         info!("🔊 Stream: Spawning tokio task to poll Core Audio stream...");
-        let task = tokio::spawn({
-            let capture = capture.clone();
-            let mut stream = core_stream;
-
-            async move {
-                use futures_util::StreamExt;
-
-                let mut buffer = Vec::new();
-                let mut frame_count = 0;
-                let frames_per_chunk = 1024; // Process in chunks of 1024 samples
-                let mut terminal_error_reported = false;
-
-                info!("✅ Stream: Core Audio processing task started for {}", device_name);
-
-                let mut _sample_count = 0u64;
-                loop {
-                    let sample = match tokio::time::timeout(
-                        tokio::time::Duration::from_secs(5),
-                        stream.next(),
-                    )
-                    .await
-                    {
-                        Ok(Some(sample)) => sample,
-                        Ok(None) => break,
-                        Err(_) => {
-                            error!(
-                                "Core Audio stopped delivering callbacks for {}",
-                                device_name
-                            );
-                            state_for_stream.report_error(AudioError::ChannelClosed);
-                            terminal_error_reported = true;
-                            break;
-                        }
-                    };
-                    let current_sample_rate = stream.sample_rate();
-                    if current_sample_rate != sample_rate {
-                        error!(
-                            "Core Audio sample rate changed during recording: {} -> {} Hz",
-                            sample_rate, current_sample_rate
-                        );
-                        state_for_stream.report_error(AudioError::SampleRateUnsupported);
-                        terminal_error_reported = true;
-                        break;
-                    }
-                    _sample_count += 1;
-                    // if _sample_count % 48000 == 0 {
-                    //     info!("📊 Stream: Received {} samples from Core Audio stream", _sample_count);
-                    // }
-
-                    buffer.push(sample);
-                    frame_count += 1;
-
-                    // Process when we have enough samples
-                    if frame_count >= frames_per_chunk {
-                        capture.process_audio_data(&buffer);
-                        buffer.clear();
-                        frame_count = 0;
-                    }
-                }
-
-                // Process any remaining samples
-                if !buffer.is_empty() {
-                    capture.process_audio_data(&buffer);
-                }
-
-                if !terminal_error_reported && state_for_stream.is_recording() {
-                    error!("Core Audio stream ended unexpectedly for {}", device_name);
-                    state_for_stream.report_error(AudioError::ChannelClosed);
-                }
-
-                info!("⚠️ Stream: Core Audio processing task ended for {}", device_name);
-            }
-        });
+        let task = tokio::spawn(core_audio_processing::process_core_audio_stream(
+            core_stream,
+            |stream| stream.sample_rate(),
+            move |samples| capture.process_audio_data(samples),
+            state_for_stream,
+            device_name,
+            sample_rate,
+        ));
 
         info!("✅ Stream: Core Audio stream fully initialized for device: {}", device.name);
 
@@ -469,13 +404,11 @@ impl AudioStream {
             }
             #[cfg(target_os = "macos")]
             StreamBackend::CoreAudio { task } => {
-                // Abort the processing task and wait briefly for cleanup
+                // Aborting wakes a Pending task so its owned native stream is
+                // dropped by Tokio without waiting for another audio callback.
                 if let Some(task_handle) = task {
                     info!("Aborting Core Audio task...");
                     task_handle.abort();
-                    // Give the runtime a moment to clean up the aborted task
-                    // This helps ensure Arc references in the closure are dropped
-                    std::thread::sleep(std::time::Duration::from_millis(50));
                     info!("Core Audio task aborted");
                 }
             }

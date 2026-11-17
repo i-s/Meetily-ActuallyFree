@@ -22,6 +22,9 @@ Speech-start pre-roll, live system speech sensitivity, and real-call replay
 qualification are documented in [LIVE_SPEECH_RETENTION.md](LIVE_SPEECH_RETENTION.md).
 Sample continuity across jittered capture callbacks and issue #40 qualification
 are documented in [AUDIO_CALLBACK_CONTINUITY.md](AUDIO_CALLBACK_CONTINUITY.md).
+Core Audio silence/EOF handling, the restored fork fix, device-free regressions,
+and the pending issue #5 build repin are documented in
+[MACOS_IDLE_AUDIO.md](MACOS_IDLE_AUDIO.md).
 
 ```text
 recording_commands.rs: start command
