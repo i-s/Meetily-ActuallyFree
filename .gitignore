@@ -16,6 +16,7 @@
 
 # testing
 /coverage
+/tests/__pycache__/
 /dist
 
 # next.js

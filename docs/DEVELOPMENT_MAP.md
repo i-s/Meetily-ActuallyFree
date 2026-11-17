@@ -175,6 +175,12 @@ changing the signed executable payloads.
 
 ## 6. Tests, qualification, and historical notes
 
+Issue #5 local Apple Silicon build prerequisites, sidecar ordering, locked
+dependencies, model provenance and physical mic/system/restart qualification
+are documented in [ISSUE5_MACOS_BUILD.md](ISSUE5_MACOS_BUILD.md). The portable
+`tests/test_macos_build.py` checks script orchestration only; neither target Mac
+has been qualified by those tests.
+
 macOS publication supports an explicitly labeled CI-qualified preview via
 `publish-macos.yml` (`preview=true`). It records no physical-test attestation,
 publishes a separate non-Latest prerelease, and retains artifact/hash/source
