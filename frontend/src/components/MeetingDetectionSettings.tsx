@@ -3,6 +3,8 @@
 import { useEffect, useState } from "react"
 import { Switch } from "./ui/switch"
 import { Badge } from "./ui/badge"
+import { listen } from "@tauri-apps/api/event"
+import type { LifecycleSnapshot } from "@/lib/meeting-lifecycle"
 import { invoke } from "@tauri-apps/api/core"
 import { Radar, Workflow } from "lucide-react"
 import { toast } from "sonner"
@@ -27,6 +29,16 @@ export function MeetingDetectionSettings() {
   const [ignoredInput, setIgnoredInput] = useState('');
   const { labs } = useLabs();
   const [automationBusy, setAutomationBusy] = useState(false);
+  const [lifecycle, setLifecycle] = useState<LifecycleSnapshot | null>(null);
+  useEffect(() => {
+    let disposed = false;
+    const update = (snapshot: LifecycleSnapshot) => {
+      if (!disposed) setLifecycle(previous => !previous || snapshot.revision > previous.revision ? snapshot : previous);
+    };
+    const unlisten = listen<LifecycleSnapshot>('meeting-lifecycle', event => update(event.payload));
+    void unlisten.then(() => invoke<LifecycleSnapshot>('get_meeting_lifecycle_snapshot')).then(update).catch(console.error);
+    return () => { disposed = true; void unlisten.then(fn => fn()); };
+  }, []);
 
   useEffect(() => {
     invoke<MeetingDetectionSettings>('get_meeting_detection_settings')
@@ -75,8 +87,8 @@ export function MeetingDetectionSettings() {
               Meeting Detection
             </h3>
             <p className="text-sm text-af-text-2">
-              Watch for meeting apps (Zoom, Teams, Slack, Webex, Discord…) and prompt you to start
-              recording when one starts. Runs entirely on-device — no network, no telemetry.
+              Local meeting detection. On macOS, Zoom uses read-only Accessibility call controls,
+              not process launch, audio activity, mute or silence. Other app offers are separate.
             </p>
           </div>
           <Switch checked={md.enabled} onCheckedChange={(v) => saveMd({ ...md, enabled: v })} />
@@ -96,7 +108,7 @@ export function MeetingDetectionSettings() {
                   onBlur={() => saveMd({ ...md, interval_secs: Math.min(3600, Math.max(3, md.interval_secs || 15)) })}
                   className="w-20 rounded-lg border border-af-border px-2 py-1 text-sm focus:border-af-accent/40 focus:outline-none"
                 />
-                <span className="text-sm text-af-text-3">seconds</span>
+                <span className="text-sm text-af-text-3">seconds (legacy offers; macOS Zoom polls every 3 s)</span>
               </div>
             </div>
 
@@ -133,6 +145,17 @@ export function MeetingDetectionSettings() {
         )}
       </div>
 
+      {lifecycle?.sources.map(source => (
+        <div key={source.source} className="rounded-xl border border-af-border p-4 text-sm text-af-text-2" role="status">
+          <strong>{source.app}: {source.presence}</strong> — {source.reason}
+          {source.session_id ? ' · call session retained' : ' · no confirmed call'}
+          {source.reason === 'accessibility_permission_required' && (
+            <p>Allow Meetily in macOS System Settings → Privacy &amp; Security → Accessibility. No recording is inferred from permission alone.</p>
+          )}
+          <p>Candidate detector, not a physical qualification pass. Microphone speech remains source-labeled; #6 acoustic identity is pending.</p>
+        </div>
+      ))}
+
       <div className="flex items-start gap-4 rounded-2xl border border-af-border bg-af-panel-2/40 p-5">
         <span className="mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-af-accent/[0.12] text-af-accent">
           <Workflow className="h-[18px] w-[18px]" />
@@ -143,8 +166,9 @@ export function MeetingDetectionSettings() {
             <Badge variant="accent" size="xs">Labs</Badge>
           </h3>
           <p className="mt-0.5 text-[13px] leading-relaxed text-af-text-3">
-            Instead of prompting, record a detected call once it uses your microphone or camera, and stop and save when it
-            ends. Recordings you start yourself are never stopped.
+            On macOS, automatically record a positively observed Zoom call and save after confirmed exit.
+            Unknown evidence never starts or stops a call. Manual Stop suppresses that session; the next call can rearm.
+            Recordings you start yourself are never stopped. Zoom detection and speaker identity still require final Mac qualification.
           </p>
         </div>
         <Switch

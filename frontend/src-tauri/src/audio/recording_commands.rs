@@ -551,6 +551,19 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
     system_device_name: Option<String>,
     meeting_name: Option<String>,
 ) -> Result<(), String> {
+    start_recording_with_lifecycle(app, mic_device_name, system_device_name, meeting_name, None).await
+}
+
+pub async fn start_recording_with_lifecycle<R: Runtime>(
+    app: AppHandle<R>,
+    mic_device_name: Option<String>,
+    system_device_name: Option<String>,
+    meeting_name: Option<String>,
+    lifecycle_session: Option<String>,
+) -> Result<(), String> {
+    if let Some(session) = &lifecycle_session {
+        crate::meeting_detection::lifecycle::validate_start(session)?;
+    }
     info!(
         "Starting recording with specific devices: mic={:?}, system={:?}, meeting={:?}",
         mic_device_name, system_device_name, meeting_name
@@ -662,6 +675,13 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
             return Err(format!("Could not load recording source preferences: {e}"));
         }
     };
+    if let Some(session) = &lifecycle_session {
+        if crate::meeting_detection::lifecycle::session_source(session).as_deref() == Some("zoom") {
+            let executables: Vec<&str> = preferences.per_app_targets.iter().map(|target| target.executable.as_str()).collect();
+            super::recording_mode::validate_zoom_sources(preferences.in_person,
+                preferences.per_app_recording_enabled, &executables).map_err(str::to_string)?;
+        }
+    }
     let auto_save = preferences.auto_save;
     manager.set_in_person(preferences.in_person);
     manager.set_recordings_folder(preferences.save_folder);
@@ -689,6 +709,14 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
     // Start recording with specified devices and auto_save setting
     #[cfg(target_os = "windows")]
     let resolved_system_device_name = system_device.as_ref().map(|device| device.name.clone());
+    // Model/device setup may outlive the detected call. Check again at the
+    // capture boundary, under the existing recording lifecycle lock.
+    if let Some(session) = &lifecycle_session {
+        if let Err(error) = crate::meeting_detection::lifecycle::validate_start(session) {
+            crate::diarization::online::stop();
+            return Err(error);
+        }
+    }
     let transcription_receiver = manager
         .start_recording(mic_device, system_device, auto_save, Some(level_sender))
         .await

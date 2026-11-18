@@ -1,8 +1,7 @@
 /**
- * Labs meeting automation. When meeting detection sees a call using the
- * microphone or camera, a recording starts; when that call ends, the
- * recording it started stops and saves. Recordings the user started are
- * never stopped by it.
+ * Labs automation handoff shared by source lifecycle adapters and legacy
+ * meeting offers. Only an automation-owned take follows its detected call;
+ * manually started recordings remain under user control.
  *
  * The recorder owns the start and stop sequences, so the hand-off between the
  * detection events (in the root layout) and the recorder goes through
@@ -10,6 +9,7 @@
  */
 
 const PENDING_KEY = 'labsAutoStartPending';
+const STARTING_KEY = 'labsAutoStartInFlight';
 const ACTIVE_KEY = 'labsAutoRecordingProcess';
 export const AUTOMATION_CHANGED_EVENT = 'meetily-automation-changed';
 
@@ -21,6 +21,9 @@ export interface AutomatedCall {
   app: string;
   /** Process the detector matched, e.g. "Zoom.exe". */
   process: string;
+  /** Lifecycle adapter + native call identity, independent of PID/device/mute. */
+  source?: string;
+  sessionId?: string;
 }
 
 function read(key: string): string | null {
@@ -36,7 +39,7 @@ function writeKey(key: string, value: string | null) {
     if (value === null) sessionStorage.removeItem(key);
     else sessionStorage.setItem(key, value);
   } catch {
-    // Without storage, automation still starts recordings but cannot stop them.
+    // Callers can fail closed by checking the handoff write before routing.
   }
 }
 
@@ -45,7 +48,10 @@ function parse(value: string | null): AutomatedCall | null {
   try {
     const parsed = JSON.parse(value) as Partial<AutomatedCall>;
     if (typeof parsed.process === 'string' && parsed.process) {
-      return { app: typeof parsed.app === 'string' && parsed.app ? parsed.app : parsed.process, process: parsed.process };
+      return { app: typeof parsed.app === 'string' && parsed.app ? parsed.app : parsed.process, process: parsed.process,
+        ...(typeof parsed.source === 'string' ? { source: parsed.source } : {}),
+        ...(typeof parsed.sessionId === 'string' ? { sessionId: parsed.sessionId } : {}),
+      };
     }
   } catch {
     // Written by #38 as the bare process name.
@@ -56,8 +62,16 @@ function parse(value: string | null): AutomatedCall | null {
 
 /** Called right before the recorder is asked to start for a detected call. */
 export function markAutomatedStart(call: AutomatedCall) {
-  writeKey(PENDING_KEY, JSON.stringify({ ...call, at: Date.now() }));
+  const value = JSON.stringify({ ...call, at: Date.now() });
+  writeKey(PENDING_KEY, value);
+  return read(PENDING_KEY) === value;
 }
+
+export function automatedStartInProgress(): AutomatedCall | null {
+  return parse(read(PENDING_KEY)) || parse(read(STARTING_KEY));
+}
+
+export function releaseAutomatedStart() { writeKey(STARTING_KEY, null); }
 
 /**
  * The recorder takes the pending request when a start begins. It is cleared
@@ -73,11 +87,14 @@ export function takeAutomatedStart(): AutomatedCall | null {
   } catch {
     return null;
   }
-  return parse(value);
+  const call = parse(value);
+  if (call) writeKey(STARTING_KEY, JSON.stringify(call));
+  return call;
 }
 
 /** The recording now running was started for this call. */
 export function beginAutomatedRecording(call: AutomatedCall) {
+  releaseAutomatedStart();
   writeKey(ACTIVE_KEY, JSON.stringify(call));
   window.dispatchEvent(new Event(AUTOMATION_CHANGED_EVENT));
 }
@@ -89,7 +106,8 @@ export function automatedRecording(): AutomatedCall | null {
 
 /** Recording stopped, or the user chose to keep it going after the call. */
 export function endAutomatedRecording() {
-  if (read(ACTIVE_KEY) === null && read(PENDING_KEY) === null) return;
+  if (read(ACTIVE_KEY) === null && read(PENDING_KEY) === null && read(STARTING_KEY) === null) return;
+  releaseAutomatedStart();
   writeKey(ACTIVE_KEY, null);
   writeKey(PENDING_KEY, null);
   window.dispatchEvent(new Event(AUTOMATION_CHANGED_EVENT));

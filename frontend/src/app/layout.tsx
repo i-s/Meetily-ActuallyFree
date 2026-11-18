@@ -30,7 +30,8 @@ import { RecordingPostProcessingProvider } from '@/contexts/RecordingPostProcess
 import { ImportDialogProvider } from '@/contexts/ImportDialogContext'
 import { isAudioExtension, getAudioFormatsDisplayList } from '@/constants/audioFormats'
 import { loadLabsPreferences } from '@/lib/labs'
-import { automatedRecording, endAutomatedRecording, markAutomatedStart } from '@/lib/meeting-automation'
+import { createLifecycleAutomation, type LifecycleSnapshot } from '@/lib/meeting-lifecycle'
+import { automatedStartInProgress, automatedRecording, endAutomatedRecording, markAutomatedStart } from '@/lib/meeting-automation'
 import { getPendingCrashReport, type PendingCrashReport } from '@/services/crashReportService'
 import { WorkspaceProvider } from '@/contexts/WorkspaceContext'
 import { RouteWarmup } from '@/components/RouteWarmup'
@@ -306,12 +307,26 @@ export default function RootLayout({
     };
   }, [startupResolved, startupError, pendingCrashReport]);
 
-  // Meeting Detection: prompt to start recording when a meeting app is detected.
-  // With Labs meeting automation on, a call that is using the microphone or
-  // camera starts a recording instead, and that recording stops when the call
-  // ends. The compact bar's window never starts or stops recordings.
+  // Source lifecycle automation is separate from legacy running-app offers.
+  // Only the main WebView owns recorder routing; the compact bar never starts
+  // or stops a take. Native snapshots retain sessions across route changes.
   useEffect(() => {
     if (!startupResolved || startupError || pendingCrashReport || isMinibar || !recordingNoticeAcknowledged) return
+    const lifecycle = createLifecycleAutomation({
+      enabled: () => loadLabsPreferences().meetingAutomation && !showOnboarding,
+      state: () => invoke('get_recording_state'),
+      start: () => startRecordingAnywhere.current(),
+      stop: () => requestRecordingStop((href) => router.push(href)),
+      error: (error) => toast.error('Meeting automation failed', { description: String(error) }),
+      conflict: (app) => toast.info(`${app} call detected while the recorder is busy`, {
+        description: 'The existing take keeps its owner. No second recording was started.',
+      }),
+    });
+    const unlistenLifecycle = listen<LifecycleSnapshot>('meeting-lifecycle', event => lifecycle.accept(event.payload));
+    // Subscribe before fetching, and reject stale revisions if a probe races it.
+    void unlistenLifecycle.then(() => invoke<LifecycleSnapshot>('get_meeting_lifecycle_snapshot'))
+      .then(snapshot => lifecycle.accept(snapshot))
+      .catch(error => console.error('Could not read meeting lifecycle:', error));
     const unlisten = listen<{ app: string; process: string; notify: boolean; active_media: boolean }>(
       'meeting-detected',
       (event) => {
@@ -330,7 +345,7 @@ export default function RootLayout({
 
         if (loadLabsPreferences().meetingAutomation && active_media && !showOnboarding) {
           void invoke<{ is_recording?: boolean }>('get_recording_state').then((state) => {
-            if (state.is_recording) return;
+            if (state.is_recording || automatedStartInProgress()) return;
             markAutomatedStart({ app, process });
             startRecording();
           }).catch((error) => console.error('Could not check recording state for meeting automation:', error));
@@ -371,6 +386,7 @@ export default function RootLayout({
     // Only a recording that automation started for this same call is stopped.
     const unlistenEnd = listen<{ app: string; process: string }>('meeting-ended', (event) => {
       const call = automatedRecording();
+      if (call?.sessionId) return; // lifecycle-owned calls never follow legacy process disappearance
       if (!call || call.process !== event.payload.process || !loadLabsPreferences().meetingAutomation) return;
       void invoke<{ is_recording?: boolean }>('get_recording_state').then((state) => {
         if (!state.is_recording) {
@@ -386,6 +402,8 @@ export default function RootLayout({
       unlisten.then((fn) => fn());
       unlistenStart.then((fn) => fn());
       unlistenEnd.then((fn) => fn());
+      lifecycle.dispose();
+      unlistenLifecycle.then((fn) => fn());
     };
   }, [showOnboarding, startupResolved, startupError, pendingCrashReport, isMinibar, router, recordingNoticeAcknowledged]);
 

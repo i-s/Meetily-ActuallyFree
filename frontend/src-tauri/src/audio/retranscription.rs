@@ -188,15 +188,18 @@ struct RetranscriptionSource {
 
 fn find_retranscription_sources(folder: &Path, fallback: &Path) -> Result<Vec<RetranscriptionSource>> {
     let metadata_path = folder.join("metadata.json");
-    let in_person = match std::fs::read(&metadata_path) {
+    let (in_person, microphone_identity_unverified) = match std::fs::read(&metadata_path) {
         Ok(bytes) => {
             let metadata: serde_json::Value = serde_json::from_slice(&bytes)?;
-            match metadata.get("in_person") {
-                Some(value) => value.as_bool().ok_or_else(|| anyhow!("Invalid in_person recording provenance"))?,
-                None => false, // Legacy recordings used the call-source convention.
-            }
+            let provenance = |key: &str| -> Result<bool> {
+                match metadata.get(key) {
+                    Some(value) => value.as_bool().ok_or_else(|| anyhow!("Invalid {key} recording provenance")),
+                    None => Ok(false), // Legacy recordings keep their historical policy.
+                }
+            };
+            (provenance("in_person")?, provenance("microphone_identity_unverified")?)
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (false, false),
         Err(error) => return Err(error.into()),
     };
     let mic_path = folder.join("mic.mp4");
@@ -216,7 +219,7 @@ fn find_retranscription_sources(folder: &Path, fallback: &Path) -> Result<Vec<Re
         sources.push(RetranscriptionSource {
             path: mic_path,
             label: "microphone",
-            speaker_hint: Some("You"),
+            speaker_hint: Some(if microphone_identity_unverified { "Microphone" } else { "You" }),
             positive_threshold: 0.20,
             negative_threshold: 0.10,
         });
@@ -1435,4 +1438,18 @@ mod issue9_label_retry_tests {
         std::fs::write(dir.path().join("metadata.json"), b"truncated").unwrap();
         assert!(find_retranscription_sources(dir.path(), &fallback).is_err());
     }
+    #[test]
+    fn unqualified_macos_microphone_is_not_promoted_to_you_on_enhance() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("metadata.json"), br#"{"microphone_identity_unverified":true}"#).unwrap();
+        std::fs::write(dir.path().join("mic.mp4"), b"synthetic").unwrap();
+        std::fs::write(dir.path().join("system.mp4"), b"synthetic").unwrap();
+        let sources = find_retranscription_sources(dir.path(), &dir.path().join("audio.mp4")).unwrap();
+        assert_eq!(sources.len(), 2);
+        assert_eq!(sources[0].speaker_hint, Some("Microphone"));
+        assert_eq!(sources[1].speaker_hint, Some("Guest"));
+        std::fs::write(dir.path().join("metadata.json"), br#"{"microphone_identity_unverified":"bad"}"#).unwrap();
+        assert!(find_retranscription_sources(dir.path(), &dir.path().join("audio.mp4")).is_err());
+    }
+
 }

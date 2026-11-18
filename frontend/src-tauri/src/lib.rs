@@ -361,7 +361,7 @@ async fn start_recording_with_devices<R: Runtime>(
     mic_device_name: Option<String>,
     system_device_name: Option<String>,
 ) -> Result<(), String> {
-    start_recording_with_devices_and_meeting(app, mic_device_name, system_device_name, None).await
+    start_recording_with_devices_and_meeting(app, mic_device_name, system_device_name, None, None).await
 }
 
 #[tauri::command]
@@ -370,6 +370,7 @@ async fn start_recording_with_devices_and_meeting<R: Runtime>(
     mic_device_name: Option<String>,
     system_device_name: Option<String>,
     meeting_name: Option<String>,
+    lifecycle_session: Option<String>,
 ) -> Result<(), String> {
     log_info!("ðŸš€ CALLED start_recording_with_devices_and_meeting - Mic: {:?}, System: {:?}, Meeting: {:?}",
              mic_device_name, system_device_name, meeting_name);
@@ -378,29 +379,35 @@ async fn start_recording_with_devices_and_meeting<R: Runtime>(
     let meeting_name_for_notification = meeting_name.clone();
 
     // Call the recording module functions that support meeting names
-    let recording_result = match (mic_device_name.clone(), system_device_name.clone()) {
-        (None, None) => {
-            log_info!(
-                "No devices specified, starting with defaults and meeting: {:?}",
-                meeting_name
-            );
-            audio::recording_commands::start_recording_with_meeting_name(app.clone(), meeting_name)
+    let recording_result = if lifecycle_session.is_some() {
+        audio::recording_commands::start_recording_with_lifecycle(
+            app.clone(), mic_device_name.clone(), system_device_name.clone(), meeting_name.clone(), lifecycle_session,
+        ).await
+    } else {
+        match (mic_device_name.clone(), system_device_name.clone()) {
+            (None, None) => {
+                log_info!(
+                    "No devices specified, starting with defaults and meeting: {:?}",
+                    meeting_name
+                );
+                audio::recording_commands::start_recording_with_meeting_name(app.clone(), meeting_name)
+                    .await
+            }
+            _ => {
+                log_info!(
+                    "Starting with specified devices: mic={:?}, system={:?}, meeting={:?}",
+                    mic_device_name,
+                    system_device_name,
+                    meeting_name
+                );
+                audio::recording_commands::start_recording_with_devices_and_meeting(
+                    app.clone(),
+                    mic_device_name,
+                    system_device_name,
+                    meeting_name,
+                )
                 .await
-        }
-        _ => {
-            log_info!(
-                "Starting with specified devices: mic={:?}, system={:?}, meeting={:?}",
-                mic_device_name,
-                system_device_name,
-                meeting_name
-            );
-            audio::recording_commands::start_recording_with_devices_and_meeting(
-                app.clone(),
-                mic_device_name,
-                system_device_name,
-                meeting_name,
-            )
-            .await
+            }
         }
     };
 
@@ -805,6 +812,7 @@ pub fn run() {
             database::repositories::meeting_notes::api_get_meeting_notes,
             database::repositories::meeting_notes::api_save_meeting_notes,
             api::api_get_meeting_audio,
+            meeting_detection::lifecycle::get_meeting_lifecycle_snapshot,
             meeting_detection::get_meeting_detection_settings,
             meeting_detection::set_meeting_detection_settings,
             meeting_detection::start_meeting_detection,

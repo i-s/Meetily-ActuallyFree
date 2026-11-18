@@ -195,18 +195,19 @@ pub fn start_transcription_task<R: Runtime>(
                             //
                             // Dual-path STT (AudioPipeline) sends mic and system as
                             // separate chunks with real capture provenance. "You"
-                            // is the headset/local-mic convention, not verified
-                            // identity or acoustic separation. In-person capture
-                            // can contain everyone in the room: label its source.
+                            // is a legacy local-mic convention, not verified
+                            // identity or acoustic separation. Unqualified macOS
+                            // and in-person microphones retain source labels.
                             crate::audio::common::mark_stt_activity();
                         let nemotron_remote = matches!(chunk.device_type, crate::audio::recording_state::DeviceType::System)
                             && crate::diarization::live_nemotron::active();
                         let profile_samples = nemotron_remote.then(|| chunk.data.clone());
                         let mut chunk_source = match &chunk.device_type {
                                 crate::audio::recording_state::DeviceType::Microphone => {
-                                    // Still feed the online diarizer so it learns the
-                                    // user's voice embedding for later offline refine.
-                                    if !crate::audio::recording_mode::in_person() {
+                                    // Enroll the legacy local-mic convention only
+                                    // when source identity is not marked unverified.
+                                    if !crate::audio::recording_mode::in_person()
+                                        && !crate::audio::recording_mode::microphone_identity_unverified() {
                                         let _ = crate::diarization::online::assign_speaker(
                                             &chunk.data,
                                             true,

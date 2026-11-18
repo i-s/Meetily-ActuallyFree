@@ -1030,12 +1030,14 @@ pub async fn diarize_meeting(
         // A room microphone is not a user identity. Older recordings retain
         // their source-track convention; explicit in-person recordings use the
         // ordinary whole-room diarization path, never collapse mic to "You".
-        let in_person = parent.as_ref()
+        // The same applies to unqualified macOS speaker leakage (#6).
+        let mic_identity_unverified = parent.as_ref()
             .and_then(|p| std::fs::read(p.join("metadata.json")).ok())
             .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-            .and_then(|value| value.get("in_person").and_then(|v| v.as_bool()))
+            .map(|value| value.get("in_person").and_then(|v| v.as_bool()).unwrap_or(false)
+                || value.get("microphone_identity_unverified").and_then(|v| v.as_bool()).unwrap_or(false))
             .unwrap_or(false);
-        let mic_source = parent.as_ref().filter(|_| !in_person).map(|p| p.join("mic.mp4"));
+        let mic_source = parent.as_ref().filter(|_| !mic_identity_unverified).map(|p| p.join("mic.mp4"));
         let system_source = parent.as_ref().map(|p| p.join("system.mp4"));
 
         if let (Some(mic), Some(system)) = (mic_source, system_source) {

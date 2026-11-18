@@ -1,14 +1,9 @@
-//! Meeting Detection.
-//!
-//! A lightweight background monitor that watches the list of running processes
-//! and, when it sees a known meeting/conferencing app start (Zoom, Teams,
-//! Slack huddles, Webex, …), emits a `meeting-detected` event so the
-//! UI can offer a one-click "Start recording". Fully local — no network, no
-//! telemetry; just process-name matching via `sysinfo`.
-//!
-//! Everything is user-configurable and persisted install-locally in
-//! `meeting_detection.json`: the poll interval, the list of app keywords to
-//! watch, and an "ignored apps" list to suppress false positives.
+//! Legacy process offers and independent, evidence-based call lifecycle adapters.
+//! macOS Zoom never uses the legacy process/audio lease fallback for automation.
+pub mod evidence;
+pub mod lifecycle;
+#[cfg(any(target_os = "macos", test))]
+mod zoom;
 
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -169,6 +164,8 @@ fn scan_for_meeting_app(settings: &MeetingDetectionSettings) -> Option<(String, 
         .collect();
 
     let is_skipped = |name: &str| -> bool {
+        // Zoom on macOS is owned exclusively by its lifecycle adapter.
+        if cfg!(target_os = "macos") && process_matches_keyword(name, "zoom") { return true; }
         if name.is_empty() || is_self_process(name) {
             return true;
         }
@@ -395,6 +392,7 @@ fn start_monitor<R: Runtime>(app: &AppHandle<R>) {
         let guard = SETTINGS.lock().unwrap();
         guard.clone().unwrap_or_default()
     };
+    let _ = app.emit("meeting-lifecycle", lifecycle::suspend(settings.enabled));
     if !settings.enabled {
         log::info!("Meeting detection disabled; monitor not started");
         return;
@@ -422,11 +420,28 @@ fn start_monitor<R: Runtime>(app: &AppHandle<R>) {
             }
 
             let scan_settings = current.clone();
-            let scan = match tokio::task::spawn_blocking(move || scan_for_meeting_app(&scan_settings)).await {
+            let (scan, zoom_probe) = match tokio::task::spawn_blocking(move || {
+                #[cfg(target_os = "macos")]
+                let zoom = Some(lifecycle::scan_zoom(&scan_settings));
+                #[cfg(not(target_os = "macos"))]
+                let zoom: Option<evidence::Probe> = None;
+                (scan_for_meeting_app(&scan_settings), zoom)
+            }).await {
                 Ok(scan) => scan,
-                Err(error) => { log::warn!("Meeting detection scan failed: {error}"); None }
+                Err(error) => {
+                    log::warn!("Meeting detection scan failed: {error}");
+                    let probe = cfg!(target_os = "macos").then_some(evidence::Probe {
+                        presence: evidence::Presence::Unknown, reason: "scan_failed",
+                    });
+                    (None, probe)
+                }
             };
             if MONITOR_GENERATION.load(Ordering::SeqCst) != generation { break; }
+            if let Some(probe) = zoom_probe {
+                if let Some(snapshot) = lifecycle::observe_zoom(probe, generation) {
+                    let _ = app.emit("meeting-lifecycle", snapshot);
+                }
+            }
             // A process-only fallback must not keep a formerly active meeting
             // alive after its microphone lease ends while the app stays open.
             let scan = match (alerted.as_ref(), scan) {
@@ -462,7 +477,8 @@ fn start_monitor<R: Runtime>(app: &AppHandle<R>) {
                 }
             }
 
-            let interval = current.interval_secs.clamp(3, 3600);
+            // Candidate Zoom timing is fixed, not the legacy offer interval.
+            let interval = if cfg!(target_os = "macos") { 3 } else { current.interval_secs.clamp(3, 3600) };
             tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
         }
 
@@ -513,6 +529,7 @@ pub async fn set_meeting_detection_settings<R: Runtime>(
         start_monitor(&app);
     } else {
         MONITOR_GENERATION.fetch_add(1, Ordering::SeqCst);
+        let _ = app.emit("meeting-lifecycle", lifecycle::suspend(false));
     }
     Ok(())
 }
@@ -526,7 +543,8 @@ pub async fn start_meeting_detection<R: Runtime>(app: AppHandle<R>) -> Result<()
 
 /// Manually stop the monitor.
 #[tauri::command]
-pub async fn stop_meeting_detection() -> Result<(), String> {
+pub async fn stop_meeting_detection<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
     MONITOR_GENERATION.fetch_add(1, Ordering::SeqCst);
+    let _ = app.emit("meeting-lifecycle", lifecycle::suspend(false));
     Ok(())
 }

@@ -8,8 +8,9 @@ import { useRecordingState, RecordingStatus } from '@/contexts/RecordingStateCon
 import { recordingService } from '@/services/recordingService';
 import { readPendingGroup } from '@/lib/groups';
 import { automaticTitle, beginLiveSession } from '@/lib/live-session';
-import { AUTO_START_KEY, START_RECORDING_EVENT } from '@/lib/recording-launch';
-import { beginAutomatedRecording, endAutomatedRecording, takeAutomatedStart } from '@/lib/meeting-automation';
+import { AUTO_START_KEY, START_RECORDING_EVENT, requestRecordingStop } from '@/lib/recording-launch';
+import { beginAutomatedRecording, endAutomatedRecording, takeAutomatedStart, releaseAutomatedStart } from '@/lib/meeting-automation';
+import { lifecycleCallCanStart, lifecycleCallEnded } from '@/lib/meeting-lifecycle';
 import Analytics from '@/lib/analytics';
 import { showRecordingNotification } from '@/lib/recordingNotification';
 import { toast } from 'sonner';
@@ -194,11 +195,16 @@ export function useRecordingStart(
     setStatus(RecordingStatus.STARTING, 'Preparing transcription model…');
     const sttReady = await prefetchSttModel();
     if (!sttReady) {
+      releaseAutomatedStart();
       await reportModelNotReady(source);
       return false;
     }
 
     try {
+      if (call && !lifecycleCallCanStart(call)) {
+        setStatus(RecordingStatus.IDLE);
+        return false;
+      }
       const startedAt = Date.now();
       const group = readPendingGroup();
       const title = automaticTitle(new Date(startedAt), group?.name, meetings.map((meeting) => meeting.title));
@@ -208,7 +214,8 @@ export function useRecordingStart(
       await recordingService.startRecordingWithDevices(
         selectedDevices?.micDevice || null,
         selectedDevices?.systemDevice || null,
-        title
+        title,
+        call?.sessionId
       );
 
       // RECORDING status itself arrives from Rust via RecordingStateContext.
@@ -220,6 +227,12 @@ export function useRecordingStart(
       Analytics.trackButtonClick('start_recording', source);
       if (call) {
         beginAutomatedRecording(call);
+        // A leave can race native stream startup. Finish using the normal Stop
+        // path, not a parallel backend shutdown that bypasses saving.
+        if (call.sessionId && lifecycleCallEnded(call)) {
+          requestRecordingStop(() => {});
+          return true;
+        }
         toast(`Recording your ${call.app} call`, {
           description: 'Meeting automation started it, and stops and saves it when the call ends.',
           duration: 10000,
@@ -242,6 +255,8 @@ export function useRecordingStart(
       toast.error(title, { description: message, duration: 8000 });
       Analytics.trackButtonClick('start_recording_error', source);
       return false;
+    } finally {
+      releaseAutomatedStart();
     }
   }, [
     prefetchSttModel,

@@ -11,8 +11,18 @@ pub fn in_person() -> bool {
     IN_PERSON.load(Ordering::SeqCst)
 }
 
+/// macOS speaker leakage has not passed #6. Preserve both source tracks and
+/// local overlap, but never promote an unseparated microphone into identity.
+/// This is intentionally conservative even on a headset until route-specific
+/// acoustic qualification can supply a trustworthy native identity policy.
+pub fn microphone_identity_unverified() -> bool { cfg!(target_os = "macos") }
+
 pub fn microphone_label(in_person: bool) -> &'static str {
-    if in_person { "Microphone" } else { "You" }
+    microphone_label_for_policy(in_person, microphone_identity_unverified())
+}
+
+pub fn microphone_label_for_policy(in_person: bool, unverified: bool) -> &'static str {
+    if in_person || unverified { "Microphone" } else { "You" }
 }
 
 /// Validate before opening any capture stream. A missing app choice must not
@@ -30,6 +40,13 @@ pub fn validate_sources(in_person: bool, per_app: bool, targets: usize, system_a
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unqualified_speaker_leakage_is_never_user_identity() {
+        assert_eq!(microphone_label_for_policy(false, true), "Microphone");
+        assert_eq!(microphone_label_for_policy(true, false), "Microphone");
+        assert_eq!(microphone_label_for_policy(false, false), "You");
+    }
 
     #[test]
     fn missing_selected_apps_never_becomes_global_audio() {
@@ -84,5 +101,31 @@ mod selection_tests {
         assert!(resolve_app_targets(true, &targets()[..1], |_| None).is_err());
         assert!(resolve_app_targets(false, &[], |_| None).is_err());
         assert_eq!(resolve_app_targets(false, &targets(), |_| Some(42)).unwrap().len(), 2);
+    }
+}
+
+/// Automation must not reinterpret a saved room/other-app selection as a Zoom
+/// call. Reject visibly; never broaden capture or rewrite user preferences.
+pub fn validate_zoom_sources(in_person: bool, per_app: bool, executables: &[&str]) -> Result<(), &'static str> {
+    if in_person {
+        return Err("Zoom automation cannot use In-person microphone-only mode. Choose call capture in Recording settings.");
+    }
+    if per_app && (executables.len() != 1 || executables[0] != "zoom.us") {
+        return Err("Zoom automation requires Zoom (zoom.us) as the one selected target application, or explicit all-system capture. Recording source preferences were not changed.");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod zoom_source_tests {
+    use super::*;
+    #[test]
+    fn automatic_zoom_never_records_another_selected_app_or_room_mode() {
+        assert!(validate_zoom_sources(true, false, &[]).is_err());
+        assert!(validate_zoom_sources(false, true, &["Discord"]).is_err());
+        assert!(validate_zoom_sources(false, true, &[]).is_err());
+        assert!(validate_zoom_sources(false, true, &["zoom.us", "Discord"]).is_err());
+        assert!(validate_zoom_sources(false, true, &["zoom.us"]).is_ok());
+        assert!(validate_zoom_sources(false, false, &[]).is_ok());
     }
 }

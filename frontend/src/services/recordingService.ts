@@ -80,12 +80,14 @@ export class RecordingService {
   async startRecordingWithDevices(
     micDeviceName: string | null,
     systemDeviceName: string | null,
-    meetingName: string
+    meetingName: string,
+    lifecycleSession?: string
   ): Promise<void> {
     return invoke('start_recording_with_devices_and_meeting', {
       micDeviceName,
       systemDeviceName,
-      meetingName
+      meetingName,
+      ...(lifecycleSession ? { lifecycleSession } : {}),
     });
   }
 
