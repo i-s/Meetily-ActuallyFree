@@ -396,6 +396,15 @@ are documented in [ISSUE5_MACOS_BUILD.md](ISSUE5_MACOS_BUILD.md). The portable
 `tests/test_macos_build.py` checks script orchestration only; neither target Mac
 has been qualified by those tests.
 
+Issue #20's [single personal candidate and batched two-Mac record](ISSUE20_PERSONAL_MACOS_ACCEPTANCE.md)
+supersedes historical #5 artifact pins for the final #5–19 handoff, without
+publishing or claiming physical acceptance. It reuses PR21's artifact-only workflow;
+source/export checks live in `scripts/verify_macos_candidate.py`, covered by
+`tests/test_macos_candidate.py`. The workflow checks actual frontend output,
+aligned source/app versions and byte-identical bundled models. The owner record
+maps all live AC to evidence, keeps Zoom/Discord observation-only and every physical
+gate explicitly NOT RUN, and separates source/workflow/artifact identities.
+
 macOS publication supports an explicitly labeled CI-qualified preview via
 `publish-macos.yml` (`preview=true`). It records no physical-test attestation,
 publishes a separate non-Latest prerelease, and retains artifact/hash/source
