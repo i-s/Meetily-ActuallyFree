@@ -305,7 +305,7 @@ pub async fn stop_recording_from_minibar<R: Runtime>(app: AppHandle<R>) -> Resul
 
     let outcome = crate::audio::recording_commands::stop_recording_from_compact(
         app.clone(),
-        crate::audio::recording_commands::RecordingArgs { save_path },
+        crate::audio::recording_commands::RecordingArgs { save_path, expected: None, manual_generation: None },
     )
     .await;
     schedule_close_after_ipc(app);

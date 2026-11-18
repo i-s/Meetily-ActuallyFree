@@ -1,23 +1,20 @@
-//! Meeting Detection.
-//!
-//! A lightweight background monitor that watches the list of running processes
-//! and, when it sees a known meeting/conferencing app start (Zoom, Teams,
-//! Slack huddles, Webex, …), emits a `meeting-detected` event so the
-//! UI can offer a one-click "Start recording". Fully local — no network, no
-//! telemetry; just process-name matching via `sysinfo`.
-//!
-//! Everything is user-configurable and persisted install-locally in
-//! `meeting_detection.json`: the poll interval, the list of app keywords to
-//! watch, and an "ignored apps" list to suppress false positives.
+//! Legacy process offers and independent, evidence-based call lifecycle adapters.
+//! macOS Zoom never uses the legacy process/audio lease fallback for automation.
+pub mod evidence;
+pub mod lifecycle;
+pub mod zoom_observation;
+#[cfg(any(target_os = "macos", test))]
+pub(crate) mod zoom;
 
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use tauri::{AppHandle, Emitter, Runtime};
 
 /// Global run flag for the monitor loop. Setting this to `false` makes the
 /// currently-running loop exit on its next tick.
 static MONITOR_GENERATION: AtomicU64 = AtomicU64::new(0);
+static MONITOR_PAUSED: AtomicBool = AtomicBool::new(false);
 /// Current settings, shared with the running loop so changes apply live.
 static SETTINGS: Mutex<Option<MeetingDetectionSettings>> = Mutex::new(None);
 
@@ -35,6 +32,12 @@ pub struct MeetingDetectionSettings {
     /// Also raise a native OS notification (handled on the frontend) in
     /// addition to the in-app prompt.
     pub notify: bool,
+    /// Unqualified read-only macOS AX candidate. Separate explicit opt-in.
+    #[serde(default)]
+    pub discord_automation: bool,
+    /// Explicit Zoom capture opt-in; observation alone never authorizes capture.
+    #[serde(default)]
+    pub zoom_automation: bool,
 }
 
 impl Default for MeetingDetectionSettings {
@@ -45,6 +48,8 @@ impl Default for MeetingDetectionSettings {
             meeting_apps: default_meeting_apps(),
             ignored_apps: Vec::new(),
             notify: true,
+            discord_automation: false,
+            zoom_automation: false,
         }
     }
 }
@@ -123,6 +128,49 @@ fn save_settings_to_disk(settings: &MeetingDetectionSettings) -> Result<(), Stri
     std::fs::write(&path, json).map_err(|e| e.to_string())
 }
 
+fn source_automation_enabled(settings: Option<&MeetingDetectionSettings>, source: &str) -> bool {
+    if MONITOR_PAUSED.load(Ordering::SeqCst) { return false; }
+    settings.is_some_and(|s| s.enabled && match source {
+        "zoom" => s.zoom_automation
+            && s.meeting_apps.iter().any(|app| app.trim().eq_ignore_ascii_case("zoom"))
+            && !s.ignored_apps.iter().any(|app| ["zoom", "zoom.us", "us.zoom.xos"].contains(&app.trim().to_lowercase().as_str())),
+        "discord" => s.discord_automation && !s.ignored_apps.iter()
+            .any(|app| !app.trim().is_empty() && "discord".contains(&app.trim().to_lowercase())),
+        _ => false,
+    })
+}
+
+pub(crate) fn zoom_automation_enabled() -> bool {
+    source_automation_enabled(SETTINGS.lock().unwrap().as_ref(), "zoom")
+}
+pub(crate) fn discord_automation_enabled() -> bool {
+    source_automation_enabled(SETTINGS.lock().unwrap().as_ref(), "discord")
+}
+
+/// Settings -> recording authority is the only lock order. A scan finishing
+/// after source disable must not republish its cached enabled=true permission.
+pub(crate) fn publish_automation_observation(source: &str, qualified: bool,
+    presence: crate::audio::recording_ownership::SourcePresence<'_>) {
+    let settings = SETTINGS.lock().unwrap();
+    crate::audio::recording_ownership::observe_source(source,
+        source_automation_enabled(settings.as_ref(), source), qualified, presence);
+}
+
+fn apply_automation_settings(settings: &MeetingDetectionSettings) -> bool {
+    let mut guard = SETTINGS.lock().unwrap();
+    let restart = settings.enabled && (MONITOR_PAUSED.load(Ordering::SeqCst)
+        || MONITOR_GENERATION.load(Ordering::SeqCst) == 0
+        || !guard.as_ref().is_some_and(|previous| previous.enabled));
+    // Revoke before publishing settings, at the same authority mutex used
+    // by Stop claim. Re-enable cannot restore the current take's authority.
+    for source in ["zoom", "discord"] {
+        crate::audio::recording_ownership::set_source_enabled(source,
+            source_automation_enabled(Some(settings), source));
+    }
+    *guard = Some(settings.clone());
+    restart
+}
+
 /// Payload emitted when a meeting app is detected.
 #[derive(Clone, Serialize)]
 struct MeetingDetectedPayload {
@@ -169,6 +217,8 @@ fn scan_for_meeting_app(settings: &MeetingDetectionSettings) -> Option<(String, 
         .collect();
 
     let is_skipped = |name: &str| -> bool {
+        // Zoom on macOS is owned exclusively by its lifecycle adapter.
+        if cfg!(target_os = "macos") && process_matches_keyword(name, "zoom") { return true; }
         if name.is_empty() || is_self_process(name) {
             return true;
         }
@@ -342,6 +392,7 @@ fn browser_title_is_meeting(title: &str) -> bool {
 /// -> ["webexmta"] — while rejecting keywords buried mid-word like the Steam
 /// service.
 fn process_matches_keyword(process_name: &str, keyword: &str) -> bool {
+    if process_name.to_lowercase().contains("discord") { return false; }
     process_name
         .split(|c: char| !c.is_ascii_alphanumeric())
         .any(|token| !token.is_empty() && token.starts_with(keyword))
@@ -350,6 +401,13 @@ fn process_matches_keyword(process_name: &str, keyword: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{is_self_process, process_matches_keyword};
+
+    #[test]
+    fn discord_never_uses_generic_process_or_media_fallback() {
+        assert!(!process_matches_keyword("Discord", "discord"));
+        assert!(!process_matches_keyword("Discord Helper", "disc"));
+        assert!(!process_matches_keyword("Discord.exe", "discord"));
+    }
 
     #[test]
     fn never_treats_meetily_as_a_meeting() {
@@ -388,6 +446,7 @@ mod tests {
 
 /// Start (or restart) the background monitor with the given settings.
 fn start_monitor<R: Runtime>(app: &AppHandle<R>) {
+    MONITOR_PAUSED.store(false, Ordering::SeqCst);
     // A generation token prevents an old sleeping loop from reviving after a restart.
     let generation = MONITOR_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
 
@@ -395,6 +454,7 @@ fn start_monitor<R: Runtime>(app: &AppHandle<R>) {
         let guard = SETTINGS.lock().unwrap();
         guard.clone().unwrap_or_default()
     };
+    let _ = app.emit("meeting-lifecycle", lifecycle::suspend(settings.enabled));
     if !settings.enabled {
         log::info!("Meeting detection disabled; monitor not started");
         return;
@@ -422,11 +482,28 @@ fn start_monitor<R: Runtime>(app: &AppHandle<R>) {
             }
 
             let scan_settings = current.clone();
-            let scan = match tokio::task::spawn_blocking(move || scan_for_meeting_app(&scan_settings)).await {
+            let (scan, zoom_probe) = match tokio::task::spawn_blocking(move || {
+                #[cfg(target_os = "macos")]
+                let zoom = Some(lifecycle::scan_zoom(&scan_settings));
+                #[cfg(not(target_os = "macos"))]
+                let zoom: Option<evidence::Probe> = None;
+                (scan_for_meeting_app(&scan_settings), zoom)
+            }).await {
                 Ok(scan) => scan,
-                Err(error) => { log::warn!("Meeting detection scan failed: {error}"); None }
+                Err(error) => {
+                    log::warn!("Meeting detection scan failed: {error}");
+                    let probe = cfg!(target_os = "macos").then_some(evidence::Probe {
+                        presence: evidence::Presence::Unknown, reason: "scan_failed",
+                    });
+                    (None, probe)
+                }
             };
             if MONITOR_GENERATION.load(Ordering::SeqCst) != generation { break; }
+            if let Some(probe) = zoom_probe {
+                if let Some(snapshot) = lifecycle::observe_zoom(probe, generation) {
+                    let _ = app.emit("meeting-lifecycle", snapshot);
+                }
+            }
             // A process-only fallback must not keep a formerly active meeting
             // alive after its microphone lease ends while the app stays open.
             let scan = match (alerted.as_ref(), scan) {
@@ -462,7 +539,8 @@ fn start_monitor<R: Runtime>(app: &AppHandle<R>) {
                 }
             }
 
-            let interval = current.interval_secs.clamp(3, 3600);
+            // Candidate Zoom timing is fixed, not the legacy offer interval.
+            let interval = if cfg!(target_os = "macos") { 3 } else { current.interval_secs.clamp(3, 3600) };
             tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
         }
 
@@ -474,10 +552,7 @@ fn start_monitor<R: Runtime>(app: &AppHandle<R>) {
 /// if the user had it enabled.
 pub fn initialize<R: Runtime>(app: &AppHandle<R>) {
     let settings = load_settings_from_disk();
-    {
-        let mut guard = SETTINGS.lock().unwrap();
-        *guard = Some(settings.clone());
-    }
+    apply_automation_settings(&settings);
     if settings.enabled {
         start_monitor(app);
     }
@@ -503,16 +578,17 @@ pub async fn set_meeting_detection_settings<R: Runtime>(
     settings.interval_secs = settings.interval_secs.clamp(3, 3600);
 
     save_settings_to_disk(&settings)?;
-    {
-        let mut guard = SETTINGS.lock().unwrap();
-        *guard = Some(settings.clone());
-    }
+    let restart = apply_automation_settings(&settings);
 
-    // Apply immediately: (re)start or stop the monitor.
+    // The worker reads live settings each poll. Restarting for Discord-only,
+    // notification or interval changes would suspend/revoke an unrelated Zoom
+    // take. Actual enable/resume and explicit restart still suspend normally.
     if settings.enabled {
-        start_monitor(&app);
+        if restart { start_monitor(&app); }
     } else {
         MONITOR_GENERATION.fetch_add(1, Ordering::SeqCst);
+        crate::audio::recording_ownership::set_meeting_automation_enabled(false);
+        let _ = app.emit("meeting-lifecycle", lifecycle::suspend(false));
     }
     Ok(())
 }
@@ -526,7 +602,16 @@ pub async fn start_meeting_detection<R: Runtime>(app: AppHandle<R>) -> Result<()
 
 /// Manually stop the monitor.
 #[tauri::command]
-pub async fn stop_meeting_detection() -> Result<(), String> {
+pub async fn stop_meeting_detection<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
+    {
+        let _settings = SETTINGS.lock().unwrap();
+        for source in ["zoom", "discord"] { crate::audio::recording_ownership::set_source_enabled(source, false); }
+        // Publish pause only after revocation, and prevent an in-progress scan
+        // from restoring cached permissions between those two operations.
+        MONITOR_PAUSED.store(true, Ordering::SeqCst);
+    }
     MONITOR_GENERATION.fetch_add(1, Ordering::SeqCst);
+    crate::audio::recording_ownership::set_meeting_automation_enabled(false);
+    let _ = app.emit("meeting-lifecycle", lifecycle::suspend(false));
     Ok(())
 }

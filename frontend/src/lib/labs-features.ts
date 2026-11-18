@@ -40,6 +40,7 @@ export async function setLabsFeature(feature: LabsFeature, value: boolean): Prom
           await invoke('set_meeting_detection_settings', { settings: { ...detection, enabled: true } });
         }
       }
+      await invoke('set_meeting_automation_enabled', { enabled: value });
       break;
     case 'whisperSilenceGuard':
       await invoke('set_whisper_strict_silence', { enabled: value });

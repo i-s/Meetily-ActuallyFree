@@ -11,6 +11,9 @@ import { X } from 'lucide-react'
 import "sonner/dist/styles.css"
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { usePathname, useRouter } from 'next/navigation'
+import { createDiscordAutomation, type DiscordCallStatus } from '@/lib/discord-automation'
+import { recoverAutomatedStart } from '@/lib/recording-start-recovery'
+import { AUTOMATION_CHANGED_EVENT } from '@/lib/meeting-automation'
 import { launchRecording, requestRecordingStop } from '@/lib/recording-launch'
 import { listen, UnlistenFn } from '@tauri-apps/api/event'
 import { invoke } from '@tauri-apps/api/core'
@@ -29,8 +32,9 @@ import { UpdateCheckProvider } from '@/components/UpdateCheckProvider'
 import { RecordingPostProcessingProvider } from '@/contexts/RecordingPostProcessingProvider'
 import { ImportDialogProvider } from '@/contexts/ImportDialogContext'
 import { isAudioExtension, getAudioFormatsDisplayList } from '@/constants/audioFormats'
-import { loadLabsPreferences } from '@/lib/labs'
-import { automatedRecording, endAutomatedRecording, markAutomatedStart } from '@/lib/meeting-automation'
+import { LABS_CHANGED_EVENT, loadLabsPreferences } from '@/lib/labs'
+import { createLifecycleAutomation, type LifecycleSnapshot } from '@/lib/meeting-lifecycle'
+import { automatedStartInProgress, automatedRecording, endAutomatedRecording, markAutomatedStart, type AutomatedCall } from '@/lib/meeting-automation'
 import { getPendingCrashReport, type PendingCrashReport } from '@/services/crashReportService'
 import { WorkspaceProvider } from '@/contexts/WorkspaceContext'
 import { RouteWarmup } from '@/components/RouteWarmup'
@@ -153,7 +157,7 @@ export default function RootLayout({
   const pathname = usePathname()
   const router = useRouter()
   // Tray, notification and meeting-detection starts work from any page.
-  const startRecordingAnywhere = useRef<() => void>(() => undefined)
+  const startRecordingAnywhere = useRef<(automated?: AutomatedCall) => void>(() => undefined)
   const isMinibar = (pathname ?? '').startsWith('/minibar')
   const [showOnboarding, setShowOnboarding] = useState(false)
   const [onboardingCompleted, setOnboardingCompleted] = useState(false)
@@ -164,9 +168,9 @@ export default function RootLayout({
   const [pendingCrashReport, setPendingCrashReport] = useState<PendingCrashReport | null>(null)
   const [recordingNoticeAcknowledged, setRecordingNoticeAcknowledged] = useState(false)
   const acknowledgeRecordingNotice = useCallback(() => setRecordingNoticeAcknowledged(true), [])
-  startRecordingAnywhere.current = () => {
+  startRecordingAnywhere.current = (automated) => {
     if (!recordingNoticeAcknowledged) return
-    launchRecording((href) => router.push(href))
+    launchRecording((href) => router.push(href), automated ? { automated } : {})
   }
 
   // Import audio state
@@ -306,33 +310,69 @@ export default function RootLayout({
     };
   }, [startupResolved, startupError, pendingCrashReport]);
 
-  // Meeting Detection: prompt to start recording when a meeting app is detected.
-  // With Labs meeting automation on, a call that is using the microphone or
-  // camera starts a recording instead, and that recording stops when the call
-  // ends. The compact bar's window never starts or stops recordings.
+  // One shared native settlement owner. Source workers never clear a dispatched
+  // ticket from an idle snapshot, and reload does not lose its exact tuple.
+  useEffect(() => {
+    if (!startupResolved || startupError || pendingCrashReport || isMinibar || !recordingNoticeAcknowledged) return;
+    const recover = () => { void recoverAutomatedStart().catch(error => console.error('Automation remains fenced:', error)); };
+    const subscriptions = ['recording-started', 'recording-stopped'].map(name => listen(name, recover));
+    window.addEventListener(AUTOMATION_CHANGED_EVENT, recover);
+    void Promise.all(subscriptions).then(recover);
+    return () => {
+      window.removeEventListener(AUTOMATION_CHANGED_EVENT, recover);
+      subscriptions.forEach(subscription => { void subscription.then(unlisten => unlisten()); });
+    };
+  }, [startupResolved, startupError, pendingCrashReport, isMinibar, recordingNoticeAcknowledged]);
+
+  // Source lifecycle automation is separate from legacy running-app offers.
+  // Only the main WebView owns recorder routing; the compact bar never starts
+  // or stops a take. Native snapshots retain sessions across route changes.
   useEffect(() => {
     if (!startupResolved || startupError || pendingCrashReport || isMinibar || !recordingNoticeAcknowledged) return
+    const syncAutomation = () => {
+      void invoke('set_meeting_automation_enabled', { enabled: loadLabsPreferences().meetingAutomation && !showOnboarding })
+        .catch(error => console.error('Could not synchronize native automation authority:', error));
+    };
+    syncAutomation();
+    window.addEventListener(LABS_CHANGED_EVENT, syncAutomation);
+    const lifecycle = createLifecycleAutomation({
+      enabled: () => loadLabsPreferences().meetingAutomation && !showOnboarding,
+      state: () => invoke('get_recording_state'),
+      start: (call) => startRecordingAnywhere.current(call),
+      stop: (expected) => requestRecordingStop((href) => router.push(href), expected),
+      error: (error) => toast.error('Meeting automation failed', { description: String(error) }),
+      conflict: (app) => toast.info(`${app} call detected while the recorder is busy`, {
+        description: 'The existing take keeps its owner. No second recording was started.',
+      }),
+    });
+    window.addEventListener(AUTOMATION_CHANGED_EVENT, lifecycle.recordingChanged);
+    const unlistenLifecycle = listen<LifecycleSnapshot>('meeting-lifecycle', event => lifecycle.accept(event.payload));
+    // Subscribe before fetching, and reject stale revisions if a probe races it.
+    void unlistenLifecycle.then(() => invoke<LifecycleSnapshot>('get_meeting_lifecycle_snapshot'))
+      .then(snapshot => lifecycle.accept(snapshot))
+      .catch(error => console.error('Could not read meeting lifecycle:', error));
     const unlisten = listen<{ app: string; process: string; notify: boolean; active_media: boolean }>(
       'meeting-detected',
       (event) => {
         const { app, notify, active_media, process } = event.payload;
         console.log('[Layout] meeting-detected:', event.payload);
 
-        const startRecording = () => {
+        const startRecording = (automated?: AutomatedCall) => {
           if (showOnboarding) {
             toast.error('Please complete setup first', {
               description: 'Finish onboarding before you can start recording.',
             });
             return;
           }
-          startRecordingAnywhere.current();
+          startRecordingAnywhere.current(automated);
         };
 
         if (loadLabsPreferences().meetingAutomation && active_media && !showOnboarding) {
           void invoke<{ is_recording?: boolean }>('get_recording_state').then((state) => {
-            if (state.is_recording) return;
-            markAutomatedStart({ app, process });
-            startRecording();
+            if (!loadLabsPreferences().meetingAutomation || state.is_recording || automatedStartInProgress()) return;
+            const call = { app, process };
+            if (markAutomatedStart(call)) startRecording(call);
+            else toast.error('Meeting automation could not reserve the recorder');
           }).catch((error) => console.error('Could not check recording state for meeting automation:', error));
           return;
         }
@@ -351,7 +391,7 @@ export default function RootLayout({
           duration: 20000,
           action: {
             label: 'Start recording',
-            onClick: startRecording,
+            onClick: () => startRecording(),
           },
         });
       }
@@ -371,14 +411,17 @@ export default function RootLayout({
     // Only a recording that automation started for this same call is stopped.
     const unlistenEnd = listen<{ app: string; process: string }>('meeting-ended', (event) => {
       const call = automatedRecording();
+      if (call?.sessionId) return; // lifecycle-owned calls never follow legacy process disappearance
       if (!call || call.process !== event.payload.process || !loadLabsPreferences().meetingAutomation) return;
-      void invoke<{ is_recording?: boolean }>('get_recording_state').then((state) => {
+      void invoke<import('@/lib/native-recording').NativeRecordingState>('get_recording_state').then((state) => {
+        if (!loadLabsPreferences().meetingAutomation) return;
         if (!state.is_recording) {
-          endAutomatedRecording();
+          endAutomatedRecording(call);
           return;
         }
-        toast(`${call.app} call ended`, { description: 'Meeting automation is stopping and saving the recording.' });
-        requestRecordingStop((href) => router.push(href));
+        if (call.recordingLease && state.recording_lease?.generation === call.recordingLease.generation) {
+          requestRecordingStop((href) => router.push(href), call.recordingLease);
+        }
       }).catch((error) => console.error('Could not check recording state for meeting automation:', error));
     });
 
@@ -386,8 +429,35 @@ export default function RootLayout({
       unlisten.then((fn) => fn());
       unlistenStart.then((fn) => fn());
       unlistenEnd.then((fn) => fn());
+      lifecycle.dispose();
+      window.removeEventListener(AUTOMATION_CHANGED_EVENT, lifecycle.recordingChanged);
+      window.removeEventListener(LABS_CHANGED_EVENT, syncAutomation);
+      unlistenLifecycle.then((fn) => fn());
     };
   }, [showOnboarding, startupResolved, startupError, pendingCrashReport, isMinibar, router, recordingNoticeAcknowledged]);
+
+  // Discord has separate typed evidence/session events: do not translate AX
+  // Unknown into generic media inactivity, or couple this to the Zoom adapter.
+  useEffect(() => {
+    if (!startupResolved || startupError || pendingCrashReport || isMinibar || !recordingNoticeAcknowledged || showOnboarding) return;
+    const bridge = createDiscordAutomation({
+      allowed: () => loadLabsPreferences().meetingAutomation,
+      status: () => invoke<DiscordCallStatus>('get_discord_automation_status'),
+      recording: () => invoke<{ is_recording?: boolean }>('get_recording_state'),
+      start: (call) => startRecordingAnywhere.current(call),
+      stop: (expected) => requestRecordingStop((href) => router.push(href), expected),
+      error: (error) => console.error('Discord automation:', error),
+    });
+    const unlisten = listen<DiscordCallStatus>('discord-call-state', (event) => bridge.update(event.payload));
+    void unlisten.then(() => invoke<DiscordCallStatus>('get_discord_automation_status'))
+      .then((status) => bridge.update(status)).catch((error) => console.error('Discord status unavailable:', error));
+    window.addEventListener(AUTOMATION_CHANGED_EVENT, bridge.recordingChanged);
+    return () => {
+      bridge.dispose();
+      window.removeEventListener(AUTOMATION_CHANGED_EVENT, bridge.recordingChanged);
+      void unlisten.then((fn) => fn());
+    };
+  }, [startupResolved, startupError, pendingCrashReport, isMinibar, recordingNoticeAcknowledged, showOnboarding, router]);
 
   // Handle file drop for audio import
   const handleFileDrop = useCallback((paths: string[]) => {
