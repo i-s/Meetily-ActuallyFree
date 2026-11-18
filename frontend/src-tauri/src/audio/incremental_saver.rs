@@ -314,14 +314,21 @@ fn recover_recording_audio(folder: &std::path::Path) -> Result<AudioRecoveryStat
 
 #[tauri::command]
 pub async fn recover_audio_from_checkpoints(meeting_folder: String, _sample_rate: u32) -> Result<AudioRecoveryStatus, String> {
-    tokio::task::spawn_blocking(move || recover_recording_audio(std::path::Path::new(&meeting_folder)))
-        .await.map_err(|e| e.to_string())?
+    // Recovery can read finalized tracks too. Share offline admission with
+    // cleanup until the blocking recovery worker has actually drained.
+    let operation = crate::diarization::operation_guard().await;
+    tokio::task::spawn_blocking(move || {
+        let _operation = operation;
+        recover_recording_audio(std::path::Path::new(&meeting_folder))
+    }).await.map_err(|e| e.to_string())?
 }
 
 /// Startup detection includes validated finalized audio, not just checkpoints.
 #[tauri::command]
 pub async fn has_recoverable_audio(meeting_folder: String) -> Result<bool, String> {
+    let operation = crate::diarization::operation_guard().await;
     tokio::task::spawn_blocking(move || {
+        let _operation = operation;
         let folder = PathBuf::from(meeting_folder);
         if finalized_mixed_audio(&folder)?.is_some() { return Ok(true); }
         let root = folder.join(".checkpoints");
@@ -334,7 +341,9 @@ pub async fn has_recoverable_audio(meeting_folder: String) -> Result<bool, Strin
 /// This command is called by the frontend after successful save to clean up checkpoint files
 #[tauri::command]
 pub async fn cleanup_checkpoints(meeting_folder: String) -> Result<(), String> {
+    let operation = crate::diarization::operation_guard().await;
     tokio::task::spawn_blocking(move || {
+        let _operation = operation;
         let folder = PathBuf::from(meeting_folder);
         let root = folder.join(".checkpoints");
         for track in ["audio", "mic", "system"] {

@@ -12,6 +12,7 @@ mock.module('@/contexts/WorkspaceContext', () => ({ useWorkspace: () => ({ group
 mock.module('@/contexts/ImportDialogContext', () => ({ useImportDialog: () => ({ openImportDialog() {} }) }));
 let held: ((value: any) => void) | null = null;
 let fail = false;
+mock.module('@tauri-apps/api/event', () => ({ listen: async () => () => {} }));
 mock.module('@tauri-apps/api/core', () => ({ invoke: async (command: string, args: any) => {
   if (command === 'api_library_materials') return source.map((meeting, i) => ({ id: meeting.id, hasNotes: i === 0, transcriptCount: 0, hasSummary: false, summaryStatus: null, audioAvailable: false }));
   if (command === 'api_search_library') {
@@ -21,7 +22,7 @@ mock.module('@tauri-apps/api/core', () => ({ invoke: async (command: string, arg
   }
   throw new Error(command);
 } }));
-mock.module('@/lib/workspace-api', () => ({ onWorkspaceChange: () => () => {} }));
+mock.module('@/lib/workspace-api', () => ({ onWorkspaceChange: () => () => {}, announceChange() {} }));
 mock.module('@/lib/meeting-actions', () => ({ deleteMeetings() {}, moveMeetingsToGroup() {}, renameMeeting() {} }));
 const Wrap = ({ children }: any) => <div>{children}</div>;
 mock.module('@/components/ui/button', () => ({ Button: ({ children, ...props }: any) => <button {...props}>{children}</button> }));

@@ -9,6 +9,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { convertFileSrc } from '@tauri-apps/api/core';
 import { getMeetingAudio } from '@/lib/workspace-api';
+import { useSavedAudioRevision } from '@/hooks/useSavedAudioRevision';
 
 export type AudioStatus = 'loading' | 'ready' | 'unavailable' | 'error';
 
@@ -33,6 +34,7 @@ export const PLAYBACK_RATES = [1, 1.25, 1.5, 1.75, 2];
 export const SLOW_PLAYBACK_RATES = [0.5, 0.75, ...PLAYBACK_RATES];
 
 export function useMeetingAudio(meetingId: string | null | undefined): MeetingAudioControls {
+  const savedAudioRevision = useSavedAudioRevision();
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const frame = useRef<number | null>(null);
   const [status, setStatus] = useState<AudioStatus>('loading');
@@ -87,7 +89,7 @@ export function useMeetingAudio(meetingId: string | null | undefined): MeetingAu
       }
       audioRef.current = null;
     };
-  }, [meetingId]);
+  }, [meetingId, savedAudioRevision]);
 
   // Smooth clock while playing.
   useEffect(() => {

@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { libraryMaterials, searchLibrary, type LibraryMaterial } from '@/lib/library-api';
 import { onWorkspaceChange } from '@/lib/workspace-api';
 import type { GlobalSearchResult } from '@/types';
+import { useSavedAudioRevision } from '@/hooks/useSavedAudioRevision';
 
 /** A result belongs to the exact query generation, not just the latest request
  * to finish. No live transcript/chat state is read or written here. */
@@ -30,6 +31,7 @@ export function useLibrarySearch(query: string) {
 }
 
 export function useLibraryMaterials() {
+  const savedAudioRevision = useSavedAudioRevision();
   const [materials, setMaterials] = useState<Map<string, LibraryMaterial>>(new Map());
   const [error, setError] = useState<string | null>(null);
   const [revision, setRevision] = useState(0);
@@ -50,6 +52,6 @@ export function useLibraryMaterials() {
     const stop = onWorkspaceChange(['notes', 'meetings'], changed);
     window.addEventListener('focus', changed);
     return () => { active = false; ++generation; stop(); window.removeEventListener('focus', changed); };
-  }, [revision]);
+  }, [revision, savedAudioRevision]);
   return { materials, error, retry: () => setRevision(value => value + 1) };
 }

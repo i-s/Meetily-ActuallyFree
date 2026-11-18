@@ -37,6 +37,8 @@ pub mod analytics;
 pub mod api;
 pub mod app_update;
 pub mod audio;
+mod audio_cleanup;
+mod audio_cleanup_commands;
 pub mod claude_cli;
 pub mod config;
 pub mod console_utils;
@@ -779,6 +781,9 @@ pub fn run() {
             anthropic::anthropic::get_anthropic_models,
             groq::groq::get_groq_models,
             api::api_get_meetings,
+            audio_cleanup_commands::api_audio_storage,
+            audio_cleanup_commands::api_prepare_audio_cleanup,
+            audio_cleanup_commands::api_confirm_audio_cleanup,
             database::library_commands::api_library_materials,
             database::library_commands::api_search_library,
             database::library_commands::api_export_meeting_snapshot,

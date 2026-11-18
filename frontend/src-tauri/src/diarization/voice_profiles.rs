@@ -342,6 +342,9 @@ async fn meeting_share(
     speaker: &str,
 ) -> Result<(String, String, VoiceSource), EnrollError> {
     use EnrollError::{Meeting, Unavailable};
+    // Enrollment reads saved source audio on a blocking worker. Keep the same
+    // offline admission as refinement/recovery through its awaited completion.
+    let operation = super::operation_guard().await;
     let failed = |error: sqlx::Error| Meeting(error.to_string());
     if !enabled() {
         return Err(Unavailable("Turn on Voice profiles in Settings > Labs first.".into()));
@@ -404,7 +407,10 @@ async fn meeting_share(
     if turns.is_empty() {
         return Err(no_clear_turn());
     }
-    let vectors = tokio::task::spawn_blocking(move || embed_turns(&track, &turns))
+    let vectors = tokio::task::spawn_blocking(move || {
+        let _operation = operation;
+        embed_turns(&track, &turns)
+    })
         .await.map_err(|error| Meeting(error.to_string()))?.map_err(|error| Meeting(error.to_string()))?;
     if vectors.is_empty() {
         return Err(no_clear_turn());

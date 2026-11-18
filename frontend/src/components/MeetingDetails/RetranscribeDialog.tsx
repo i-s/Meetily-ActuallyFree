@@ -26,6 +26,7 @@ import { useRouter } from 'next/navigation';
 import { LANGUAGES } from '@/constants/languages';
 import { useTranscriptionModels, ModelOption } from '@/hooks/useTranscriptionModels';
 import Analytics from '@/lib/analytics';
+import { useSavedAudioRevision } from '@/hooks/useSavedAudioRevision';
 import { announceChange } from '@/lib/workspace-api';
 
 interface RetranscribeDialogProps {
@@ -84,6 +85,15 @@ export function RetranscribeDialog({
   const [isClearingMeetingVocabulary, setIsClearingMeetingVocabulary] = useState(false);
   const [listenersReady, setListenersReady] = useState(false);
   const [audioAvailable, setAudioAvailable] = useState(false);
+  const savedAudioRevision = useSavedAudioRevision();
+  useEffect(() => {
+    let active = true;
+    setAudioAvailable(false);
+    if (open) void invoke<{ audio_available: boolean }>('list_transcript_versions', { meetingId })
+      .then(state => { if (active) setAudioAvailable(state.audio_available); })
+      .catch(cause => { if (active) setError(`Cannot check saved audio: ${String(cause)}`); });
+    return () => { active = false; };
+  }, [open, meetingId, savedAudioRevision]);
 
   // Use centralized model fetching hook
   const {
@@ -137,10 +147,6 @@ export function RetranscribeDialog({
     prevOpenRef.current = open;
 
     if (open && !wasOpen) {
-      setAudioAvailable(false);
-      void invoke<{ audio_available: boolean }>('list_transcript_versions', { meetingId })
-        .then((state) => setAudioAvailable(state.audio_available))
-        .catch((cause) => setError(`Cannot check saved audio: ${String(cause)}`));
       resetSelection();
       setIsProcessing(false);
       setProgress(null);

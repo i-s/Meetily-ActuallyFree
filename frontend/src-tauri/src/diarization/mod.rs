@@ -786,11 +786,15 @@ pub async fn diarize_recording(
     threshold: Option<f32>,
     engine: Option<String>,
 ) -> Result<DiarizationResult, String> {
+    let operation = operation_guard().await;
     let path = PathBuf::from(&audio_path);
     let selected_engine = engine.unwrap_or_else(get_active_engine);
     if !matches!(selected_engine.as_str(), "pyannote" | "nemotron") { return Err("Unknown diarization engine".into()); }
     // Model inference is CPU-heavy; keep it off the async runtime's core threads.
-    tokio::task::spawn_blocking(move || diarize_file_with_engine(&path, &selected_engine, num_speakers, threshold))
+    tokio::task::spawn_blocking(move || {
+        let _operation = operation;
+        diarize_file_with_engine(&path, &selected_engine, num_speakers, threshold)
+    })
         .await
         .map_err(|e| format!("Diarization task failed: {}", e))?
         .map_err(|e| {

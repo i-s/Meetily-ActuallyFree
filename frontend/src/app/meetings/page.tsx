@@ -50,6 +50,7 @@ import {
 import { createGroupFromPicker, GroupChip, GroupDot, groupOptions } from '@/components/groups/GroupBits';
 import { openGroupEditor } from '@/components/groups/GroupEditor';
 import { ExportMeetingsDialog } from '@/components/meetings/ExportMeetingsDialog';
+import { AudioStorage } from '@/components/meetings/AudioStorage';
 import { dateSection, formatDuration, parseDate } from '@/lib/dates';
 import { displayTitle } from '@/lib/meeting-titles';
 import { deleteMeetings, moveMeetingsToGroup, renameMeeting } from '@/lib/meeting-actions';
@@ -270,6 +271,8 @@ export default function MeetingsPage() {
             </Button>
           }
         />
+
+        <AudioStorage />
 
         <div className="mt-6 flex flex-wrap items-center gap-2">
           <div className="relative min-w-[14rem] flex-1">

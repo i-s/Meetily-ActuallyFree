@@ -113,6 +113,18 @@ VAD boundaries, ASR time, and queue load also contribute. Timeline lookup waits
 at most 1.5 s; history is limited to ten minutes. Missing/failed results retain
 source labels rather than guessing a speaker or switching engines.
 
+## Audio retention and explicit cleanup
+
+[ISSUE19_AUDIO_CLEANUP.md](ISSUE19_AUDIO_CLEANUP.md) owns the normal library's
+storage observation, unchecked audio selection, expiring one-shot native consent,
+exact final-track unlink scope, partial outcomes and retained text/queue data.
+Read it before changing audio removal. Cleanup shares offline-operation and
+recording lifecycle admission, then rechecks job/version ownership under a SQLite
+write reservation. Recovery/direct diarization/voice enrollment retain offline
+admission through their awaited file readers. `audio-cleanup-finished` invalidates
+open playback, library and retranscription availability, not saved text. Generated
+fixture tests do not qualify physical Mac storage/IPC/playback or deletion latency.
+
 ## 3. Post-call processing and model selection
 
 Issue #14's local ASR + diarization candidate workflow, immutable live/refined/

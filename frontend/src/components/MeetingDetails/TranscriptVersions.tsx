@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { Button } from '@/components/ui/button';
+import { useSavedAudioRevision } from '@/hooks/useSavedAudioRevision';
 
 type Segment = { id: string; text: string; speaker?: string; audio_start_time?: number };
 type Version = { id: string; kind: string; status: string; created_at: string; error?: string; settings_json: string; summary_json?: string };
@@ -35,7 +36,8 @@ export function TranscriptVersions({ meetingId, onChanged, onBeforeChange }: {
       setError(null);
     } catch (cause) { setError(String(cause)); }
   }, [meetingId]);
-  useEffect(() => { void refresh(); }, [refresh]);
+  const savedAudioRevision = useSavedAudioRevision();
+  useEffect(() => { void refresh(); }, [refresh, savedAudioRevision]);
 
   const inspect = async (version: Version) => {
     if (!data) return;

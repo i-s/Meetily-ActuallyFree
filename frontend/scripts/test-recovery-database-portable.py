@@ -18,6 +18,8 @@ REPOSITORY = ROOT / 'frontend/src-tauri/src/database/repositories/transcript.rs'
 
 
 def main():
+    diarization = (ROOT / "frontend/src-tauri/src/diarization/mod.rs").read_text()
+    offline_guard = diarization[diarization.index("static OPERATION_LOCK:"):diarization.index("/// Record where the bundled")]
     lock = tomllib.loads((ROOT / 'Cargo.lock').read_text())
     names = ('sqlx', 'chrono', 'tokio', 'uuid', 'tracing', 'sha2', 'anyhow', 'log', 'serde', 'serde_json', 'tempfile', 'bytemuck')
     versions = {n: next(p['version'] for p in lock['package'] if p['name'] == n) for n in names}
@@ -61,6 +63,7 @@ serde={{version="={versions['serde']}",features=["derive"]}}
         person_methods = '\n'.join(person_method(name) for name in ('link_named_speakers', 'reconcile_speaker_identity'))
         (work / 'src/lib.rs').write_text(f'''#![allow(dead_code)]
 extern crate self as tauri;
+mod diarization {{ {offline_guard} }}
 pub trait Runtime {{}}
 impl Runtime for () {{}}
 pub struct AppHandle<R:Runtime>(pub std::marker::PhantomData<R>);

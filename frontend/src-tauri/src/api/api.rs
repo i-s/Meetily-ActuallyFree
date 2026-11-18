@@ -1235,6 +1235,11 @@ pub async fn api_save_transcript<R: Runtime>(
     );
 
     let pool = state.db_manager.pool();
+    // A recovery save may validate finalized audio before associating its
+    // folder. Retain offline ownership through both validation and DB save.
+    let mut recovery_audio_guard = if recovery_id.is_some() {
+        Some(crate::diarization::operation_guard().await)
+    } else { None };
     let supplied_recording_start = recording_started_at.as_deref().and_then(|value| {
         match DateTime::parse_from_rfc3339(value) {
             Ok(timestamp) => Some(timestamp.with_timezone(&Utc)),
@@ -1253,10 +1258,14 @@ pub async fn api_save_transcript<R: Runtime>(
     // not merely an arbitrary folder or the existence of checkpoint filenames.
     if recovery_id.is_some() && !transcripts_to_save.iter().any(|segment| !segment.text.trim().is_empty()) {
         let folder = folder_path.clone().ok_or("Audio-only recovery has no recording folder")?;
-        let valid = tokio::task::spawn_blocking(move || {
-            crate::audio::incremental_saver::validated_final_audio_available(std::path::Path::new(&folder))
-        }).await.map_err(|e| e.to_string())??;
-        if !valid { return Err("Audio-only recovery requires validated recorded audio; no empty meeting was created".into()); }
+        let guard = recovery_audio_guard.take();
+        let (valid, guard) = tokio::task::spawn_blocking(move || {
+            // The worker, not its possibly abandoned IPC waiter, owns admission.
+            let valid = crate::audio::incremental_saver::validated_final_audio_available(std::path::Path::new(&folder));
+            (valid, guard)
+        }).await.map_err(|e| e.to_string())?;
+        recovery_audio_guard = guard;
+        if !valid? { return Err("Audio-only recovery requires validated recorded audio; no empty meeting was created".into()); }
     }
     let saved = if let Some(key) = recovery_id.as_deref() {
         TranscriptsRepository::save_recovered_transcript(pool, &meeting_title, &transcripts_to_save,
@@ -1265,6 +1274,7 @@ pub async fn api_save_transcript<R: Runtime>(
         TranscriptsRepository::save_transcript(pool, &meeting_title, &transcripts_to_save,
             folder_path, recording_started_at).await
     };
+    drop(recovery_audio_guard);
     match saved
     {
         Ok(meeting_id) => {

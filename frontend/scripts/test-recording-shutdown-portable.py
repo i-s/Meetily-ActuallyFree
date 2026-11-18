@@ -20,6 +20,8 @@ AUDIO = REPO / "frontend/src-tauri/src/audio"
 
 
 def main():
+    diarization = (REPO / "frontend/src-tauri/src/diarization/mod.rs").read_text()
+    offline_guard = diarization[diarization.index("static OPERATION_LOCK:"):diarization.index("/// Record where the bundled")]
     lock = tomllib.loads((REPO / "Cargo.lock").read_text())
     names = ("anyhow", "log", "tokio", "tracing", "serde", "serde_json", "chrono", "tempfile", "bytemuck", "sha2")
     versions = {name: next(p["version"] for p in lock["package"] if p["name"] == name) for name in names}
@@ -43,6 +45,7 @@ def main():
         (work / "src/audio_processing.rs").write_text("use std::path::PathBuf; use anyhow::Result; use chrono::Utc;\n" + folder_functions)
         (work / "src/lib.rs").write_text(f'''#![allow(dead_code)]
 extern crate self as tauri;
+mod diarization {{ {offline_guard} }}
 pub trait Runtime {{}}
 impl Runtime for () {{}}
 pub struct AppHandle<R: Runtime>(pub std::marker::PhantomData<R>);

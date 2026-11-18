@@ -8,6 +8,7 @@ let missingAudio = false;
 let stale = false;
 let changed = 0;
 const version = { id: 'refined', kind: 'refined', status: 'ready', created_at: '2026-11-18T10:00:00Z', settings_json: '{"provider":"whisper"}' };
+mock.module('@tauri-apps/api/event', () => ({ listen: async () => () => {} }));
 mock.module('@tauri-apps/api/core', () => ({ invoke: async (name: string, args: any) => {
   calls.push([name, args]);
   if (name === 'list_transcript_versions') return { selected_id: 'live', revision, audio_available: !missingAudio, versions: [version] };

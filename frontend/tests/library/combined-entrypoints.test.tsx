@@ -82,6 +82,7 @@ const transport=async(name:string,args:any):Promise<any>=>{
  }
  throw new Error(name);
 };
+mock.module('@tauri-apps/api/event', () => ({ listen: async () => () => {} }));
 mock.module('@tauri-apps/api/core',()=>({invoke:transport}));
 const empty=()=>null;
 mock.module('lucide-react',()=>Object.fromEntries(['AlertTriangle','ChevronDown','FileText','Languages','ListChecks','NotebookPen','RefreshCw','Settings2','Sparkles','Square','Wand2','Clipboard','FileJson','FileType','Files','ScrollText','ArrowUpRight','Check','Download','FileAudio','FolderInput','Layers','Library','MoreHorizontal','Pencil','Plus','Search','Trash2','X'].map(name=>[name,empty])));
