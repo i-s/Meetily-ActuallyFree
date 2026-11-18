@@ -1,5 +1,8 @@
 //! Read-only, bounded input for local spelling suggestions. Keep this separate
 //! from #14's complete selected snapshot and its lazy initialization contract.
+use std::sync::LazyLock;
+
+use regex::Regex;
 use serde::Serialize;
 use sqlx::SqlitePool;
 
@@ -59,7 +62,26 @@ pub(crate) fn bounded_text(raw: &str, limit: usize) -> (String, bool) {
     let text: String = chars.by_ref().take(limit).collect();
     let truncated = chars.next().is_some();
     let text = if truncated {
-        text.trim_end_matches(|c: char| c.is_alphanumeric() || c == '-' || c == '_').to_string()
+        match suggestion_tokens().find_iter(&text).last() {
+            Some(token) if token.end() == text.len() => text[..token.start()].to_string(),
+            _ => text,
+        }
     } else { text };
     (text, truncated)
+}
+
+// Marks are continuations, not separators: decomposed spellings must never
+// establish proof for a prefix/suffix. Keep the same L/N/M classes as the UI.
+fn suggestion_tokens() -> &'static Regex {
+    static TOKENS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[\p{L}\p{N}\p{M}_-]+").expect("static suggestion token pattern"));
+    &TOKENS
+}
+
+pub(crate) fn valid_suggestion_term(term: &str) -> bool {
+    static SPELLING: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[\p{L}\p{N}][\p{L}\p{N}\p{M}_-]*$").expect("static suggestion spelling pattern"));
+    term.chars().count() <= 64 && SPELLING.is_match(term)
+}
+
+pub(crate) fn contains_suggestion_token(text: &str, term: &str) -> bool {
+    suggestion_tokens().find_iter(text).any(|token| token.as_str().trim_matches(['-', '_']) == term)
 }

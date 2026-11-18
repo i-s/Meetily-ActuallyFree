@@ -126,3 +126,73 @@ async fn suggestion_proof_does_not_read_or_approve_an_unbounded_row_suffix() {
     assert!(confirm(&s,&c.version_id,c.revision,"row","HiddenAPI").await.is_err());
     assert_eq!(V::approved_global(p).await.unwrap().terms,"OpenAPI");
 }
+
+#[tokio::test]
+async fn r1_combining_marks_never_prove_fragments_but_exact_source_remains_confirmable() {
+    let s=fixture().await; let p=s.db_manager.pool();
+    crate::transcript_versions::selected(p,"m").await.unwrap();
+    V::confirm_global(p,"ExistingAPI").await.unwrap();
+    for (term,fragments) in [("е\u{0308}лкаAPI",vec!["е","лкаAPI"]),("E\u{0308}lkaAPI",vec!["E","lkaAPI"]),("OpenAPI\u{0301}Client",vec!["OpenAPI","Client"])] {
+        sqlx::query("UPDATE transcripts SET transcript=? WHERE id='row'").bind(format!("{term} ControlAPI")).execute(p).await.unwrap();
+        let c=api_get_vocabulary_suggestion_context(crate::State(&s),"m".into()).await.unwrap();
+        let before=V::approved_global(p).await.unwrap();let global=V::get_global(p).await.unwrap();
+        for fragment in fragments {
+            let writes=changes(p).await;
+            let result=confirm(&s,&c.version_id,c.revision,"row",fragment).await;
+            let observed=V::approved_global(p).await.unwrap();
+            assert!(result.is_err(),"fragment {fragment:?} in {term:?}; actual SQLite terms {:?}, revision {} -> {}",observed.terms,before.revision,observed.revision);
+            assert_eq!(changes(p).await,writes);
+            assert_eq!(V::get_global(p).await.unwrap(),global);
+            let after=V::approved_global(p).await.unwrap();assert_eq!(after.terms,before.terms);assert_eq!(after.revision,before.revision);
+        }
+        confirm(&s,&c.version_id,c.revision,"row",term).await.unwrap();
+        confirm(&s,&c.version_id,c.revision,"row","ControlAPI").await.unwrap();
+    }
+    assert_eq!(V::approved_global(p).await.unwrap().terms,"ExistingAPI\nе\u{0308}лкаAPI\nControlAPI\nE\u{0308}lkaAPI\nOpenAPI\u{0301}Client");
+}
+
+#[tokio::test]
+async fn r1_sql_scalar_prefix_clipping_never_leaves_mark_separated_fragment_proof() {
+    let s=fixture().await;let p=s.db_manager.pool();
+    crate::transcript_versions::selected(p,"m").await.unwrap();
+    V::confirm_global(p,"ExistingAPI").await.unwrap();
+    for term in ["е\u{0308}лкаAPI","E\u{0308}lkaAPI","OpenAPI\u{0301}Client","OpenAPI\u{1D165}Client"] {
+        let mark=term.chars().position(|c| ['\u{0308}','\u{0301}','\u{1D165}'].contains(&c)).unwrap();
+        for offset in [0,1,2] {
+            let prefix=" ".repeat(100000-mark-offset);
+            sqlx::query("UPDATE transcripts SET transcript=? WHERE id='row'").bind(format!("{prefix}{term}")).execute(p).await.unwrap();
+            let writes=changes(p).await;
+            let c=api_get_vocabulary_suggestion_context(crate::State(&s),"m".into()).await.unwrap();
+            assert!(c.truncated);assert!(c.segments[0].text_truncated);
+            assert!(c.segments[0].text==prefix,"clipped token retained for {term:?}, offset {offset}");
+            assert_eq!(changes(p).await,writes);
+            let before=V::approved_global(p).await.unwrap();
+            for fragment in ["е","лкаAPI","E","lkaAPI","OpenAPI","Client"] {
+                assert!(confirm(&s,&c.version_id,c.revision,"row",fragment).await.is_err(),"{term:?}/{offset}/{fragment}");
+                assert_eq!(changes(p).await,writes);
+                let after=V::approved_global(p).await.unwrap();assert_eq!(after.terms,before.terms);assert_eq!(after.revision,before.revision);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn r1_all_mark_categories_are_continuations_without_changing_manual_confirmation() {
+    let s=fixture().await;let p=s.db_manager.pool();
+    crate::transcript_versions::selected(p,"m").await.unwrap();
+    for mark in ['\u{0301}','\u{0903}','\u{20DD}','\u{1D165}'] {
+        let term=format!("OpenAPI{mark}Client");
+        sqlx::query("UPDATE transcripts SET transcript=? WHERE id='row'").bind(&term).execute(p).await.unwrap();
+        let c=api_get_vocabulary_suggestion_context(crate::State(&s),"m".into()).await.unwrap();
+        let before=V::approved_global(p).await.unwrap();
+        assert!(confirm(&s,&c.version_id,c.revision,"row","OpenAPI").await.is_err());
+        assert!(confirm(&s,&c.version_id,c.revision,"row","Client").await.is_err());
+        let after=V::approved_global(p).await.unwrap();assert_eq!(after.terms,before.terms);assert_eq!(after.revision,before.revision);
+        confirm(&s,&c.version_id,c.revision,"row",&term).await.unwrap();
+    }
+    // #16 intentionally does not normalize composed/decomposed manual entries.
+    api_confirm_vocabulary_term(crate::State(&s),"е\u{0308}лкаAPI".into()).await.unwrap();
+    api_confirm_vocabulary_term(crate::State(&s),"ёлкаAPI".into()).await.unwrap();
+    let terms=V::approved_global(p).await.unwrap().terms;
+    assert!(terms.lines().any(|t|t=="е\u{0308}лкаAPI"));assert!(terms.lines().any(|t|t=="ёлкаAPI"));
+}

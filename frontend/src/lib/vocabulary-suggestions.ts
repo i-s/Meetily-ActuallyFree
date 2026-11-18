@@ -10,7 +10,7 @@ const MAX_ROWS = 2000;
 const MAX_CHARS = 100_000;
 const MAX_CANDIDATES = 100;
 const MAX_VISIBLE = 5;
-const tokenCharacter = /[\p{L}\p{N}_-]/u;
+const tokenCharacter = /[\p{L}\p{N}\p{M}_-]/u;
 
 /** A spelling finder, not a correctness/identity model. Never changes source
  * text or learns a word. Bounds apply even to a single pathological long line. */
@@ -29,12 +29,14 @@ export function suggestVocabulary(segments: SuggestionSegment[], excluded: Reado
     const text = segment.text.slice(0, cut);
     remaining -= text.length;
     if (text.length < segment.text.length) truncated = true;
-    for (const match of text.matchAll(/[\p{L}\p{N}][\p{L}\p{N}_-]*/gu)) {
+    for (const match of text.matchAll(/[\p{L}\p{N}\p{M}][\p{L}\p{N}\p{M}_-]*/gu)) {
       // Do not turn the cut-off prefix of a long token into a suggested term.
       if (match.index + match[0].length === text.length && text.length < segment.text.length
         && tokenCharacter.test(String.fromCodePoint(segment.text.codePointAt(text.length)!))) continue;
       const term = match[0].replace(/[_-]+$/, '');
-      if (term.length < 2 || term.length > 64) continue;
+      // Consume marks with their token, even at the budget boundary. A leading
+      // mark is unsupported, so skip that whole token rather than its prefix.
+      if (term.length < 2 || term.length > 64 || !/^[\p{L}\p{N}]/u.test(term)) continue;
       const distinctive = /^\p{Lu}{2,}$/u.test(term) || /\p{Ll}\p{Lu}/u.test(term)
         || (/\p{L}/u.test(term) && /\p{N}/u.test(term));
       const key = term.toLowerCase();

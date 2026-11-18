@@ -40,3 +40,24 @@ test('UTF-16 clipping never offers a prefix before or inside a supplementary Uni
     expect(result.candidates).toEqual([]); expect(result.truncated).toBe(true);
   }
 });
+test.each(['ёлкаAPI', 'ËlkaAPI', 'OpenAPÍClient'])('combining marks preserve whole exact source spelling: %s', (term) => {
+  const result=suggestVocabulary(rows(`Обсудили ${term} и ControlAPI.`),new Set());
+  expect(result.candidates.map(c=>c.term)).toEqual([term,'ControlAPI']);
+  expect(result.candidates[0].excerpt).toContain(term);
+});
+test('marks before, at and beyond the UTF-16 budget never expose token fragments', () => {
+  for (const term of ['ёлкаAPI','ËlkaAPI','OpenAPÍClient','OpenAPI\u{1D165}Client']) {
+    const mark=term.search(/\p{M}/u);
+    for (const offset of [0,1,2]) {
+      const result=suggestVocabulary(rows(' '.repeat(100000-mark-offset)+term),new Set());
+      expect(result.candidates).toEqual([]);expect(result.truncated).toBe(true);
+    }
+  }
+});
+test('all Unicode mark categories continue a token, including a leading unsupported mark', () => {
+  for (const mark of ['́','ः','⃝','\u{1D165}']) {
+    const term=`OpenAPI${mark}Client`;
+    expect(suggestVocabulary(rows(term),new Set()).candidates.map(c=>c.term)).toEqual([term]);
+    expect(suggestVocabulary(rows(`${mark}OpenAPI`),new Set()).candidates).toEqual([]);
+  }
+});

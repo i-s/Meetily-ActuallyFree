@@ -76,3 +76,12 @@ test.each(['version','revision'])('a %s-only projection change clears visible an
  await click('Refresh versions');await act(async()=>releaseScan());
  expect(buttons('Запомнить написание')).toHaveLength(0);expect(writes()).toEqual([]);
 });
+test('ordinary meeting controls offer and confirm exact decomposed spellings, never fragments',async()=>{
+ text='ёлкаAPI ËlkaAPI OpenAPÍClient ControlAPI';
+ await mount();await click('Предложить термины');
+ expect(root.root.findAllByType('strong').map(n=>n.props.children)).toEqual(['ёлкаAPI','ËlkaAPI','OpenAPÍClient','ControlAPI']);
+ expect(writes()).toEqual([]);
+ await click('Запомнить написание');
+ expect(writes()).toEqual([{name:'api_confirm_vocabulary_suggestion',args:{meetingId:'m',versionId:'v1',revision:1,transcriptId:'row',term:'ёлкаAPI'}}]);
+ expect(global).toBe('ёлкаAPI');
+});

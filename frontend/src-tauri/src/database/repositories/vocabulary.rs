@@ -152,7 +152,7 @@ impl VocabularyRepository {
     }
 
     pub async fn confirm_suggestion(pool: &SqlitePool, term: &str, source: SuggestionSource<'_>) -> Result<Option<String>, String> {
-        if term.is_empty() || term.chars().count() > 64 || !term.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_') {
+        if !crate::database::vocabulary_suggestions::valid_suggestion_term(term) {
             return Err("Invalid suggestion spelling".into());
         }
         Self::update_global(pool, None, None, Some(term), true, Some(source)).await
@@ -169,8 +169,8 @@ impl VocabularyRepository {
                 .fetch_optional(&mut *tx).await.map_err(|e| e.to_string())?;
             // Match a whole exact source token: neither case-folded guesses nor
             // substrings of a longer spelling constitute confirmation evidence.
-            if !text.is_some_and(|text| crate::database::vocabulary_suggestions::bounded_text(&text, 100000).0.split(|c: char| !c.is_alphanumeric() && c != '-' && c != '_')
-                .any(|token| token.trim_matches(['-', '_']) == raw.unwrap_or_default())) {
+            if !text.is_some_and(|text| crate::database::vocabulary_suggestions::contains_suggestion_token(
+                &crate::database::vocabulary_suggestions::bounded_text(&text, 100000).0, raw.unwrap_or_default())) {
                 return Err("Suggestion source changed. Find terms again in the current selected transcript; nothing was added.".into());
             }
         }

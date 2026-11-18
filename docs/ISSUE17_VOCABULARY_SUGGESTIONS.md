@@ -103,7 +103,7 @@ CLI boundary and agreed shared scheduling rather than this local selector.
 | No recording/Notes interruption or repeated-rejection notification flood | User-requested bounded saved-meeting panel, memory suppression, no recording hook, auto-focus, timer or notification. Real Notes/version editor regression suite remains green. Physical responsiveness remains a Mac gate. |
 | AI uses agreed text-only CLI; service failure does not block manual entry | No AI/service use at all (conditional AC). No API, paid fallback, credentials or audio access. Empty/error scan preserves ordinary manual confirmation. Real-service behavior is not claimed. |
 
-## Portable verification
+## Initial portable verification (8c0c1a6)
 
 - `tests/vocabulary`: **52 passed,0failed,0ignored** after bounded-reader work
   (45 inherited +7 new). Includes actual repository and extracted production native
@@ -149,3 +149,45 @@ Whisper224-token prefix and Parakeet-no-hints limits remain #16 behavior.
 Author self-review only (no delegates authorized); coordinator acceptance and any
 independent review are separate. No Mac operation, full desktop/Next, packaging,
 Actions, push, PR, merge, release, or issue closure is included.
+
+
+## R1: combining marks are token continuations
+
+Independent review of `8c0c1a6761ceac5f6a06f3e2ebbf0b455da961e4` identified a
+fragment-approval P2: `е\u0308лкаAPI`, `E\u0308lkaAPI` and
+`OpenAPI\u0301Client` were split at their combining marks. Reproduced with the
+actual native command and SQLite: the fragment `е` changed approved terms from
+`ExistingAPI` to `ExistingAPI\nе`, advancing approval revision1→2. Production
+selector tests also reproduced suffix/prefix suggestions. R1 regression runs
+failed before implementation (selector5new failures; native3new failures).
+
+Selection and budget lookahead now include all Unicode general-category **M**
+marks (Mn/Mc/Me) as continuations alongside L/N and existing `_`/`-` connectors.
+A token starting with a mark is consumed and skipped whole in the selector.
+Eligible marked spellings retain their exact original code points; no NFC/NFD
+normalization or silent spelling substitution is performed. Rust shares the same
+L/N/M token regex for bounded SQL-prefix tail removal and whole-source proof;
+suggestion-term validation accepts complete marked spellings. Direct requests for
+fragments cannot approve either side of a mark, even when the mark lies at or
+straddles a budget boundary. `regex` was already a product dependency; only the
+portable harness adds that existing dependency/four cache-resolved lock entries.
+Unrelated lock entries/versions are preserved and `--offline --locked` passes.
+
+Focused R1 verification: **55native tests passed,0failed,0ignored** (52inherited +
+3R1), **54frontend tests passed** in9isolated files (selector12, ordinary flow9,
+inherited vocabulary3/version30), scoped four-file TypeScript check and diff check.
+Fixtures include both reported scripts, Mn/Mc/Me and a supplementary mark,
+mark-before/at/after100,000Unicode-scalar native and100,000UTF-16 frontend limits,
+read-only clipped context, direct fragment rejection with exact stored terms and
+approval revision unchanged, full exact-source acceptance and an ordinary valid
+control. Ordinary `TranscriptVersions` controls transport the full decomposed
+spelling. Existing #16 manual commands still allow explicitly confirmed composed
+and decomposed entries independently; no manual normalization/dedup semantics,
+approval migration or generic transcript/Notes interface changed.
+
+This prevents new fragment suggestions/approvals; it cannot identify or silently
+remove fragment spellings already confirmed on an older build. Existing entries
+require explicit user review/editing in Personal vocabulary. Conservative term
+coverage and the previously documented physical Mac, full-app and real-service
+gates remain unchanged. No heavy/Next build, delegate, Mac operation, service/auth,
+Actions, push or publication was performed for R1.
