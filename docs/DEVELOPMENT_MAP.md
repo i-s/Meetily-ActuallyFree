@@ -202,6 +202,14 @@ qualification remain separately required.
 
 ## 7. Tests, qualification, and historical notes
 
+Issue #7's read-only Core Audio process-metadata probe, local truth journal,
+portable experimental I/O replay, prior fork detector limitations, and deferred
+Zoom/Discord physical matrix are documented in
+[ISSUE7_CALL_SIGNALS.md](ISSUE7_CALL_SIGNALS.md). This is qualification tooling,
+not an automatic recording adapter. Mute/preview and process I/O must not be
+promoted to call lifecycle without evidence; no target Mac measurements or
+verified mechanism are claimed.
+
 Issue #5 artifact-only Actions build (pinned source/tree vs workflow SHA),
 sidecar ordering, locked dependencies, model provenance, same-account backup/
 rollback proposal and physical mic/system/restart qualification
