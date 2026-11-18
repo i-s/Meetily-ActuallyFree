@@ -279,3 +279,86 @@ empty or arbitrary document.
 - Independent unsaved writers may still conflict at SQLite's revision check.
   No automatic merge or last-writer-wins is claimed. Recovery retains the other
   drafts and offers explicit choices; stale conversion/text never enters context.
+
+## Issue #12 R2 — readable recovery journal with no allocation capacity
+
+The independent review's P2 was reproduced on `57db11b`: a valid single retained
+v2 snapshot was readable, but every `setItem` threw `QuotaExceededError` while the
+native store was healthy. The actual `MeetingNotesEditor` + production
+`NotesEditor` mounted test failed because the editor stayed hidden. Separately,
+the production-store own/alias cases were run against the unmodified store from
+that reviewed SHA in temporary test modules: both failed at `loaded === true`.
+Those temporary modules were removed; only the regression tests are committed.
+These are executed red repros, not static-only findings.
+
+### Recovery without allocating another browser record
+
+When copying the selected snapshot fails, the store now publishes a **loaded,
+read-only** recovery state, retains the original immutable source(s), and exposes
+the storage error/warning rather than hiding the editor. The ordinary Notes UI
+mounts the actual rich editor read-only and shows selectable/copyable exact rich
+JSON and Markdown. Pending conversion labels the Markdown as last-complete/stale;
+the production editor reconverts its actual rich JSON before native save is
+allowed. It does not substitute stale Markdown or flatten formatting into text.
+If editor normalization changes the JSON values, the lock rejects that change
+rather than silently claiming those different blocks were recovered.
+
+An explicit **Save retained Notes to meeting** bypasses new browser allocation,
+not native validation: the same revision-checked SQLite command must commit,
+and a subsequent native read must match its revision, exact Markdown and rich
+JSON values/array order before immutable sources are retired. JSON object-key
+order is immaterial (native serde_json can reorder properties). Read/write errors,
+conversion failure or a conflicting native revision keep the original source.
+Conflict review still requires explicit replacement of a reviewed revision;
+other writers' immutable journals are never consumed by that replacement.
+
+**Cancel recovery (keep original)** cancels the local conversion generation and
+pauses automatic/unmount flushing without deleting a source. **Resume recovery**
+remounts read-only for actual JSON reconversion. Native writes already in progress
+cannot be cancelled by that control: it is disabled and the store also rejects
+such cancellation honestly. Retrying after native failure works with no new
+browser capacity. A fresh store can reopen the original after failure or the
+verified native document after success.
+
+The quota warning/lock persists after successful native recovery. Further
+unjournaled edits are not accepted or presented as saved. **Retry recovery
+backup** must actually create a durable browser snapshot before unlocking normal
+editing; a failed retry retains the lock and source. The normal autosave path
+also enters this honest locked mode if a later edit cannot be journaled. The
+UI retains selectable JSON/text if clipboard access is unavailable or denied.
+
+A v2 source can reference mutable legacy ancestry. With zero capacity, safe
+legacy acknowledgement receipts cannot be allocated: after verified native
+commit, the store retains the immutable supersession record and its legacy
+sources, reports native success plus deferred cleanup, and does not expose the
+older superseded draft or delete mutable data unsafely. Reopening still recovers
+the correct rich snapshot; it may require explicit reconversion/save confirmation
+again until browser storage is restored. Ordinary v2-only sources require no
+receipt allocation and are retired after successful readback.
+
+### R2 verification and limits
+
+- `quota-mounted.test.tsx`: **5 passed**, through the production meeting Notes
+  component and production `NotesEditor`/Markdown conversion helper. BlockNote's
+  view/editor engine and Tauri transport are mocked; the exact rich blocks passed
+  to conversion and read-only state are asserted. Cases cover finished/pending
+  conversion, copying, successful/failed reopen, cancel/resume, multiple choices,
+  native CAS conflict and reviewed retry under permanently throwing `setItem`.
+- `quota-store.test.ts`: **9 passed** using independent production-store instances
+  with Storage-shaped backends, held native write/read responses, and fresh
+  instances for restart. Covers own/alias sources, verification before retirement,
+  write/read errors, paused generations, locked edits, restored backup capacity,
+  competing drafts/CAS and JSON property reordering/legacy ancestry.
+- Full isolated frontend suite: **38/38 test files passed**, including all
+  **38 Notes tests** across six isolated files. Final standalone TypeScript
+  `tsc --noEmit` and `git diff --check` passed. No native schema, native command,
+  recording, provider or #14 code changes are made by this fix. Native tests were
+  not rerun for this frontend-only change.
+- R1's previously pending production export subsequently **passed at exact
+  `57db11bce0597857d8a53765d3fc39cceb89e49b`**, exit 0, including lint/types and
+  12/12 static pages, using the exclusive bounded-memory slot. That result is not
+  automatically a production export verification of the later R2 commit.
+- R2 does not start an uncoordinated heavy build. Physical Mac WebView/storage
+  durability, recording/ASR continuity, and the combined #14 <800 ms change plus
+  restart test remain deferred. The tests establish software recovery behavior,
+  not an actual Mac restart, real BlockNote/WebView rendering, or power-loss proof.
