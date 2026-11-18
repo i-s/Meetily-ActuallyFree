@@ -17,6 +17,20 @@ pub async fn ask(
     token: &CancellationToken,
     is_current: impl Fn() -> bool,
 ) -> Result<LiveAnswer, String> {
+    let empty = super::vocabulary::ApprovedVocabulary::global("", 0)?;
+    ask_with_vocabulary(request, current_lines, committed_notes, &empty, configured, auth_home, token, is_current).await
+}
+
+pub async fn ask_with_vocabulary(
+    request: QuestionSnapshot,
+    current_lines: &[CanonicalLine],
+    committed_notes: &UserNotes,
+    vocabulary: &super::vocabulary::ApprovedVocabulary,
+    configured: Option<&str>,
+    auth_home: &std::path::Path,
+    token: &CancellationToken,
+    is_current: impl Fn() -> bool,
+) -> Result<LiveAnswer, String> {
     const STALE: &str = "Recording stopped or changed. Request cancelled; no answer was attached to another meeting.";
     if !is_current() {
         return Err(STALE.into());
@@ -28,7 +42,7 @@ pub async fn ask(
     {
         return Err("Notes changed or are not committed. Open Notes and retry after saving; nothing was sent.".into());
     }
-    let prompt = request.prompt()?;
+    let prompt = vocabulary.augment_prompt(&request.prompt()?)?;
     let watch = async {
         loop {
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -45,7 +59,9 @@ pub async fn ask(
         answer = cli::generate(configured, auth_home, cli::DEFAULT_MODEL, "Text-only current meeting Q&A. Return the specified JSON.", &prompt, Some(token)) => {
             if token.is_cancelled() { return Err("Request cancelled".into()); }
             if !is_current() { return Err(STALE.into()); }
-            request.answer(&answer?)
+            let mut validated = request.answer(&answer?)?;
+            validated.vocabulary_revision = Some(vocabulary.revision());
+            Ok(validated)
         }
     }
 }

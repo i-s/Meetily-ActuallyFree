@@ -279,3 +279,15 @@ and Notes provenance. Check capture continuity, ASR lag/queue and saved audio,
 Notes edits and restart behavior instead of treating scheduler/mock results as
 hardware evidence. Real-service answer latency <=60 s and semantic accuracy are
 not established by a localhost fixture. No subscription login is requested now.
+
+
+## Issue #16 vocabulary extension
+
+[ISSUE16_CONFIRMED_VOCABULARY.md](ISSUE16_CONFIRMED_VOCABULARY.md) supersedes the
+original no-glossary limitation: native live dispatch loads only proof-bearing
+owner-approved global terms, separately scoped/revisioned as spelling guidance.
+Legacy hints require explicit review before Codex use. Original recording/Notes
+ownership validation and isolated subscription transport remain unchanged. The
+shared helper is also supplied for #15 summary integration; no summary queue is
+implemented by #16. Answer provenance adds `vocabularyRevision` independently of
+speech citations and `notesRevision`.

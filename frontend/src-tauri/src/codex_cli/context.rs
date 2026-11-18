@@ -70,6 +70,7 @@ pub struct LiveAnswer {
     pub uncertain: bool,
     pub evidence: Vec<Evidence>,
     pub notes_revision: Option<i64>,
+    pub vocabulary_revision: Option<i64>,
     pub as_of_seconds: f64,
     pub from_seconds: f64,
 }
@@ -180,6 +181,7 @@ impl QuestionSnapshot {
             uncertain: parsed.uncertain,
             evidence,
             notes_revision: parsed.notes_used.then_some(self.user_notes.revision),
+            vocabulary_revision: None,
             as_of_seconds: self.as_of_seconds,
             from_seconds: self.from_seconds,
         })

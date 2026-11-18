@@ -5,3 +5,5 @@ pub mod commands;
 pub mod context;
 pub mod jobs;
 pub mod service;
+
+pub mod vocabulary;

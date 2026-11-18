@@ -78,3 +78,29 @@ fn current_native_transcript_validation_refuses_stale_text_and_another_session_s
     edited[0].end_time = 14.0;
     assert!(r.validate_current(&edited).is_err());
 }
+
+#[test]
+fn approved_spelling_is_bounded_separate_context_never_speech_evidence() {
+    let r = request();
+    let vocabulary = super::super::vocabulary::ApprovedVocabulary::global("Ёлка API\nOpenAPI\nSRE", 4).unwrap();
+    let p = vocabulary.augment_prompt(&r.prompt().unwrap()).unwrap();
+    assert!(p.contains("approved_vocabulary") && p.contains("global") && p.contains("Ёлка API"));
+    assert!(p.contains("not evidence") && p.contains("spelling"));
+    assert!(!p.contains("/synthetic/current"));
+    for raw in [
+        r#"{"answer":"SRE was agreed","transcript_ids":["approved_vocabulary"],"notes_used":false,"uncertain":false}"#,
+        r#"{"answer":"SRE was agreed","transcript_ids":[],"notes_used":false,"uncertain":false}"#,
+    ] { assert!(r.answer(raw).is_err()); }
+    let unknown = r.answer(r#"{"answer":"No speech establishes SRE or an agreement","transcript_ids":[],"notes_used":false,"uncertain":true}"#).unwrap();
+    assert!(unknown.evidence.is_empty());
+    assert!(super::super::vocabulary::ApprovedVocabulary::global(&"я".repeat(1001), 4).is_err());
+    assert!(super::super::vocabulary::ApprovedVocabulary::global("term", -1).is_err());
+    assert!(vocabulary.augment_prompt(&"x".repeat(512 * 1024)).is_err());
+}
+
+#[test]
+fn frontend_cannot_smuggle_unconfirmed_vocabulary_into_live_request() {
+    let mut json=serde_json::to_value(request()).unwrap();
+    json["approvedVocabulary"]=serde_json::json!({"terms":["UnconfirmedSuggestion"]});
+    assert!(serde_json::from_value::<QuestionSnapshot>(json).is_err());
+}
