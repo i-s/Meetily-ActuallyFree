@@ -49,6 +49,8 @@ pub struct MeetingMetadata {
     pub transcript_file: String,
     pub sample_rate: u32,
     pub status: String,  // "recording", "completed", "error"
+    #[serde(default)]
+    pub in_person: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -74,6 +76,8 @@ pub struct RecordingSaver {
     chunk_receiver: Option<mpsc::UnboundedReceiver<AudioChunk>>,
     is_saving: Arc<Mutex<bool>>,
     accumulation_handle: Option<tokio::task::JoinHandle<()>>,
+    recording_state: Option<Arc<super::recording_state::RecordingState>>,
+    storage_error: Arc<Mutex<Option<String>>>,
 }
 
 impl RecordingSaver {
@@ -90,7 +94,13 @@ impl RecordingSaver {
             chunk_receiver: None,
             is_saving: Arc::new(Mutex::new(false)),
             accumulation_handle: None,
+            recording_state: None,
+            storage_error: Arc::new(Mutex::new(None)),
         }
+    }
+
+    pub fn set_recording_state(&mut self, state: Arc<super::recording_state::RecordingState>) {
+        self.recording_state = Some(state);
     }
 
     /// Set the meeting name for this recording session
@@ -126,7 +136,18 @@ impl RecordingSaver {
         // NEW: Save incrementally to disk
         if let Some(folder) = &self.meeting_folder {
             if let Err(e) = self.write_transcripts_json(folder) {
-                warn!("Failed to write incremental transcript update: {}", e);
+                error!("Failed to write incremental transcript update: {}", e);
+                let first = {
+                    let mut error = self.storage_error.lock().unwrap();
+                    let first = error.is_none();
+                    *error = Some(e.to_string());
+                    first
+                };
+                if first {
+                    if let Some(state) = &self.recording_state {
+                        state.report_error(super::recording_state::AudioError::StorageFailed);
+                    }
+                }
             }
         }
     }
@@ -209,6 +230,8 @@ impl RecordingSaver {
         let mic_saver = self.mic_saver.clone();
         let system_saver = self.system_saver.clone();
         let save_audio = auto_save;
+        let recording_state = self.recording_state.clone();
+        let storage_error = self.storage_error.clone();
 
         if let Some(mut receiver) = self.chunk_receiver.take() {
             self.accumulation_handle = Some(tokio::spawn(async move {
@@ -227,9 +250,30 @@ impl RecordingSaver {
                     };
 
                     if let Some(saver_arc) = target {
-                        let mut saver_guard = saver_arc.lock().await;
-                        if let Err(e) = saver_guard.add_chunk(chunk) {
-                            error!("Failed to add chunk to track saver: {}", e);
+                        // FFmpeg/file I/O must not block a Tokio capture/ASR worker.
+                        // This one owner preserves per-track ordering through Stop.
+                        let saver = saver_arc.clone();
+                        let result = tokio::task::spawn_blocking(move || {
+                            saver.blocking_lock().add_chunk(chunk)
+                        }).await;
+                        let failure = match result {
+                            Ok(Ok(())) => None,
+                            Ok(Err(e)) => Some(e.to_string()),
+                            Err(e) => Some(e.to_string()),
+                        };
+                        if let Some(message) = failure {
+                            error!("Failed to save recording checkpoint: {}", message);
+                            let first = {
+                                let mut error = storage_error.lock().unwrap();
+                                let first = error.is_none();
+                                *error = Some(message);
+                                first
+                            };
+                            if first {
+                                if let Some(state) = &recording_state {
+                                    state.report_error(super::recording_state::AudioError::StorageFailed);
+                                }
+                            }
                         }
                     }
                 }
@@ -279,6 +323,7 @@ impl RecordingSaver {
         // Create initial metadata
         let metadata = MeetingMetadata {
             version: "1.0".to_string(),
+            in_person: super::recording_mode::in_person(),
             meeting_id: None,  // Will be set by backend
             meeting_name: Some(meeting_name.to_string()),
             created_at: chrono::Utc::now().to_rfc3339(),
@@ -402,7 +447,9 @@ impl RecordingSaver {
             *is_saving = false;
         }
         if let Some(handle) = self.accumulation_handle.take() {
+            info!("[recording-stop] saver_drain_start");
             handle.await.map_err(|e| format!("Recording saver task failed: {e}"))?;
+            info!("[recording-stop] saver_drain_complete");
         }
 
         // Check if incremental saver exists (indicates auto_save was enabled)
@@ -432,29 +479,42 @@ impl RecordingSaver {
                     Ok(None)
                 };
             };
+            info!("[recording-stop] track_finalize_start track={label}");
             let mut guard = saver_arc.lock().await;
+            if !required && !guard.has_audio() {
+                return Ok(None);
+            }
             match guard.finalize().await {
                 Ok(path) => {
                     info!("✅ Finalized {label}: {}", path.display());
                     Ok(Some(path))
                 }
                 Err(e) => {
-                    if required {
-                        error!("❌ Failed to finalize {label}: {e}");
-                        Err(format!("Failed to finalize {label}: {e}"))
-                    } else {
-                        warn!("⚠️ Optional track {label} not finalized: {e}");
-                        Ok(None)
-                    }
+                    error!("❌ Failed to finalize {label}: {e}");
+                    Err(format!("Failed to finalize {label}: {e}"))
                 }
             }
         }
 
-        let final_audio_path = finalize_track(&self.mixed_saver, "audio (mixed)", true)
-            .await?
-            .ok_or_else(|| "Mixed audio path missing".to_string())?;
-        let mic_audio_path = finalize_track(&self.mic_saver, "mic", false).await?;
-        let system_audio_path = finalize_track(&self.system_saver, "system", false).await?;
+        // Attempt every track even if another fails; never abandon an intact
+        // source just because the playback mix could not be finalized.
+        let mixed = finalize_track(&self.mixed_saver, "audio (mixed)", true).await;
+        let mic = finalize_track(&self.mic_saver, "mic", false).await;
+        let system = finalize_track(&self.system_saver, "system", false).await;
+        let mut failures: Vec<String> = [&mixed, &mic, &system].iter()
+            .filter_map(|result| result.as_ref().err().cloned()).collect();
+        if let Some(error) = self.storage_error.lock().unwrap().clone() {
+            failures.push(format!("Checkpoint save failed during capture: {error}"));
+        }
+        if !failures.is_empty() {
+            if let Some(folder) = &self.meeting_folder {
+                let _ = self.write_transcripts_json(folder);
+            }
+            return Err(failures.join("; "));
+        }
+        let final_audio_path = mixed?.ok_or_else(|| "Mixed audio path missing".to_string())?;
+        let mic_audio_path = mic?;
+        let system_audio_path = system?;
 
         // Save final transcripts.json with validation
         if let Some(folder) = &self.meeting_folder {
@@ -499,6 +559,14 @@ impl RecordingSaver {
             }
 
             info!("✅ Metadata updated with duration: {:?}s", metadata.duration_seconds);
+        }
+
+        // Every populated source plus transcript/metadata has committed. Only
+        // now is it safe to remove the meeting's recovery checkpoints.
+        if let Some(folder) = &self.meeting_folder {
+            if let Err(error) = std::fs::remove_dir_all(folder.join(".checkpoints")) {
+                warn!("Could not clean completed checkpoints: {error}");
+            }
         }
 
         // Emit save event with audio and transcript paths
@@ -591,5 +659,105 @@ mod tests {
         saver.set_meeting_name(Some("Test meeting".to_string()));
 
         assert!(saver.start_accumulation(true).is_err());
+    }
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+    use super::super::recording_state::DeviceType;
+
+    #[tokio::test]
+    async fn saver_drains_thirty_five_seconds_and_finalizes_all_three_tracks() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut saver = RecordingSaver::new();
+        saver.set_recordings_folder(directory.path().to_path_buf());
+        saver.set_meeting_name(Some("Synthetic shutdown".into()));
+        let sender = saver.start_accumulation(true).unwrap();
+        for index in 0..70 {
+            for device_type in [DeviceType::Microphone, DeviceType::System, DeviceType::Mixed] {
+                let samples: Vec<f32> = (0..24_000).map(|i| {
+                    let phase = i as f32 * std::f32::consts::TAU / 48_000.0;
+                    match device_type {
+                        DeviceType::Microphone => 0.2 * (phase * 440.0).sin(),
+                        DeviceType::System => 0.2 * (phase * 660.0).sin(),
+                        DeviceType::Mixed => 0.2 * ((phase * 440.0).sin() + (phase * 660.0).sin()),
+                    }
+                }).collect();
+                sender.send(AudioChunk {
+                    data: samples, sample_rate: 48_000, timestamp: (index + 1) as f64 / 2.0,
+                    chunk_id: index, device_type,
+                }).unwrap();
+            }
+        }
+        drop(sender);
+        // Same owner/wait as stop_and_save: queued audio must drain before any
+        // track lock is acquired for the final partial checkpoint.
+        saver.accumulation_handle.take().unwrap().await.unwrap();
+        for (track, expected, absent) in [
+            (&saver.mic_saver, 440.0, Some(660.0)),
+            (&saver.system_saver, 660.0, Some(440.0)),
+            (&saver.mixed_saver, 440.0, None),
+        ] {
+            let mut track = track.as_ref().unwrap().lock().await;
+            assert_eq!(track.get_checkpoint_count(), 1, "30-second checkpoint must complete");
+            let output = track.finalize().await.unwrap();
+            let decoded = std::process::Command::new(super::super::ffmpeg::find_ffmpeg_path().unwrap())
+                .args(["-v", "error", "-i"]).arg(&output)
+                .args(["-f", "f32le", "-ac", "1", "-ar", "48000", "pipe:1"])
+                .output().unwrap();
+            assert!(decoded.status.success());
+            let count = decoded.stdout.len() / 4;
+            // Concat retains AAC framing from both separately encoded
+            // checkpoints (priming plus final-frame padding, <=2 frames each).
+            assert!((35 * 48_000..=35 * 48_000 + 4 * 1024).contains(&count), "track lost audio: {count} samples");
+            let energy: f32 = decoded.stdout[(35 * 48_000 - 4800) * 4..35 * 48_000 * 4]
+                .chunks_exact(4).map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()).powi(2)).sum();
+            assert!((energy / 4800.0).sqrt() > 0.1, "final five-second checkpoint must retain its tail");
+            let tail: Vec<f32> = decoded.stdout[(35 * 48_000 - 4800) * 4..35 * 48_000 * 4]
+                .chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
+            let amplitude = |frequency: f32| {
+                let (sin, cos) = tail.iter().enumerate().fold((0.0f32, 0.0f32), |(s, c), (i, x)| {
+                    let phase = i as f32 * frequency * std::f32::consts::TAU / 48_000.0;
+                    (s + x * phase.sin(), c + x * phase.cos())
+                });
+                2.0 * sin.hypot(cos) / tail.len() as f32
+            };
+            assert!(amplitude(expected) > 0.1, "expected source signal must survive simultaneous activity");
+            if let Some(absent) = absent {
+                assert!(amplitude(absent) < 0.03, "source tracks must not be mixed together");
+            } else {
+                assert!(amplitude(660.0) > 0.1, "playback must retain both simultaneous sources");
+            }
+        }
+    }
+}
+
+
+#[cfg(test)]
+mod storage_tests {
+    use super::*;
+    use super::super::recording_state::{RecordingState, DeviceType};
+
+    #[tokio::test]
+    async fn checkpoint_storage_failure_stops_capture_and_is_not_silently_discarded() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = RecordingState::new();
+        state.start_recording().unwrap();
+        let mut saver = RecordingSaver::new();
+        saver.set_recording_state(state.clone());
+        saver.set_recordings_folder(dir.path().to_path_buf());
+        saver.set_meeting_name(Some("Synthetic storage failure".into()));
+        let sender = saver.start_accumulation(true).unwrap();
+        let checkpoint_dir = saver.meeting_folder.as_ref().unwrap().join(".checkpoints/mic");
+        std::fs::remove_dir(&checkpoint_dir).unwrap();
+        std::fs::write(&checkpoint_dir, b"not a directory").unwrap();
+        sender.send(AudioChunk { data: vec![0.2; 30 * 48_000], sample_rate: 48_000,
+            timestamp: 30.0, chunk_id: 0, device_type: DeviceType::Microphone }).unwrap();
+        drop(sender);
+        saver.accumulation_handle.take().unwrap().await.unwrap();
+        assert!(!state.is_recording());
+        assert!(matches!(state.get_last_error(), Some(super::super::recording_state::AudioError::StorageFailed)));
+        assert!(saver.storage_error.lock().unwrap().is_some());
     }
 }

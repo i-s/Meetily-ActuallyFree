@@ -65,6 +65,10 @@ pub fn is_recording_active() -> bool {
     IS_RECORDING.load(Ordering::SeqCst)
 }
 
+pub fn is_recording_stopping() -> bool {
+    IS_STOPPING.load(Ordering::SeqCst)
+}
+
 /// Rechecked by the minibar lifecycle after acquiring its own serialization
 /// lock. The minimize callback may have observed recording=true before native
 /// shutdown claimed IS_STOPPING.
@@ -254,7 +258,7 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
     let mut manager = RecordingManager::new();
 
     // Load recording preferences to get auto_save AND device preferences
-    let (auto_save, preferred_mic_name, preferred_system_name, recordings_folder, per_app_enabled, per_app_targets) =
+    let (auto_save, preferred_mic_name, preferred_system_name, recordings_folder, per_app_enabled, per_app_targets, in_person) =
         match super::recording_preferences::load_recording_preferences(&app).await {
             Ok(prefs) => {
                 info!("📋 Loaded recording preferences: auto_save={}, preferred_mic={:?}, preferred_system={:?}, per_app={}, targets={}",
@@ -266,22 +270,14 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
                     prefs.save_folder,
                     prefs.per_app_recording_enabled,
                     prefs.per_app_targets,
+                    prefs.in_person,
                 )
             }
-            Err(e) => {
-                warn!("Failed to load recording preferences, using defaults: {}", e);
-                (
-                    true,
-                    None,
-                    None,
-                    super::recording_preferences::get_default_recordings_folder(),
-                    false,
-                    Vec::new(),
-                )
-            }
+            Err(e) => return Err(format!("Could not load recording source preferences: {e}")),
         };
     manager.set_recordings_folder(recordings_folder);
     manager.set_per_app_config(per_app_enabled, per_app_targets);
+    manager.set_in_person(in_person);
 
     // ============================================================================
     // MICROPHONE DEVICE RESOLUTION: Preference â†’ Default â†’ Error
@@ -663,11 +659,11 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
             prefs
         }
         Err(e) => {
-            warn!("Failed to load recording preferences, defaulting to auto_save=true: {}", e);
-            super::recording_preferences::RecordingPreferences::default()
+            return Err(format!("Could not load recording source preferences: {e}"));
         }
     };
     let auto_save = preferences.auto_save;
+    manager.set_in_person(preferences.in_person);
     manager.set_recordings_folder(preferences.save_folder);
     manager.set_per_app_config(
         preferences.per_app_recording_enabled,
@@ -840,6 +836,9 @@ async fn stop_recording_inner<R: Runtime>(
         return Ok(StopOutcome::AlreadyStopping);
     }
     let _stop_guard = StopGuard;
+    // Every entrypoint (including UI/fatal errors) publishes native shutdown,
+    // not only the tray button that happened to request it.
+    crate::tray::set_tray_state(&app, crate::tray::RecordingState::Stopping);
 
     #[cfg(target_os = "windows")]
     super::windows_audio_sessions::stop_monitoring();
@@ -1457,6 +1456,8 @@ pub async fn get_recording_state() -> serde_json::Value {
     if let Some(manager) = manager_guard.as_ref() {
         serde_json::json!({
             "is_recording": is_recording,
+            "is_stopping": IS_STOPPING.load(Ordering::SeqCst),
+            "in_person": super::recording_mode::in_person(),
             "is_paused": manager.is_paused(),
             "is_microphone_muted": manager.get_state().is_microphone_muted(),
             "is_system_audio_muted": manager.get_state().is_system_audio_muted(),
@@ -1469,6 +1470,8 @@ pub async fn get_recording_state() -> serde_json::Value {
     } else {
         serde_json::json!({
             "is_recording": is_recording,
+            "is_stopping": IS_STOPPING.load(Ordering::SeqCst),
+            "in_person": super::recording_mode::in_person(),
             "is_paused": false,
             "is_microphone_muted": false,
             "is_system_audio_muted": false,

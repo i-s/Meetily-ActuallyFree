@@ -194,10 +194,10 @@ pub fn start_transcription_task<R: Runtime>(
                             // Speaker label for this segment.
                             //
                             // Dual-path STT (AudioPipeline) sends mic and system as
-                            // separate chunks with a real `device_type`. Mic audio is
-                            // always the local user → "You" (UI substitutes their
-                            // display name). System audio is remote parties →
-                            // diarize into Speaker N when models are available.
+                            // separate chunks with real capture provenance. "You"
+                            // is the headset/local-mic convention, not verified
+                            // identity or acoustic separation. In-person capture
+                            // can contain everyone in the room: label its source.
                             crate::audio::common::mark_stt_activity();
                         let nemotron_remote = matches!(chunk.device_type, crate::audio::recording_state::DeviceType::System)
                             && crate::diarization::live_nemotron::active();
@@ -206,11 +206,14 @@ pub fn start_transcription_task<R: Runtime>(
                                 crate::audio::recording_state::DeviceType::Microphone => {
                                     // Still feed the online diarizer so it learns the
                                     // user's voice embedding for later offline refine.
-                                    let _ = crate::diarization::online::assign_speaker(
-                                        &chunk.data,
-                                        true,
-                                    );
-                                    "You".to_string()
+                                    if !crate::audio::recording_mode::in_person() {
+                                        let _ = crate::diarization::online::assign_speaker(
+                                            &chunk.data,
+                                            true,
+                                        );
+                                    }
+                                    crate::audio::recording_mode::microphone_label(
+                                        crate::audio::recording_mode::in_person()).to_string()
                                 }
                                 crate::audio::recording_state::DeviceType::System => {
                                     match crate::diarization::online::assign_speaker(

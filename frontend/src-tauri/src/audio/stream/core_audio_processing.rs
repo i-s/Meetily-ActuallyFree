@@ -294,3 +294,51 @@ mod tests {
         assert!(capture.dropped.load(Ordering::SeqCst));
     }
 }
+
+
+/// Process lifetime is independent of audible output: silence/mute must never
+/// trigger this guard. The stream task owns this future and cancels it on Stop.
+pub(in crate::audio) async fn watch_selected_process<F>(pid: u32, state: Arc<RecordingState>, exists: F)
+where
+    F: Fn(u32) -> bool + Send + Sync + 'static,
+{
+    let exists = Arc::new(exists);
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        if !state.is_recording() { return; }
+        let check = exists.clone();
+        let alive = tokio::task::spawn_blocking(move || check(pid)).await.unwrap_or(false);
+        if !alive {
+            error!("Selected audio application PID {} exited or could not be checked; stopping without retargeting", pid);
+            state.report_error(AudioError::DeviceDisconnected);
+            return;
+        }
+    }
+}
+
+#[cfg(test)]
+mod selected_process_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn selected_app_exit_is_fatal_even_while_recording_is_paused() {
+        let state = RecordingState::new();
+        state.start_recording().unwrap();
+        state.pause_recording().unwrap();
+        watch_selected_process(42, state.clone(), |pid| { assert_eq!(pid, 42); false }).await;
+        assert!(!state.is_recording());
+        assert!(matches!(state.get_last_error(), Some(AudioError::DeviceDisconnected)));
+    }
+
+    #[tokio::test]
+    async fn live_but_silent_app_is_not_a_disconnect() {
+        let state = RecordingState::new();
+        state.start_recording().unwrap();
+        let task = tokio::spawn(watch_selected_process(42, state.clone(), |_| true));
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        assert!(state.is_recording());
+        assert_eq!(state.get_error_count(), 0);
+        task.abort();
+        let _ = task.await;
+    }
+}

@@ -112,12 +112,18 @@ impl IncrementalAudioSaver {
             .join(format!("{}_chunk_{:03}.mp4", self.track, self.checkpoint_count));
 
         // Encode and save checkpoint
+        // A failed encode must not leave a corrupt .mp4 that recovery mistakes
+        // for a committed checkpoint, or block retry with FFmpeg's overwrite prompt.
+        let pending_path = checkpoint_path.with_extension("pending");
+        let _ = std::fs::remove_file(&pending_path);
         encode_single_audio(
             bytemuck::cast_slice(&audio_data),
             self.sample_rate,
             1,  // mono
-            &checkpoint_path
+            &pending_path
         )?;
+        std::fs::File::open(&pending_path)?.sync_all()?;
+        std::fs::rename(&pending_path, &checkpoint_path)?;
 
         let duration_seconds = audio_data.len() as f32 / self.sample_rate as f32;
         self.checkpoint_count += 1;
@@ -131,6 +137,10 @@ impl IncrementalAudioSaver {
         );
 
         Ok(())
+    }
+
+    pub fn has_audio(&self) -> bool {
+        self.checkpoint_count > 0 || self.checkpoint_buffer.iter().any(|chunk| !chunk.data.is_empty())
     }
 
     /// Finalize the recording: save final checkpoint, merge all checkpoints, cleanup
@@ -161,19 +171,8 @@ impl IncrementalAudioSaver {
         let final_audio_path = self.meeting_folder.join(format!("{}.mp4", self.track));
         self.merge_checkpoints(&final_audio_path).await?;
 
-        // Clean up this track's checkpoints directory
-        info!(
-            "Cleaning up {} {} checkpoint files",
-            self.checkpoint_count, self.track
-        );
-        if let Err(e) = std::fs::remove_dir_all(&self.checkpoints_dir) {
-            warn!("Failed to clean up checkpoints directory: {}", e);
-            // Non-fatal - user can manually delete
-        }
-        // Removes only when all sibling tracks have also finished.
-        if let Some(parent) = self.checkpoints_dir.parent() {
-            let _ = std::fs::remove_dir(parent);
-        }
+        // RecordingSaver owns meeting-level commit and cleanup. A different
+        // source or metadata write can still fail after this track succeeds.
 
         info!("Finalized track: {}", final_audio_path.display());
 
@@ -295,7 +294,7 @@ fn recover_checkpoint_track(
                 checkpoint_files.len()
             ));
         }
-        checkpoint_files.truncate(expected as usize);
+        // Retain all source checkpoints, including a source tail beyond mixed.
     }
 
     let concat_file = checkpoints_dir.join("concat_list.txt");
@@ -324,6 +323,7 @@ fn recover_checkpoint_track(
         "-c",
         "copy",
         "-y",
+        "-f", "mp4", // .recovering is intentionally not a recognized media extension
         temp_output.to_str().ok_or("Invalid output path")?,
     ]);
     #[cfg(target_os = "windows")]
@@ -347,9 +347,10 @@ fn recover_checkpoint_track(
         return Err(format!("FFmpeg did not create {}", temp_output.display()));
     }
     if output_path.exists() {
-        std::fs::remove_file(output_path)
-            .map_err(|e| format!("Failed to replace {}: {e}", output_path.display()))?;
+        return Err(format!("Existing recording was not replaced: {}. Keep it or move it before retrying recovery.", output_path.display()));
     }
+    std::fs::File::open(&temp_output).and_then(|file| file.sync_all())
+        .map_err(|e| format!("Failed to sync recovered audio: {e}"))?;
     std::fs::rename(&temp_output, output_path)
         .map_err(|e| format!("Failed to promote {}: {e}", output_path.display()))?;
     std::fs::write(checkpoints_dir.join(".recovered"), b"ok")
@@ -545,8 +546,8 @@ mod tests {
         let final_path = saver.finalize().await.unwrap();
         assert!(final_path.exists());
 
-        // Verify checkpoints directory deleted
-        assert!(!meeting_folder.join(".checkpoints").exists());
+        // A track finalization alone must not erase crash-recovery evidence.
+        assert!(meeting_folder.join(".checkpoints/audio").exists());
     }
 
     #[tokio::test]
@@ -565,5 +566,55 @@ mod tests {
         let result = saver.finalize().await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("No audio checkpoints"));
+    }
+}
+
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+    use super::super::recording_state::DeviceType;
+
+    fn chunk() -> AudioChunk {
+        AudioChunk { data: vec![0.2; 48_000], sample_rate: 48_000,
+            timestamp: 1.0, chunk_id: 0, device_type: DeviceType::Microphone }
+    }
+
+    #[test]
+    fn recovers_committed_checkpoint_and_ignores_incomplete_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut saver = IncrementalAudioSaver::new_track(dir.path().to_path_buf(), 48_000, "mic").unwrap();
+        saver.add_chunk(chunk()).unwrap();
+        saver.save_checkpoint().unwrap();
+        std::fs::write(saver.checkpoints_dir.join("mic_chunk_001.pending"), b"incomplete").unwrap();
+        let output = dir.path().join("mic.mp4");
+        assert_eq!(recover_checkpoint_track(&saver.checkpoints_dir, &output, None).unwrap(), 1);
+        assert!(output.metadata().unwrap().len() > 0);
+        assert!(saver.checkpoints_dir.join("mic_chunk_000.mp4").exists(), "recovery retains evidence until explicit cleanup");
+    }
+
+    #[test]
+    fn recovery_never_replaces_existing_user_audio() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut saver = IncrementalAudioSaver::new(dir.path().to_path_buf(), 48_000).unwrap();
+        saver.add_chunk(chunk()).unwrap();
+        saver.save_checkpoint().unwrap();
+        let output = dir.path().join("audio.mp4");
+        std::fs::write(&output, b"existing user audio").unwrap();
+        assert!(recover_checkpoint_track(&saver.checkpoints_dir, &output, None).unwrap_err().contains("not replaced"));
+        assert_eq!(std::fs::read(output).unwrap(), b"existing user audio");
+    }
+
+    #[test]
+    fn checkpoint_failure_keeps_buffer_and_does_not_commit_partial_mp4() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut saver = IncrementalAudioSaver::new(dir.path().to_path_buf(), 48_000).unwrap();
+        saver.checkpoint_interval_samples = 1;
+        // Deterministic storage failure, even under an elevated test account.
+        std::fs::remove_dir(&saver.checkpoints_dir).unwrap();
+        std::fs::write(&saver.checkpoints_dir, b"not a directory").unwrap();
+        assert!(saver.add_chunk(chunk()).is_err());
+        assert_eq!(saver.checkpoint_count, 0);
+        assert_eq!(saver.checkpoint_buffer[0].data.len(), 48_000);
     }
 }

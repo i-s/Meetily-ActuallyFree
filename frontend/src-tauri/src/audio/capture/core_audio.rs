@@ -88,7 +88,14 @@ impl CoreAudioCapture {
 
         let tap_desc = if let Some(pid) = target_pid {
             info!("🎙️ CoreAudio: Creating process tap for target PID {}...", pid);
-            let num = cidre::ns::Number::with_i32(pid as i32);
+            // TapDesc expects a HAL AudioObjectID, never a Unix PID. Resolve
+            // explicitly and fail closed if the chosen process has disappeared.
+            let process = ca::hardware::Process::with_pid(pid as i32)
+                .map_err(|e| anyhow::anyhow!("Selected app system audio unavailable (PID {}): {:?}", pid, e))?;
+            if process.0.0 == 0 {
+                anyhow::bail!("Selected app system audio unavailable (PID {}): no HAL process object", pid);
+            }
+            let num = cidre::ns::Number::with_u32(process.0.0);
             let arr = cidre::ns::Array::from_slice(&[&*num]);
             ca::TapDesc::with_mono_mixdown_of_processes(&arr)
         } else {
@@ -97,15 +104,7 @@ impl CoreAudioCapture {
         };
 
         let tap = tap_desc.create_process_tap()
-            .or_else(|err| {
-                if target_pid.is_some() {
-                    warn!("⚠️ CoreAudio: Per-process tap failed ({:?}), falling back to global tap...", err);
-                    let fallback_desc = ca::TapDesc::with_mono_global_tap_excluding_processes(&cidre::ns::Array::new());
-                    fallback_desc.create_process_tap()
-                } else {
-                    Err(err)
-                }
-            })
+            // A failed selected-app tap must never broaden capture to other apps.
             .map_err(|e| {
                 error!("❌ CoreAudio: Failed to create process tap: {:?}", e);
                 anyhow::anyhow!("Failed to create process tap: {:?}", e)

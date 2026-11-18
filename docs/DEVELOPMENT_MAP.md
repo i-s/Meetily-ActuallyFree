@@ -18,6 +18,14 @@ and a model's anonymous speaker channels are also different concepts.
 
 ## 2. Recording data flow
 
+Manual controls, explicit microphone-only in-person mode, fail-closed chosen-app
+capture, selected-process lifetime, FFmpeg checkpoint shutdown, storage failures,
+recovery/data retention and issue #9's unqualified physical acceptance gates are
+mapped in [ISSUE9_MANUAL_RECORDING.md](ISSUE9_MANUAL_RECORDING.md). Read it before
+changing capture selection, Stop ordering or checkpoint cleanup. In-person mic
+labels describe the room source, never a user identity; its persisted metadata
+also disables the offline mic-to-You source-track shortcut.
+
 Speech-start pre-roll, live system speech sensitivity, and real-call replay
 qualification are documented in [LIVE_SPEECH_RETENTION.md](LIVE_SPEECH_RETENTION.md).
 Sample continuity across jittered capture callbacks and issue #40 qualification

@@ -1027,7 +1027,15 @@ pub async fn diarize_meeting(
     let engine_for_blocking = selected_engine.clone();
     let (result, used_source_tracks, profile_names) = tokio::task::spawn_blocking(move || -> Result<(DiarizationResult, bool, std::collections::HashMap<usize, String>)> {
         let parent = source.parent().map(Path::to_path_buf);
-        let mic_source = parent.as_ref().map(|p| p.join("mic.mp4"));
+        // A room microphone is not a user identity. Older recordings retain
+        // their source-track convention; explicit in-person recordings use the
+        // ordinary whole-room diarization path, never collapse mic to "You".
+        let in_person = parent.as_ref()
+            .and_then(|p| std::fs::read(p.join("metadata.json")).ok())
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .and_then(|value| value.get("in_person").and_then(|v| v.as_bool()))
+            .unwrap_or(false);
+        let mic_source = parent.as_ref().filter(|_| !in_person).map(|p| p.join("mic.mp4"));
         let system_source = parent.as_ref().map(|p| p.join("system.mp4"));
 
         if let (Some(mic), Some(system)) = (mic_source, system_source) {

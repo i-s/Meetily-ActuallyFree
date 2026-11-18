@@ -7,7 +7,9 @@ The temporary crate includes the production processing module, RecordingState,
 and buffer pool directly. It extracts the mixer and its 10 applicable tests
 verbatim from pipeline.rs; it does not reimplement any audio behavior.
 
-This checks 7 stream, 10 mixer, and 3 buffer-pool tests on Linux. It deliberately
+This checks stream, selected-process lifetime, mixer, recording-state and
+buffer-pool regressions on Linux. Process existence is injected by the portable
+tests; actual macOS process enumeration remains a native boundary. It deliberately
 excludes desktop/DSP-dependent pipeline tests and the macOS AudioStream::stop
 wrapper test. Those require native Cargo test filters in macOS Actions; a
 portable pass does not establish macOS compilation or physical capture.

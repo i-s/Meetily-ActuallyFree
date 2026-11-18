@@ -111,6 +111,8 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
   const [openLane, setOpenLane] = useState<'mic' | 'output' | null>(null);
   const [micGain, setMicGain] = useState(1);
   const [systemGain, setSystemGain] = useState(1);
+  const [nextInPerson, setNextInPerson] = useState(false);
+  const inPerson = isRecording ? recordingState.inPerson : nextInPerson;
   const saveChain = useRef(Promise.resolve());
   const gainTimer = useRef<number | null>(null);
   const pendingGain = useRef<{ which: 'mic' | 'system'; value: number } | null>(null);
@@ -141,6 +143,7 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
     void loadAudioDevices();
     void invoke<RecordingPreferences>('get_recording_preferences')
       .then((prefs) => {
+        setNextInPerson(prefs.in_person ?? false);
         setMicGain(prefs.mic_gain ?? 1);
         setSystemGain(prefs.system_gain ?? 1);
       })
@@ -551,7 +554,7 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
               else setIdleMicMuted((current) => !current);
             }}
           />
-          <RecordingVoiceLane
+          {inPerson ? <span className="px-2 text-xs text-af-text-3">In-person · microphone only</span> : <RecordingVoiceLane
             kind="output"
             open={openLane === 'output'}
             onOpenChange={(next) => {
@@ -575,7 +578,7 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
               if (isRecording) void handleSystemAudioMute();
               else setIdleSystemMuted((current) => !current);
             }}
-          />
+          />}
         </div>
       </div>
     </div>

@@ -204,14 +204,30 @@ impl AudioStream {
         // The stream needs to be polled continuously to produce samples
         let device_name = device.name.clone();
         info!("🔊 Stream: Spawning tokio task to poll Core Audio stream...");
-        let task = tokio::spawn(core_audio_processing::process_core_audio_stream(
+        let monitor_state = state_for_stream.clone();
+        let processing = core_audio_processing::process_core_audio_stream(
             core_stream,
             |stream| stream.sample_rate(),
             move |samples| capture.process_audio_data(samples),
             state_for_stream,
             device_name,
             sample_rate,
-        ));
+        );
+        let task = tokio::spawn(async move {
+            if let Some(pid) = target_pid {
+                tokio::select! {
+                    _ = processing => {},
+                    _ = core_audio_processing::watch_selected_process(pid, monitor_state, |pid| {
+                        let mut system = sysinfo::System::new();
+                        let pid = sysinfo::Pid::from_u32(pid);
+                        system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
+                        system.process(pid).is_some()
+                    }) => {},
+                }
+            } else {
+                processing.await;
+            }
+        });
 
         info!("✅ Stream: Core Audio stream fully initialized for device: {}", device.name);
 
@@ -513,7 +529,8 @@ impl AudioStreamManager {
                 }
                 Err(e) => {
                     warn!("⚠️ Failed to create system audio stream: {}", e);
-                    // Don't fail if only system audio fails
+                    self.state.finish_capture_setup();
+                    return Err(anyhow::anyhow!("System audio capture failed: {}", e));
                 }
             }
         } else {

@@ -29,6 +29,7 @@ pub struct RecordingManager {
     recording_saver: RecordingSaver,
     device_monitor: Option<AudioDeviceMonitor>,
     device_event_receiver: Option<mpsc::UnboundedReceiver<DeviceEvent>>,
+    in_person: bool,
     per_app_enabled: bool,
     per_app_targets: Vec<crate::audio::recording_preferences::PerAppTarget>,
 }
@@ -51,12 +52,15 @@ impl RecordingManager {
             recording_saver: RecordingSaver::new(),
             device_monitor: Some(device_monitor),
             device_event_receiver: Some(device_event_receiver),
+            in_person: false,
             per_app_enabled: false,
             per_app_targets: Vec::new(),
         }
     }
 
-    // Remove app handle storage for now - will be passed directly when saving
+    pub fn set_in_person(&mut self, in_person: bool) {
+        self.in_person = in_person;
+    }
 
     /// Start recording with specified devices
     ///
@@ -72,6 +76,14 @@ impl RecordingManager {
         level_sender: Option<mpsc::UnboundedSender<super::pipeline::AudioLevels>>,
     ) -> Result<mpsc::UnboundedReceiver<AudioChunk>> {
         info!("Starting recording manager (auto_save: {})", auto_save);
+        let system_device = if self.in_person { None } else { system_device };
+        super::recording_mode::validate_sources(self.in_person, self.per_app_enabled,
+            self.per_app_targets.len(), system_device.is_some()).map_err(anyhow::Error::msg)?;
+        super::recording_mode::start_session(self.in_person);
+        if self.in_person {
+            self.per_app_enabled = false;
+        }
+        self.recording_saver.set_recording_state(self.state.clone());
 
         // Set up transcription channel
         let (transcription_sender, transcription_receiver) = mpsc::unbounded_channel::<AudioChunk>();
@@ -140,7 +152,12 @@ impl RecordingManager {
         } else {
             None
         };
-        self.stream_manager.start_streams_with_per_app(microphone_device.clone(), system_device.clone(), per_app_opt, None).await?;
+        if let Err(error) = self.stream_manager.start_streams_with_per_app(microphone_device.clone(), system_device.clone(), per_app_opt, None).await {
+            self.state.stop_recording();
+            let _ = self.stream_manager.stop_streams();
+            let _ = self.pipeline_manager.force_flush_and_stop().await;
+            return Err(error);
+        }
 
         // Start device monitoring to detect disconnects (skip system device monitoring if per-app)
         if let Some(ref mut monitor) = self.device_monitor {
@@ -297,9 +314,9 @@ impl RecordingManager {
             errors.push(format!("Failed to flush the audio pipeline: {}", e));
         }
 
-        // CRITICAL: Full cleanup to release all Arc references and resources
-        // This ensures microphone is released even if Drop is delayed
-        self.state.cleanup();
+        // stop_recording already releases capture devices and input. Retain the
+        // frozen duration, pause total, statistics and errors through final save;
+        // RecordingManager::drop performs the full reset afterwards.
 
         if !errors.is_empty() {
             return Err(anyhow::anyhow!(errors.join("; ")));

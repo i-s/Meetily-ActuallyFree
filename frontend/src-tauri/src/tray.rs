@@ -252,6 +252,12 @@ async fn get_current_recording_state() -> RecordingState {
         return RecordingState::Stopped;
     }
 
+    // The manager is detached during finalization but the session remains
+    // active until save completes. Never advertise that phase as recording.
+    if crate::audio::recording_commands::is_recording_stopping() {
+        return RecordingState::Stopping;
+    }
+
     // Check if paused
     let is_paused = crate::audio::recording_commands::is_recording_paused().await;
     log::info!("Tray: is_paused: {}", is_paused);

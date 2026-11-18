@@ -84,6 +84,9 @@ pub struct PerAppTarget {
 pub struct RecordingPreferences {
     pub save_folder: PathBuf,
     pub auto_save: bool,
+    /// In-person meetings capture only the microphone, never a system tap.
+    #[serde(default)]
+    pub in_person: bool,
     pub file_format: String,
     #[serde(default)]
     pub preferred_mic_device: Option<String>,
@@ -125,6 +128,7 @@ impl Default for RecordingPreferences {
         Self {
             save_folder: get_default_recordings_folder(),
             auto_save: true,
+            in_person: false,
             file_format: "mp4".to_string(),
             preferred_mic_device: None,
             preferred_system_device: None,
@@ -301,8 +305,7 @@ pub async fn load_recording_preferences<R: Runtime>(
     let store = match app.store("recording_preferences.json") {
         Ok(store) => store,
         Err(e) => {
-            warn!("Failed to access store: {}, using defaults", e);
-            return Ok(RecordingPreferences::default());
+            return Err(anyhow::anyhow!("Could not read recording source preferences: {}. Capture was not broadened.", e));
         }
     };
 
@@ -322,8 +325,7 @@ pub async fn load_recording_preferences<R: Runtime>(
                 p
             }
             Err(e) => {
-                warn!("Failed to deserialize preferences: {}, using defaults", e);
-                RecordingPreferences::default()
+                return Err(anyhow::anyhow!("Invalid recording source preferences: {}. Capture was not broadened.", e));
             }
         }
     } else {

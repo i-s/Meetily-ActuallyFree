@@ -10,6 +10,8 @@ import { listen, UnlistenFn } from '@tauri-apps/api/event';
 
 export interface RecordingState {
   is_recording: boolean;
+  is_stopping?: boolean;
+  in_person?: boolean;
   is_paused: boolean;
   is_microphone_muted: boolean;
   is_system_audio_muted: boolean;
