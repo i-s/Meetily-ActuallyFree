@@ -50,6 +50,7 @@ mock.module('@/lib/analytics', () => ({ default: { trackButtonClick: noop } }));
 mock.module('@/lib/recordingNotification', () => ({ showRecordingNotification: async () => {} }));
 mock.module('sonner', () => ({ toast: Object.assign(noop, { error: noop, info: noop }) }));
 const { useRecordingStart } = await import('../../src/hooks/useRecordingStart');
+const { launchRecording } = await import('../../src/lib/recording-launch');
 const { createLifecycleAutomation } = await import('../../src/lib/meeting-lifecycle');
 const { automatedRecording, endAutomatedRecording, automatedStartInProgress } = await import('../../src/lib/meeting-automation');
 let revision = 0;
@@ -58,7 +59,7 @@ function Recorder() { handler = useRecordingStart(false, noop).handleRecordingSt
 const tick = async () => { for (let i = 0; i < 20; i++) await Promise.resolve(); };
 function detector() {
   return createLifecycleAutomation({ enabled: () => true, state: async () => ({}),
-    start: () => { events.dispatchEvent(new Event('start-recording-from-sidebar')); }, stop: noop, error: e => { throw e; }, conflict: noop,
+    start: () => { const call = automatedStartInProgress(); if (call) launchRecording(noop, { automated: call }); }, stop: noop, error: e => { throw e; }, conflict: noop,
   });
 }
 function signal(c: ReturnType<typeof detector>, id: string | null) {
@@ -132,7 +133,7 @@ test('tokenless legacy automation handoff cannot become a manual capture', async
   try {
     await act(async () => { events.dispatchEvent(new Event('start-recording-from-sidebar')); await tick(); });
     expect(calls.some(c => c.name === 'start_recording_with_devices_and_meeting')).toBe(false);
-    expect(automatedStartInProgress()).toBeNull();
+    expect(store.has('labsAutoStartPending')).toBe(true); // #11 owns expiry/recovery, not this rejected event
   } finally { act(() => view!.unmount()); }
 });
 
@@ -147,4 +148,86 @@ test('disable while model is awaited cancels the reserved automatic start', asyn
     expect(calls.some(c => c.name === 'start_recording_with_devices_and_meeting')).toBe(false);
     expect(automatedStartInProgress()).toBeNull();
   } finally { automationEnabled = true; modelGate = undefined; c.dispose(); act(() => view!.unmount()); }
+});
+
+test('corrupt or missing routed automation is never implicit manual intent, including reload', async () => {
+  for (const value of ['{}', '{broken', '{"app":"Zoom"}', '{"app":"Zoom","process":""}', null]) {
+    for (const routed of [false, true]) {
+      store.clear(); calls.length = 0; nativeLease = null;
+      if (value !== null) store.set('labsAutoStartPending', value);
+      // Legacy route flag has no explicit manual/automation provenance.
+      if (routed) store.set('autoStartRecording', 'true');
+      let view: ReturnType<typeof create>;
+      await act(async () => { view = create(<Recorder />); await tick(); });
+      try {
+        await act(async () => {
+          if (!routed) events.dispatchEvent(new Event('start-recording-from-sidebar'));
+          await tick();
+        });
+        expect(calls.some(c => c.name === 'start_recording_with_devices_and_meeting')).toBe(false);
+        expect(calls.some(c => c.name === 'check_transcription_runtime')).toBe(false);
+      } finally { act(() => view!.unmount()); }
+    }
+  }
+});
+
+test('explicit automation with missing reservation or invalid event/route payload does nothing', async () => {
+  const expected = { app: 'Zoom', process: 'us.zoom.xos', source: 'zoom', sessionId: 'missing', token: 'missing-token' };
+  for (const payload of [{ kind: 'automated', call: expected }, {}, { kind: 'automated', call: {} }, '{bad']) {
+    for (const routed of [false, true]) {
+      store.clear(); calls.length = 0; nativeLease = null;
+      if (routed) store.set('autoStartRecording', typeof payload === 'string' ? payload : JSON.stringify(payload));
+      let view: ReturnType<typeof create>;
+      await act(async () => { view = create(<Recorder />); await tick(); });
+      try {
+        await act(async () => {
+          if (!routed) events.dispatchEvent(new CustomEvent('start-recording-from-sidebar', { detail: payload }));
+          await tick();
+        });
+        expect(calls.some(c => c.name === 'start_recording_with_devices_and_meeting')).toBe(false);
+      } finally { act(() => view!.unmount()); }
+    }
+  }
+});
+
+test('explicit manual button ignores corrupt automation and routed manual controls still work', async () => {
+  for (const mode of ['button', 'event', 'route']) {
+    store.clear(); calls.length = 0; nativeLease = null;
+    store.set('labsAutoStartPending', '{}');
+    if (mode === 'route') store.set('autoStartRecording', JSON.stringify({ kind: 'manual' }));
+    let view: ReturnType<typeof create>;
+    await act(async () => { view = create(<Recorder />); await tick(); });
+    try {
+      await act(async () => {
+        if (mode === 'button') await handler();
+        if (mode === 'event') events.dispatchEvent(new CustomEvent('start-recording-from-sidebar', { detail: { kind: 'manual' } }));
+        await tick();
+      });
+      const start = calls.find(c => c.name === 'start_recording_with_devices_and_meeting');
+      expect(start).toBeDefined();
+      expect(start?.args.lifecycleSession).toBeUndefined();
+    } finally { act(() => view!.unmount()); }
+  }
+});
+
+
+test('late A launch cannot transfer pending B, and valid typed route survives recorder reload', async () => {
+  store.clear(); calls.length = 0; nativeLease = null;
+  const c = createLifecycleAutomation({ enabled: () => true, state: async () => ({}), start: noop, stop: noop, error: e => { throw e; }, conflict: noop });
+  let view: ReturnType<typeof create>;
+  await act(async () => { view = create(<Recorder />); signal(c, 'pending-B'); await tick(); });
+  try {
+    const b = automatedStartInProgress()!;
+    expect(b.sessionId).toBe('pending-B');
+    const a = { ...b, token: 'stale-A', sessionId: 'old-A' };
+    await act(async () => { launchRecording(noop, { automated: a }); await tick(); });
+    expect(calls.some(c => c.name === 'start_recording_with_devices_and_meeting')).toBe(false);
+    expect(automatedStartInProgress()?.token).toBe(b.token);
+    act(() => view!.unmount());
+    window.location.pathname = '/library';
+    launchRecording(noop, { automated: b });
+    window.location.pathname = '/';
+    await act(async () => { view = create(<Recorder />); await tick(); });
+    expect(calls.find(c => c.name === 'start_recording_with_devices_and_meeting')?.args.lifecycleSession).toBe('pending-B');
+  } finally { window.location.pathname = '/'; c.dispose(); act(() => view!.unmount()); }
 });

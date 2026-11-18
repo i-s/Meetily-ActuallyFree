@@ -1451,8 +1451,8 @@ pub async fn diarize_meeting(
                         .as_deref()
                         .map(str::trim)
                         .filter(|label| !label.is_empty())
-                        .map(|label| if !identity_policy.trust_legacy_user && label.eq_ignore_ascii_case("you") {
-                            "Unknown".to_string()
+                        .map(|label| if !identity_policy.trust_legacy_user {
+                            crate::speaker_labels::without_unverified_user(label)
                         } else { label.to_string() })
                 });
                 if let Some(label) = &fallback {

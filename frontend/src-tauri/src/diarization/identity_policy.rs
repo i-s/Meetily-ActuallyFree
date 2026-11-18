@@ -2,23 +2,34 @@
 //! Zoom take (nor a room mic). Keep existing enrollment on disk, but do not read,
 //! match, infer or write user identity through those shortcuts for this take.
 #[derive(Clone, Copy, Debug)]
-pub struct IdentityPolicy { pub trust_legacy_user: bool }
+pub struct IdentityPolicy { pub trust_legacy_user: bool, pub in_person: bool }
 impl IdentityPolicy {
     pub fn from_metadata(value: &serde_json::Value) -> Self {
-        if !value.is_object() { return Self { trust_legacy_user: false }; }
+        if !value.is_object() { return Self { trust_legacy_user: false, in_person: false }; }
         let flag = |key: &str| match value.get(key) {
             Some(v) => v.as_bool().unwrap_or(true), // invalid provenance fails closed
             None => false, // historical unflagged recordings retain behavior
         };
-        Self { trust_legacy_user: !(flag("in_person") || flag("microphone_identity_unverified")) }
+        Self { trust_legacy_user: !(flag("in_person") || flag("microphone_identity_unverified")),
+            in_person: value.get("in_person").and_then(|v| v.as_bool()).unwrap_or(false) }
     }
     pub fn for_recording(path: &std::path::Path) -> Result<Self, String> {
-        let metadata = path.parent().map(|p| p.join("metadata.json"));
-        let value = match metadata.map(std::fs::read) {
-            Some(Ok(bytes)) => serde_json::from_slice(&bytes).map_err(|e| format!("Invalid recording provenance: {e}"))?,
-            Some(Err(e)) if e.kind() != std::io::ErrorKind::NotFound => return Err(format!("Cannot read recording provenance: {e}")),
-            _ => serde_json::json!({}),
+        Self::for_folder(path.parent().ok_or("Recording has no provenance folder")?)
+    }
+    /// Resolve the ORIGINAL session folder, not a temporary decoded WAV parent.
+    /// Missing file/fields are documented legacy; malformed data is not legacy.
+    pub fn for_folder(folder: &std::path::Path) -> Result<Self, String> {
+        let value: serde_json::Value = match std::fs::read(folder.join("metadata.json")) {
+            Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| format!("Invalid recording provenance: {e}"))?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+            Err(e) => return Err(format!("Cannot read recording provenance: {e}")),
         };
+        if !value.is_object() { return Err("Recording provenance must be a JSON object".into()); }
+        for key in ["in_person", "microphone_identity_unverified"] {
+            if value.get(key).is_some_and(|flag| !flag.is_boolean()) {
+                return Err(format!("Invalid {key} recording provenance"));
+            }
+        }
         Ok(Self::from_metadata(&value))
     }
     pub fn inferred_user(&self, candidate: Option<usize>) -> Option<usize> {

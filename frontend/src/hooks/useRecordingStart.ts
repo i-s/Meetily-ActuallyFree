@@ -9,7 +9,7 @@ import { recordingService } from '@/services/recordingService';
 import { readPendingGroup } from '@/lib/groups';
 import { automaticTitle, beginLiveSession } from '@/lib/live-session';
 import { AUTO_START_KEY, START_RECORDING_EVENT, requestRecordingStop } from '@/lib/recording-launch';
-import { beginAutomatedRecording, endAutomatedRecording, takeAutomatedStart, releaseAutomatedStart, reservationCurrent, automatedStartInProgress } from '@/lib/meeting-automation';
+import { beginAutomatedRecording, endAutomatedRecording, takeAutomatedStart, releaseAutomatedStart, reservationCurrent, type AutomatedCall } from '@/lib/meeting-automation';
 import { lifecycleCallCanStart, lifecycleCallEnded } from '@/lib/meeting-lifecycle';
 import { loadLabsPreferences } from '@/lib/labs';
 import Analytics from '@/lib/analytics';
@@ -22,6 +22,20 @@ interface UseRecordingStartReturn {
 }
 
 type StartSource = 'home_page' | 'sidebar_auto' | 'sidebar_direct';
+
+// Consumer-only validation until #11's shared read/takeRecordingLaunchIntent
+// lands. Missing/corrupt handoff is no action, never evidence of manual intent.
+function startIntent(payload: unknown): { kind: 'manual' } | { kind: 'automated'; call: AutomatedCall } | null {
+  try {
+    const value = typeof payload === 'string' ? JSON.parse(payload) : payload;
+    if (!value || typeof value !== 'object') return null;
+    if (value.kind === 'manual') return { kind: 'manual' };
+    const call = value.call;
+    if (value.kind !== 'automated' || !call || typeof call !== 'object') return null;
+    if (![call.app, call.process, call.source, call.sessionId, call.token].every(part => typeof part === 'string' && part.trim())) return null;
+    return { kind: 'automated', call };
+  } catch { return null; }
+}
 
 /** A readable reason for a failed start, from the backend's error text. */
 export function describeStartError(error: unknown): { title: string; message: string } {
@@ -186,14 +200,14 @@ export function useRecordingStart(
   }, [checkIfModelDownloading, setStatus, showModal]);
 
   /** The one start sequence. Returns false when recording did not start. */
-  const startRecording = useCallback(async (source: StartSource): Promise<boolean> => {
-    // A detected call asked for this start (Labs meeting automation). A start
-    // from the record button is the user's own and is never stopped for them.
-    const hadAutomatedRequest = automatedStartInProgress() !== null;
-    const automated = takeAutomatedStart();
-    // Old/invalid routed automation cannot turn into an unguarded manual start.
-    if (source !== 'home_page' && hadAutomatedRequest && !automated) return false;
-    const call = source === 'home_page' ? null : automated;
+  const startRecording = useCallback(async (source: StartSource, expected?: AutomatedCall): Promise<boolean> => {
+    // Only an explicit automated intent may consume a reservation. Validate
+    // its token BEFORE transfer so a late A event cannot steal pending B.
+    if (expected && !reservationCurrent(expected, 'pending')) return false;
+    const automated = expected ? takeAutomatedStart() : null;
+    if (expected && (!automated || automated.token !== expected.token
+      || automated.source !== expected.source || automated.sessionId !== expected.sessionId)) return false;
+    const call = automated;
     // Readying the model can take several seconds (it loads a large model
     // into memory), so say so from the first step.
     setStatus(RecordingStatus.STARTING, 'Preparing transcription model…');
@@ -290,26 +304,29 @@ export function useRecordingStart(
     await startRecording('home_page');
   }, [startRecording]);
 
-  // Sent here with the autoStartRecording flag (e.g. "Start" on a group).
+  // The route payload carries intent independently of reservation parse success.
   useEffect(() => {
-    let shouldAutoStart = false;
+    if (isRecording || isAutoStarting) return;
+    let payload: string | null;
     try {
-      shouldAutoStart = sessionStorage.getItem(AUTO_START_KEY) === 'true';
-    } catch {
-      shouldAutoStart = false;
-    }
-    if (!shouldAutoStart || isRecording || isAutoStarting) return;
-    sessionStorage.removeItem(AUTO_START_KEY);
+      payload = sessionStorage.getItem(AUTO_START_KEY);
+      sessionStorage.removeItem(AUTO_START_KEY);
+    } catch { return; }
+    const intent = startIntent(payload);
+    if (!intent) return;
     setIsAutoStarting(true);
-    void startRecording('sidebar_auto').finally(() => setIsAutoStarting(false));
+    void startRecording('sidebar_auto', intent.kind === 'automated' ? intent.call : undefined)
+      .finally(() => setIsAutoStarting(false));
   }, [isRecording, isAutoStarting, startRecording]);
 
-  // Tray, detected meetings, and start buttons elsewhere on this page.
   useEffect(() => {
-    const handleDirectStart = () => {
+    const handleDirectStart = (event: Event) => {
       if (isRecording || isAutoStarting) return;
+      const intent = startIntent((event as CustomEvent).detail);
+      if (!intent) return;
       setIsAutoStarting(true);
-      void startRecording('sidebar_direct').finally(() => setIsAutoStarting(false));
+      void startRecording('sidebar_direct', intent.kind === 'automated' ? intent.call : undefined)
+        .finally(() => setIsAutoStarting(false));
     };
     window.addEventListener(START_RECORDING_EVENT, handleDirectStart);
     return () => window.removeEventListener(START_RECORDING_EVENT, handleDirectStart);

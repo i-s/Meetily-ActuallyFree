@@ -16,7 +16,7 @@ async fn run_case(flagged: bool, engine: &str) -> (Vec<(String, String, f64, f64
     let pool = sqlx::sqlite::SqlitePoolOptions::new().max_connections(1).connect("sqlite::memory:").await.unwrap();
     sqlx::raw_sql("CREATE TABLE meetings(id TEXT, folder_path TEXT, title TEXT); CREATE TABLE transcripts(id TEXT PRIMARY KEY,meeting_id TEXT,transcript TEXT,timestamp TEXT,audio_start_time REAL,audio_end_time REAL,duration REAL,speaker TEXT); CREATE TABLE person_speakers(meeting_id TEXT,speaker_label TEXT);").execute(&pool).await.unwrap();
     sqlx::query("INSERT INTO meetings VALUES('m',?,'Synthetic Zoom')").bind(dir.path().to_str().unwrap()).execute(&pool).await.unwrap();
-    for (id, source, start, end) in [("remote", "Guest", 0., 2.), ("mic", "Microphone", 0., 2.), ("system", "System audio + Guest", 0., 2.), ("stale", "You", 0., 2.), ("manual", "Alice", 2., 4.), ("other_turn", "Guest", 2., 4.), ("manual_composite", "Alice + You", 2., 4.), ("stale_gap", "You", 5., 6.)] {
+    for (id, source, start, end) in [("remote", "Guest", 0., 2.), ("mic", "Microphone", 0., 2.), ("system", "System audio + Guest", 0., 2.), ("stale", "You", 0., 2.), ("manual", "Alice", 2., 4.), ("other_turn", "Guest", 2., 4.), ("manual_composite", "Alice + You", 2., 4.), ("stale_gap", "You", 5., 6.), ("guest_gap", "You + Guest", 5., 6.), ("speaker_gap", "You+Speaker 2", 5., 6.), ("manual_gap", "Alice+You", 5., 6.)] {
         sqlx::query("INSERT INTO transcripts VALUES(?,'m',?,'00:00',?,?,?,?)").bind(id).bind(format!("Keep {id}: текст!"))
             .bind(start).bind(end).bind(end-start).bind(source).execute(&pool).await.unwrap();
     }
@@ -25,7 +25,7 @@ async fn run_case(flagged: bool, engine: &str) -> (Vec<(String, String, f64, f64
     command::voiceprint::WRITES.store(0, Ordering::SeqCst);
     let state = AppState { db_manager: DbManager(pool.clone()) };
     let result = command::diarize_meeting(State(&state), "m".into(), Some(recording.to_str().unwrap().into()), None, None, Some(engine.into())).await.unwrap();
-    assert_eq!(result.labeled, 8);
+    assert_eq!(result.labeled, 11);
     let after: Vec<(String,String,f64,f64)> = sqlx::query_as("SELECT id,transcript,audio_start_time,audio_end_time FROM transcripts ORDER BY id").fetch_all(&pool).await.unwrap();
     assert_eq!(before, after, "identity changes must preserve text/row/timestamps");
     assert_eq!(std::fs::read(&enrollment).unwrap(), polluted);
@@ -40,7 +40,9 @@ async fn actual_call_path_keeps_remote_guest_and_polluted_enrollment_out_of_you(
         assert_eq!(reads, 0, "flagged call read legacy user voiceprint");
         assert_eq!(writes, 0, "flagged call enrolled unqualified mic audio");
         for (id, _, _, _, speaker) in rows {
-            if id == "manual" || id == "other_turn" || id == "manual_composite" { assert_eq!(speaker, "Alice"); }
+            if id == "manual" || id == "other_turn" || id == "manual_composite" || id == "manual_gap" { assert_eq!(speaker, "Alice"); }
+            else if id == "guest_gap" { assert_eq!(speaker, "Guest"); }
+            else if id == "speaker_gap" { assert_eq!(speaker, "Speaker 2"); }
             else if id == "stale_gap" { assert_eq!(speaker, "Unknown"); }
             else { assert_eq!(speaker, "Speaker 1", "{id}: source should refine without becoming You or a manual name"); }
         }

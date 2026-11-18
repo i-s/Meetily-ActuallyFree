@@ -7,9 +7,19 @@ pub fn is_generated_part(part: &str) -> bool {
 }
 pub fn is_generated_label(label: &str) -> bool { label.split('+').all(is_generated_part) }
 pub fn manual_names(label: &str) -> Vec<String> {
-    label.split(" + ").map(str::trim).filter(|p| !is_generated_label(p)).map(str::to_string).collect()
+    label.split('+').map(str::trim).filter(|p| !is_generated_label(p)).map(str::to_string).collect()
 }
 pub fn is_manual_label(label: &str) -> bool { !manual_names(label).is_empty() }
+
+/// Keep evidenced names, otherwise retain anonymous/source provenance without
+/// an unqualified local-user component, even when no model turn overlaps it.
+pub fn without_unverified_user(label: &str) -> String {
+    let names = manual_names(label);
+    if !names.is_empty() { return names.join(" + "); }
+    let parts: Vec<_> = label.split('+').map(str::trim)
+        .filter(|part| !part.is_empty() && !part.eq_ignore_ascii_case("you")).collect();
+    if parts.is_empty() { "Unknown".into() } else { parts.join(" + ") }
+}
 
 #[cfg(test)]
 mod tests {

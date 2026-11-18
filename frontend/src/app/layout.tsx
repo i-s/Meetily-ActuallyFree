@@ -31,7 +31,7 @@ import { ImportDialogProvider } from '@/contexts/ImportDialogContext'
 import { isAudioExtension, getAudioFormatsDisplayList } from '@/constants/audioFormats'
 import { LABS_CHANGED_EVENT, loadLabsPreferences } from '@/lib/labs'
 import { createLifecycleAutomation, type LifecycleSnapshot } from '@/lib/meeting-lifecycle'
-import { automatedStartInProgress, automatedRecording, endAutomatedRecording, markAutomatedStart } from '@/lib/meeting-automation'
+import { automatedStartInProgress, automatedRecording, endAutomatedRecording, markAutomatedStart, type AutomatedCall } from '@/lib/meeting-automation'
 import { getPendingCrashReport, type PendingCrashReport } from '@/services/crashReportService'
 import { WorkspaceProvider } from '@/contexts/WorkspaceContext'
 import { RouteWarmup } from '@/components/RouteWarmup'
@@ -154,7 +154,7 @@ export default function RootLayout({
   const pathname = usePathname()
   const router = useRouter()
   // Tray, notification and meeting-detection starts work from any page.
-  const startRecordingAnywhere = useRef<() => void>(() => undefined)
+  const startRecordingAnywhere = useRef<(automated?: AutomatedCall) => void>(() => undefined)
   const isMinibar = (pathname ?? '').startsWith('/minibar')
   const [showOnboarding, setShowOnboarding] = useState(false)
   const [onboardingCompleted, setOnboardingCompleted] = useState(false)
@@ -165,9 +165,9 @@ export default function RootLayout({
   const [pendingCrashReport, setPendingCrashReport] = useState<PendingCrashReport | null>(null)
   const [recordingNoticeAcknowledged, setRecordingNoticeAcknowledged] = useState(false)
   const acknowledgeRecordingNotice = useCallback(() => setRecordingNoticeAcknowledged(true), [])
-  startRecordingAnywhere.current = () => {
+  startRecordingAnywhere.current = (automated) => {
     if (!recordingNoticeAcknowledged) return
-    launchRecording((href) => router.push(href))
+    launchRecording((href) => router.push(href), { automated })
   }
 
   // Import audio state
@@ -321,7 +321,10 @@ export default function RootLayout({
     const lifecycle = createLifecycleAutomation({
       enabled: () => loadLabsPreferences().meetingAutomation && !showOnboarding,
       state: () => invoke('get_recording_state'),
-      start: () => startRecordingAnywhere.current(),
+      start: () => {
+        const call = automatedStartInProgress();
+        if (call) startRecordingAnywhere.current(call);
+      },
       stop: (expected) => requestRecordingStop((href) => router.push(href), expected),
       error: (error) => toast.error('Meeting automation failed', { description: String(error) }),
       conflict: (app) => toast.info(`${app} call detected while the recorder is busy`, {
@@ -339,20 +342,21 @@ export default function RootLayout({
         const { app, notify, active_media, process } = event.payload;
         console.log('[Layout] meeting-detected:', event.payload);
 
-        const startRecording = () => {
+        const startRecording = (automated?: AutomatedCall) => {
           if (showOnboarding) {
             toast.error('Please complete setup first', {
               description: 'Finish onboarding before you can start recording.',
             });
             return;
           }
-          startRecordingAnywhere.current();
+          startRecordingAnywhere.current(automated);
         };
 
         if (loadLabsPreferences().meetingAutomation && active_media && !showOnboarding) {
           void invoke<{ is_recording?: boolean }>('get_recording_state').then((state) => {
             if (!loadLabsPreferences().meetingAutomation || state.is_recording || automatedStartInProgress()) return;
-            if (markAutomatedStart({ app, process })) startRecording();
+            const call = { app, process };
+            if (markAutomatedStart(call)) startRecording(call);
             else toast.error('Meeting automation could not reserve the recorder');
           }).catch((error) => console.error('Could not check recording state for meeting automation:', error));
           return;
@@ -372,7 +376,7 @@ export default function RootLayout({
           duration: 20000,
           action: {
             label: 'Start recording',
-            onClick: startRecording,
+            onClick: () => startRecording(),
           },
         });
       }

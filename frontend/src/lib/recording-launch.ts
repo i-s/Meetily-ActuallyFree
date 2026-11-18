@@ -4,6 +4,7 @@
  * flag it picks up on arrival; on the recorder they act right away.
  */
 import type { RecordingLease } from './native-recording';
+import type { AutomatedCall } from './meeting-automation';
 import { writePendingGroup, type PendingGroup } from '@/lib/groups';
 
 export const AUTO_START_KEY = 'autoStartRecording';
@@ -11,14 +12,15 @@ export const START_RECORDING_EVENT = 'start-recording-from-sidebar';
 export const STOP_REQUEST_KEY = 'af-stop-requested';
 export const STOP_RECORDING_EVENT = 'af-stop-recording';
 
-export function launchRecording(navigate: (href: string) => void, options: { group?: PendingGroup | null } = {}) {
+export function launchRecording(navigate: (href: string) => void, options: { group?: PendingGroup | null; automated?: AutomatedCall } = {}) {
+  const intent = options.automated ? { kind: 'automated', call: options.automated } : { kind: 'manual' };
   if (options.group !== undefined) writePendingGroup(options.group);
   if (window.location.pathname === '/') {
-    window.dispatchEvent(new CustomEvent(START_RECORDING_EVENT));
+    window.dispatchEvent(new CustomEvent(START_RECORDING_EVENT, { detail: intent }));
     return;
   }
   try {
-    sessionStorage.setItem(AUTO_START_KEY, 'true');
+    sessionStorage.setItem(AUTO_START_KEY, JSON.stringify(intent));
   } catch {
     // Without storage the recorder opens and waits for the button.
   }

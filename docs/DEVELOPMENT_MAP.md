@@ -33,7 +33,10 @@ provenance (identified Zoom contexts, ambiguous global Zoom inventory, and room)
 sets persisted `microphone_identity_unverified`; unrelated capture keeps its prior
 behavior. Flagged offline calls bypass BOTH mic-to-You and legacy voiceprint/user-
 cluster inference; shared source-label predicates keep Microphone refinable rather
-than a person. Both source tracks/overlap stay intact; #6 acoustic identity remains
+than a person. The [R2 follow-up](ISSUE10_R2_FOLLOWUP.md) adds explicit recorder
+launch intent, original-folder metadata validation and no-overlap/composite user
+label sanitization; it also records the pending #11 shared-hook integration boundary.
+Both source tracks/overlap stay intact; #6 acoustic identity remains
 pending and independent of lifecycle.
 
 Manual controls, explicit microphone-only in-person mode, fail-closed chosen-app

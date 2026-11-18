@@ -187,21 +187,15 @@ struct RetranscriptionSource {
 }
 
 fn find_retranscription_sources(folder: &Path, fallback: &Path) -> Result<Vec<RetranscriptionSource>> {
-    let metadata_path = folder.join("metadata.json");
-    let (in_person, microphone_identity_unverified) = match std::fs::read(&metadata_path) {
-        Ok(bytes) => {
-            let metadata: serde_json::Value = serde_json::from_slice(&bytes)?;
-            let provenance = |key: &str| -> Result<bool> {
-                match metadata.get(key) {
-                    Some(value) => value.as_bool().ok_or_else(|| anyhow!("Invalid {key} recording provenance")),
-                    None => Ok(false), // Legacy recordings keep their historical policy.
-                }
-            };
-            (provenance("in_person")?, provenance("microphone_identity_unverified")?)
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (false, false),
-        Err(error) => return Err(error.into()),
-    };
+    let policy = crate::diarization::identity_policy::IdentityPolicy::for_folder(folder).map_err(|e| anyhow!(e))?;
+    find_retranscription_sources_with_policy(folder, fallback, policy)
+}
+
+fn find_retranscription_sources_with_policy(
+    folder: &Path, fallback: &Path, policy: crate::diarization::identity_policy::IdentityPolicy,
+) -> Result<Vec<RetranscriptionSource>> {
+    let in_person = policy.in_person;
+    let microphone_identity_unverified = !policy.trust_legacy_user;
     let mic_path = folder.join("mic.mp4");
     let system_path = folder.join("system.mp4");
     let mut sources = Vec::new();
@@ -248,18 +242,18 @@ fn is_manual_speaker_label(label: &str) -> bool { crate::speaker_labels::is_manu
 
 /// Keep named people across Enhance runs, never promote a source label into
 /// an identity. Legacy call-mic hints retain their existing You convention.
-fn speaker_after_manual_ranges(hint: Option<&str>, start: f64, end: f64, ranges: &[(f64, f64, String)]) -> Option<String> {
-    if hint.is_some_and(|label| label.eq_ignore_ascii_case("you")) {
+fn speaker_after_manual_ranges(hint: Option<&str>, start: f64, end: f64, ranges: &[(f64, f64, String)], trust_legacy_user: bool) -> Option<String> {
+    if trust_legacy_user && hint.is_some_and(|label| label.eq_ignore_ascii_case("you")) {
         return hint.map(str::to_string);
     }
-    let mut result = hint.map(str::to_string);
+    let mut result = hint.map(|label| if trust_legacy_user { label.to_string() } else { crate::speaker_labels::without_unverified_user(label) });
     let mut best_overlap = 0.05;
     for (range_start, range_end, name) in ranges {
         if !is_manual_speaker_label(name) { continue; }
         let overlap = (end.min(*range_end) - start.max(*range_start)).max(0.0);
         if overlap > best_overlap {
             best_overlap = overlap;
-            result = Some(name.clone());
+            result = Some(if trust_legacy_user { name.clone() } else { crate::speaker_labels::manual_names(name).join(" + ") });
         }
     }
     result
@@ -290,7 +284,10 @@ async fn run_retranscription<R: Runtime>(
 ) -> Result<RetranscriptionResult> {
     let folder_path = PathBuf::from(&meeting_folder_path);
     let audio_path = find_audio_file(&folder_path)?;
-    let sources = find_retranscription_sources(&folder_path, &audio_path)?;
+    // Freeze the original session policy before decode/ASR; temp paths and new
+    // source hints cannot weaken attribution during the later range merge.
+    let identity_policy = crate::diarization::identity_policy::IdentityPolicy::for_folder(&folder_path).map_err(|e| anyhow!(e))?;
+    let sources = find_retranscription_sources_with_policy(&folder_path, &audio_path, identity_policy)?;
 
     // Determine which provider to use (default to whisper)
     let use_parakeet = provider.as_deref() == Some("parakeet");
@@ -617,7 +614,7 @@ async fn run_retranscription<R: Runtime>(
 
     for segment in &mut segments {
         if let (Some(start), Some(end)) = (segment.audio_start_time, segment.audio_end_time) {
-            segment.speaker = speaker_after_manual_ranges(segment.speaker.as_deref(), start, end, &manual_ranges);
+            segment.speaker = speaker_after_manual_ranges(segment.speaker.as_deref(), start, end, &manual_ranges, identity_policy.trust_legacy_user);
         }
     }
 
@@ -1402,9 +1399,9 @@ mod issue9_label_retry_tests {
     #[test]
     fn repeated_enhance_preserves_real_names_not_room_source_labels() {
         let ranges = vec![(0.0, 10.0, "Microphone".into()), (1.0, 3.0, "Alex".into()), (0.0, 10.0, "You".into())];
-        assert_eq!(speaker_after_manual_ranges(Some("Microphone"), 1.0, 3.0, &ranges).as_deref(), Some("Alex"));
-        assert_eq!(speaker_after_manual_ranges(Some("Microphone"), 4.0, 5.0, &ranges).as_deref(), Some("Microphone"));
-        assert_eq!(speaker_after_manual_ranges(Some("You"), 1.0, 3.0, &ranges).as_deref(), Some("You"));
+        assert_eq!(speaker_after_manual_ranges(Some("Microphone"), 1.0, 3.0, &ranges, false).as_deref(), Some("Alex"));
+        assert_eq!(speaker_after_manual_ranges(Some("Microphone"), 4.0, 5.0, &ranges, false).as_deref(), Some("Microphone"));
+        assert_eq!(speaker_after_manual_ranges(Some("You"), 1.0, 3.0, &ranges, true).as_deref(), Some("You"));
     }
     #[test]
     fn legacy_call_sources_keep_their_hints_but_room_fallback_never_uses_you() {
@@ -1434,4 +1431,27 @@ mod issue9_label_retry_tests {
         assert!(find_retranscription_sources(dir.path(), &dir.path().join("audio.mp4")).is_err());
     }
 
+}
+
+#[cfg(test)]
+mod issue10_r2_identity_tests {
+    use super::*;
+    #[test]
+    fn enhance_keeps_evidenced_name_not_generated_user_component() {
+        let ranges = vec![(0., 2., "Alice + You".into())];
+        assert_eq!(speaker_after_manual_ranges(Some("Microphone"), 0., 2., &ranges, false).as_deref(), Some("Alice"));
+        assert_eq!(speaker_after_manual_ranges(Some("Guest"), 0., 2., &ranges, true).as_deref(), Some("Alice + You"));
+        let compact = vec![(0., 2., "Alice+You".into())];
+        assert_eq!(speaker_after_manual_ranges(None, 0., 2., &compact, false).as_deref(), Some("Alice"));
+        assert_eq!(speaker_after_manual_ranges(Some("You+Guest"), 3., 4., &ranges, false).as_deref(), Some("Guest"));
+    }
+    #[test]
+    fn enhance_rejects_non_object_provenance_instead_of_legacy_you() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["mic.mp4", "system.mp4", "audio.mp4"] { std::fs::write(dir.path().join(name), b"synthetic").unwrap(); }
+        for malformed in ["null", "[]", "true", "7", "\"scalar\""] {
+            std::fs::write(dir.path().join("metadata.json"), malformed).unwrap();
+            assert!(find_retranscription_sources(dir.path(), &dir.path().join("audio.mp4")).is_err(), "{malformed}");
+        }
+    }
 }
