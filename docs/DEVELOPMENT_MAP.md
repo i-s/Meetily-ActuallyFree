@@ -148,6 +148,16 @@ Ordinary corrections and declined confirmation never learn terms. Parakeet has
 no hints; Whisper uses a 224-token prefix, not the whole storage character limit.
 Synthetic persistence/dispatch tests do not qualify real ASR/model accuracy.
 
+Issue #17's requested local RU/EN spelling suggestions, bounded read-only selected
+projection, same-transaction source/version/revision approval guard, transient
+rejection and ordinary meeting controls are documented in
+[ISSUE17_VOCABULARY_SUGGESTIONS.md](ISSUE17_VOCABULARY_SUGGESTIONS.md). Read it before
+changing suggestion generation or accepting inferred terms. No AI/provider or
+queue is used; scan/decline/close never write. Only explicit acceptance enters
+#16's existing vocabulary transaction. Generic #14 snapshots, Notes and approval
+migrations remain unchanged; physical usability/real-transcript usefulness are
+separate pending gates.
+
 Issue #12's live/library Notes editor, session-keyed autosave, transactional
 save/recovery association, independent data ownership, revisioned read interfaces
 for #13/#15/#18, portable coverage and deferred physical Mac gates are documented

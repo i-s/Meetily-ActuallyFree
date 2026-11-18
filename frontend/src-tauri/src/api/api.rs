@@ -924,6 +924,31 @@ pub async fn api_confirm_vocabulary_term(
         .await.map(|value| value.unwrap_or_default())
 }
 
+/// A scan is read-only, including for old meetings without initialized history.
+#[tauri::command]
+pub async fn api_get_vocabulary_suggestion_context(
+    state: tauri::State<'_, AppState>,
+    meeting_id: String,
+) -> Result<crate::database::vocabulary_suggestions::SuggestionContext, String> {
+    crate::database::vocabulary_suggestions::context(state.db_manager.pool(), &meeting_id).await
+}
+
+/// Explicit suggestion acceptance only. Manual #16 confirmation stays separate.
+#[tauri::command]
+pub async fn api_confirm_vocabulary_suggestion(
+    state: tauri::State<'_, AppState>,
+    meeting_id: String,
+    version_id: String,
+    revision: i64,
+    transcript_id: String,
+    term: String,
+) -> Result<String, String> {
+    VocabularyRepository::confirm_suggestion(state.db_manager.pool(), &term,
+        crate::database::repositories::vocabulary::SuggestionSource {
+            meeting_id: &meeting_id, version_id: &version_id, revision, transcript_id: &transcript_id,
+        }).await.map(|value| value.unwrap_or_default())
+}
+
 #[tauri::command]
 pub async fn api_save_meeting_whisper_vocabulary(
     state: tauri::State<'_, AppState>,

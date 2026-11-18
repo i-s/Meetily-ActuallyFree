@@ -23,6 +23,15 @@ pub struct GlobalVocabularyState {
 
 pub struct VocabularyRepository;
 
+/// Source identity belongs to the selected editable projection, not an archived
+/// snapshot. All fields are checked under the dictionary's SQLite writer lock.
+pub struct SuggestionSource<'a> {
+    pub meeting_id: &'a str,
+    pub version_id: &'a str,
+    pub revision: i64,
+    pub transcript_id: &'a str,
+}
+
 impl VocabularyRepository {
     pub fn normalize(raw: &str) -> Result<Option<String>, String> {
         if raw.chars().any(|c| c.is_control() && c != '\n' && c != '\r') {
@@ -139,14 +148,32 @@ impl VocabularyRepository {
     /// read at Save time: otherwise a stale WebView can erase a confirmed term.
     pub async fn replace_global_at_revision(pool: &SqlitePool, expected: &str, revision: i64, raw: &str) -> Result<Option<String>, String> {
         let normalized = Self::normalize(raw)?;
-        Self::update_global(pool, Some(expected), Some(revision), normalized.as_deref(), false).await
+        Self::update_global(pool, Some(expected), Some(revision), normalized.as_deref(), false, None).await
     }
 
-    async fn update_global(pool: &SqlitePool, expected: Option<&str>, expected_revision: Option<i64>, raw: Option<&str>, append: bool) -> Result<Option<String>, String> {
+    pub async fn confirm_suggestion(pool: &SqlitePool, term: &str, source: SuggestionSource<'_>) -> Result<Option<String>, String> {
+        if term.is_empty() || term.chars().count() > 64 || !term.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_') {
+            return Err("Invalid suggestion spelling".into());
+        }
+        Self::update_global(pool, None, None, Some(term), true, Some(source)).await
+    }
+
+    async fn update_global(pool: &SqlitePool, expected: Option<&str>, expected_revision: Option<i64>, raw: Option<&str>, append: bool, source: Option<SuggestionSource<'_>>) -> Result<Option<String>, String> {
         let _guard = GLOBAL_VOCABULARY_WRITE_LOCK.lock().await;
         // Reserve SQLite's writer before reading, including across processes.
         // Neither overflow nor stale replacement can partially change the store.
         let mut tx = pool.begin_with("BEGIN IMMEDIATE").await.map_err(|e| e.to_string())?;
+        if let Some(source) = source {
+            let text: Option<String> = sqlx::query_scalar("SELECT substr(t.transcript, 1, 100001) FROM transcripts t JOIN transcript_selection s ON s.meeting_id = t.meeting_id WHERE t.meeting_id = ? AND t.id = ? AND s.version_id = ? AND s.revision = ?")
+                .bind(source.meeting_id).bind(source.transcript_id).bind(source.version_id).bind(source.revision)
+                .fetch_optional(&mut *tx).await.map_err(|e| e.to_string())?;
+            // Match a whole exact source token: neither case-folded guesses nor
+            // substrings of a longer spelling constitute confirmation evidence.
+            if !text.is_some_and(|text| crate::database::vocabulary_suggestions::bounded_text(&text, 100000).0.split(|c: char| !c.is_alphanumeric() && c != '-' && c != '_')
+                .any(|token| token.trim_matches(['-', '_']) == raw.unwrap_or_default())) {
+                return Err("Suggestion source changed. Find terms again in the current selected transcript; nothing was added.".into());
+            }
+        }
         let (approval_revision, previously_approved): (i64, String) = sqlx::query_as("SELECT revision, approved_terms FROM vocabulary_approval WHERE id = 1")
             .fetch_one(&mut *tx).await.map_err(|e| e.to_string())?;
         let existing: Option<String> = sqlx::query_scalar("SELECT whisperVocabulary FROM transcript_settings WHERE id = '1'")
@@ -189,7 +216,7 @@ impl VocabularyRepository {
     }
 
     pub async fn add_global(pool: &SqlitePool, raw: &str) -> Result<Option<String>, String> {
-        Self::update_global(pool, None, None, Some(raw), true).await
+        Self::update_global(pool, None, None, Some(raw), true, None).await
     }
 
     pub async fn get_meeting(

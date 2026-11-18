@@ -4,6 +4,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { Button } from '@/components/ui/button';
 import { RememberTerm } from '@/components/meeting/RememberTerm';
+import { VocabularySuggestions } from '@/components/meeting/VocabularySuggestions';
 
 type Segment = { id: string; text: string; speaker?: string; audio_start_time?: number };
 type Version = { id: string; kind: string; status: string; created_at: string; error?: string; settings_json: string; summary_json?: string };
@@ -120,6 +121,7 @@ function MeetingTranscriptVersions({ meetingId, onChanged, onBeforeChange }: {
         <Button disabled={busy || !editId || !editText.trim()} onClick={() => void saveCorrection()}>Save text correction</Button>
         <Button variant="ghost" onClick={() => setEditing(null)}>Discard draft correction</Button>
       </section>}
+      <VocabularySuggestions meetingId={meetingId} versionId={data?.selected_id ?? ''} revision={data?.revision ?? -1} />
       {remember && <RememberTerm key={`${remember.revision}:${remember.transcriptId}`} correctedText={remember.text} onDismiss={() => setRemember(null)} />}
       {error && <p role="alert" className="text-sm text-af-danger">{error}</p>}
       <ul className="space-y-2">

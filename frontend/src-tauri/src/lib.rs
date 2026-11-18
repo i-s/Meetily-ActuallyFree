@@ -847,6 +847,8 @@ pub fn run() {
             api::api_get_whisper_vocabulary,
             api::api_save_global_whisper_vocabulary,
             api::api_confirm_vocabulary_term,
+            api::api_get_vocabulary_suggestion_context,
+            api::api_confirm_vocabulary_suggestion,
             api::api_save_meeting_whisper_vocabulary,
             api::api_delete_meeting,
             api::api_get_meeting,
