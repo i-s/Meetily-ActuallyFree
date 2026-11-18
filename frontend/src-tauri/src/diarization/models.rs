@@ -93,6 +93,7 @@ impl DiarizationModels {
     /// Run segmentation on a single window (16 kHz mono). Returns per-frame
     /// local-speaker activity `[frames][MAX_LOCAL_SPEAKERS]`.
     pub fn segment_window(&mut self, window: &[f32]) -> Result<Vec<[bool; MAX_LOCAL_SPEAKERS]>> {
+        super::batch_control::check()?;
         let n = window.len();
         let arr = Array3::<f32>::from_shape_vec((1, 1, n), window.to_vec())?;
         let outputs = self

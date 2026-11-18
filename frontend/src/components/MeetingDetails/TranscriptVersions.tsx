@@ -4,6 +4,8 @@ import { useCallback, useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { Button } from '@/components/ui/button';
 import { useSavedAudioRevision } from '@/hooks/useSavedAudioRevision';
+import { RememberTerm } from '@/components/meeting/RememberTerm';
+import { VocabularySuggestions } from '@/components/meeting/VocabularySuggestions';
 
 type Segment = { id: string; text: string; speaker?: string; audio_start_time?: number };
 type Version = { id: string; kind: string; status: string; created_at: string; error?: string; settings_json: string; summary_json?: string };
@@ -11,7 +13,16 @@ type Versions = { selected_id: string; revision: number; versions: Version[]; au
 
 /** The selected editable transcript is separate from immutable snapshots. A
  * candidate is never silently applied, including after reopening this page. */
-export function TranscriptVersions({ meetingId, onChanged, onBeforeChange }: {
+type Props = {
+  meetingId: string; onChanged: () => Promise<void> | void;
+  onBeforeChange?: () => Promise<() => void>;
+};
+
+export function TranscriptVersions(props: Props) {
+  return <MeetingTranscriptVersions key={props.meetingId} {...props} />;
+}
+
+function MeetingTranscriptVersions({ meetingId, onChanged, onBeforeChange }: {
   meetingId: string; onChanged: () => Promise<void> | void;
   onBeforeChange?: () => Promise<() => void>;
 }) {
@@ -30,6 +41,7 @@ export function TranscriptVersions({ meetingId, onChanged, onBeforeChange }: {
   const [editing, setEditing] = useState<{ revision: number; segments: Segment[] } | null>(null);
   const [editId, setEditId] = useState('');
   const [editText, setEditText] = useState('');
+  const [remember, setRemember] = useState<{ text: string; revision: number; transcriptId: string } | null>(null);
   const refresh = useCallback(async () => {
     try {
       setData(await invoke<Versions>('list_transcript_versions', { meetingId }));
@@ -81,6 +93,8 @@ export function TranscriptVersions({ meetingId, onChanged, onBeforeChange }: {
     try {
       release = await onBeforeChange?.();
       await invoke('correct_transcript_text', { meetingId, transcriptId: editId, text: editText, expectedRevision: editing.revision });
+      // Confirmation belongs to this successful save, independent of readback.
+      setRemember({ text: editText, revision: editing.revision, transcriptId: editId });
       setEditing(null); await refresh(); await refreshProjection();
     } catch (cause) { setError(String(cause)); }
     finally { release?.(); setBusy(false); }
@@ -109,6 +123,8 @@ export function TranscriptVersions({ meetingId, onChanged, onBeforeChange }: {
         <Button disabled={busy || !editId || !editText.trim()} onClick={() => void saveCorrection()}>Save text correction</Button>
         <Button variant="ghost" onClick={() => setEditing(null)}>Discard draft correction</Button>
       </section>}
+      <VocabularySuggestions meetingId={meetingId} versionId={data?.selected_id ?? ''} revision={data?.revision ?? -1} />
+      {remember && <RememberTerm key={`${remember.revision}:${remember.transcriptId}`} correctedText={remember.text} onDismiss={() => setRemember(null)} />}
       {error && <p role="alert" className="text-sm text-af-danger">{error}</p>}
       <ul className="space-y-2">
         {data?.versions.map((version) => <li key={version.id} className="text-sm">

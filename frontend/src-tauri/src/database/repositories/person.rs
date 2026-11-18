@@ -919,7 +919,7 @@ impl PeopleRepository {
             "SELECT DISTINCT m.id, m.title, m.created_at, s.result \
              FROM person_speakers ps \
              JOIN meetings m ON m.id = ps.meeting_id \
-             LEFT JOIN summary_processes s ON s.meeting_id = m.id \
+             LEFT JOIN current_meeting_summaries s ON s.meeting_id = m.id \
              WHERE ps.person_id = ? \
              ORDER BY m.created_at DESC LIMIT 100",
         )

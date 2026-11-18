@@ -127,7 +127,7 @@ fn install_fatal_error_callback<R: Runtime>(
                 let _ = stop_recording_inner(
                     app_for_stop,
                     RecordingArgs {
-                        save_path: String::new(),
+                        save_path: String::new(), expected: None, manual_generation: None,
                     },
                     true,
                 )
@@ -187,6 +187,10 @@ fn start_windows_audio_route_monitor<R: Runtime>(
 #[derive(Debug, Deserialize)]
 pub struct RecordingArgs {
     pub save_path: String,
+    #[serde(default)]
+    pub expected: Option<super::recording_ownership::RecordingLease>,
+    #[serde(default)]
+    pub manual_generation: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -208,7 +212,7 @@ pub struct TranscriptionStatus {
 // ============================================================================
 
 /// Start recording with default devices
-pub async fn start_recording<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
+pub async fn start_recording<R: Runtime>(app: AppHandle<R>) -> Result<super::recording_ownership::RecordingLease, String> {
     start_recording_with_meeting_name(app, None).await
 }
 
@@ -216,19 +220,22 @@ pub async fn start_recording<R: Runtime>(app: AppHandle<R>) -> Result<(), String
 pub async fn start_recording_with_meeting_name<R: Runtime>(
     app: AppHandle<R>,
     meeting_name: Option<String>,
-) -> Result<(), String> {
+) -> Result<super::recording_ownership::RecordingLease, String> {
     info!(
         "Starting recording with default devices, meeting: {:?}",
         meeting_name
     );
 
+    // Reserve before the engine lock: cancelling a background model must be
+    // able to drain/release that lock before live model initialization.
+    let _post_call_priority = crate::post_call::worker::PRIORITY.recording().await;
     let engine_lifecycle_guard = super::common::acquire_engine_lifecycle_lock().await;
 
     // Check if already recording
     let current_recording_state = IS_RECORDING.load(Ordering::SeqCst);
     info!("ðŸ” IS_RECORDING state check: {}", current_recording_state);
-    if current_recording_state {
-        return Err("Recording already in progress".to_string());
+    if current_recording_state || IS_STOPPING.load(Ordering::SeqCst) {
+        return Err("Recording already in progress or stopping".to_string());
     }
 
     crate::onnx_runtime::ensure_available().map_err(|error| {
@@ -427,6 +434,7 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
     // Live audio-level meter: forward per-source (mic + system) levels to the UI visualizer
     let level_sender = spawn_level_forwarder(&app);
 
+    manager.prepare_source_provenance();
     start_live_diarization(&app).await;
     // Start recording with resolved devices (replaces start_recording_with_defaults_and_auto_save call)
     #[cfg(target_os = "windows")]
@@ -449,6 +457,7 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
 
     // Set recording flag and reset speech detection flag
     info!("ðŸ” Setting IS_RECORDING to true and resetting SPEECH_DETECTED_EMITTED");
+    let recording_lease = super::recording_ownership::begin(None);
     IS_RECORDING.store(true, Ordering::SeqCst);
 
     // Live speaker identification: label transcript segments with individual
@@ -532,7 +541,7 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
     info!("âœ… Recording started successfully with async-first approach");
     drop(engine_lifecycle_guard);
 
-    Ok(())
+    Ok(recording_lease)
 }
 
 /// Start recording with specific devices
@@ -540,7 +549,7 @@ pub async fn start_recording_with_devices<R: Runtime>(
     app: AppHandle<R>,
     mic_device_name: Option<String>,
     system_device_name: Option<String>,
-) -> Result<(), String> {
+) -> Result<super::recording_ownership::RecordingLease, String> {
     start_recording_with_devices_and_meeting(app, mic_device_name, system_device_name, None).await
 }
 
@@ -550,21 +559,77 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
     mic_device_name: Option<String>,
     system_device_name: Option<String>,
     meeting_name: Option<String>,
-) -> Result<(), String> {
+) -> Result<super::recording_ownership::RecordingLease, String> {
+    start_recording_with_lifecycle(app, mic_device_name, system_device_name, meeting_name, None, None).await
+}
+
+pub async fn start_recording_with_lifecycle<R: Runtime>(
+    app: AppHandle<R>,
+    mic_device_name: Option<String>,
+    system_device_name: Option<String>,
+    meeting_name: Option<String>,
+    lifecycle_session: Option<String>,
+    expected_start: Option<super::recording_start_authority::StartRequest>,
+) -> Result<super::recording_ownership::RecordingLease, String> {
+    // Reject known-invalid IPC before preempting an unrelated saved-meeting job.
+    // This grants no setup ownership. There is no await before priority; later
+    // revocation is still checked under the shared engine lock below.
+    let preflight = (|| -> Result<(), String> {
+        if lifecycle_session.is_some() != expected_start.is_some() {
+            return Err("Automated recording requires native start authority v1 and a lifecycle session".into());
+        }
+        if let Some(expected) = &expected_start {
+            if lifecycle_session.as_deref() != Some(expected.session_id.as_str()) {
+                return Err("Recording start session binding mismatch".into());
+            }
+            super::recording_start_authority::preflight(expected)?;
+            super::recording_start_sources::validate(&expected.source, &expected.session_id)?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = preflight {
+        // Keep rejected next tickets failed/fenced, just as the locked claim's
+        // early-return path did. This is not a terminal receipt for future or
+        // malformed tickets; resolve/cancel still provide the actual barrier.
+        if let Some(expected) = &expected_start {
+            super::recording_start_authority::reject_unadmitted(expected);
+        }
+        return Err(error);
+    }
+    // Yield background inference before taking the lock shared with v1 barriers.
+    let _post_call_priority = crate::post_call::worker::PRIORITY.recording().await;
+    let engine_lifecycle_guard = super::common::acquire_engine_lifecycle_lock().await;
+    // Claim before qualification/setup, under the SAME lock as settle/cancel.
+    // Cancellation before this IPC arrives permanently consumes its sequence.
+    let start_claim = expected_start.as_ref().map(super::recording_start_authority::claim).transpose()?;
+    if lifecycle_session.is_some() != expected_start.is_some() {
+        return Err("Automated recording requires native start authority v1 and a lifecycle session".into());
+    }
+    if let Some(expected) = &expected_start {
+        if lifecycle_session.as_deref() != Some(expected.session_id.as_str()) {
+            return Err("Recording start session binding mismatch".into());
+        }
+    }
+    // Resolve the selected source under lifecycle serialization, not through
+    // Zoom's session table for every adapter. Freeze owner across awaited setup.
+    let lifecycle_owner = expected_start.as_ref()
+        .map(|expected| super::recording_start_sources::validate(&expected.source, &expected.session_id))
+        .transpose()?;
     info!(
         "Starting recording with specific devices: mic={:?}, system={:?}, meeting={:?}",
         mic_device_name, system_device_name, meeting_name
     );
 
-    let engine_lifecycle_guard = super::common::acquire_engine_lifecycle_lock().await;
-
     // Check if already recording
     let current_recording_state = IS_RECORDING.load(Ordering::SeqCst);
     info!("ðŸ” IS_RECORDING state check: {}", current_recording_state);
-    if current_recording_state {
-        return Err("Recording already in progress".to_string());
+    if current_recording_state || IS_STOPPING.load(Ordering::SeqCst) {
+        return Err("Recording already in progress or stopping".to_string());
     }
 
+    // Admission owns Stop revocation before any capture/setup await. Commit
+    // transfers that history; it never reconstructs trust from republished A.
+    let stop_admission = lifecycle_owner.clone().map(super::recording_ownership::admit).transpose()?;
     crate::onnx_runtime::ensure_available().map_err(|error| {
         map_recording_start_error(&app, crate::onnx_runtime::InitializationError(error).into())
     })?;
@@ -662,8 +727,14 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
             return Err(format!("Could not load recording source preferences: {e}"));
         }
     };
+    if let Some(owner) = &lifecycle_owner {
+        let executables: Vec<&str> = preferences.per_app_targets.iter().map(|target| target.executable.as_str()).collect();
+        super::recording_start_sources::validate_sources(&owner.source, preferences.in_person,
+            preferences.per_app_recording_enabled, &executables).map_err(str::to_string)?;
+    }
     let auto_save = preferences.auto_save;
     manager.set_in_person(preferences.in_person);
+    manager.set_automatic_zoom(lifecycle_owner.as_ref().is_some_and(|owner| owner.source == "zoom"));
     manager.set_recordings_folder(preferences.save_folder);
     manager.set_per_app_config(
         preferences.per_app_recording_enabled,
@@ -685,10 +756,22 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
     // Live audio-level meter: forward per-source (mic + system) levels to the UI visualizer
     let level_sender = spawn_level_forwarder(&app);
 
+    manager.prepare_source_provenance();
     start_live_diarization(&app).await;
     // Start recording with specified devices and auto_save setting
     #[cfg(target_os = "windows")]
     let resolved_system_device_name = system_device.as_ref().map(|device| device.name.clone());
+    // Model/device setup may outlive the detected call. Check again at the
+    // capture boundary, under the existing recording lifecycle lock.
+    if let Some(expected) = &expected_start {
+        match super::recording_start_sources::validate(&expected.source, &expected.session_id) {
+            Ok(owner) if Some(&owner) == lifecycle_owner.as_ref() => {},
+            _ => {
+                crate::diarization::online::stop();
+                return Err("Automated recording source/session is no longer qualified or enabled".into());
+            }
+        }
+    }
     let transcription_receiver = manager
         .start_recording(mic_device, system_device, auto_save, Some(level_sender))
         .await
@@ -707,7 +790,12 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
 
     // Set recording flag and reset speech detection flag
     info!("ðŸ” Setting IS_RECORDING to true and resetting SPEECH_DETECTED_EMITTED");
+    let recording_lease = match stop_admission {
+        Some(admission) => admission.commit(),
+        None => super::recording_ownership::begin(None),
+    };
     IS_RECORDING.store(true, Ordering::SeqCst);
+    if let Some(claim) = start_claim { claim.commit(recording_lease.clone()); }
 
     // Live speaker identification: label transcript segments with individual
     // voices as they arrive. Best-effort — if the models aren't installed we
@@ -791,7 +879,29 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
     info!("âœ… Recording started with custom devices using async-first approach");
     drop(engine_lifecycle_guard);
 
-    Ok(())
+    Ok(recording_lease)
+}
+
+/// Settling barriers, not snapshots: queued starts cannot commit after a receipt.
+/// An already-admitted capture holds this lock; resolve waits for its outcome
+/// instead of pretending that cancellation can safely interrupt device startup.
+#[tauri::command]
+pub async fn resolve_automated_recording_start(
+    expected: super::recording_start_authority::StartRequest,
+) -> Result<super::recording_start_authority::StartResolution, String> {
+    let _engine_lifecycle_guard = super::common::acquire_engine_lifecycle_lock().await;
+    let mut result = super::recording_start_authority::settle(&expected)?;
+    result.recording_lease = super::recording_ownership::current();
+    result.is_recording = IS_RECORDING.load(Ordering::SeqCst);
+    result.is_stopping = IS_STOPPING.load(Ordering::SeqCst);
+    Ok(result)
+}
+
+#[tauri::command]
+pub async fn cancel_automated_recording_start(
+    expected: super::recording_start_authority::StartRequest,
+) -> Result<super::recording_start_authority::StartResolution, String> {
+    resolve_automated_recording_start(expected).await
 }
 
 /// Stop recording with optimized graceful shutdown ensuring NO transcript chunks are lost
@@ -815,7 +925,7 @@ pub async fn stop_recording_from_compact<R: Runtime>(
 
 async fn stop_recording_inner<R: Runtime>(
     app: AppHandle<R>,
-    _args: RecordingArgs,
+    args: RecordingArgs,
     restore_main: bool,
 ) -> Result<StopOutcome, String> {
     info!(
@@ -825,6 +935,14 @@ async fn stop_recording_inner<R: Runtime>(
     // Check if recording is active
     if !IS_RECORDING.load(Ordering::SeqCst) {
         info!("Recording was not active");
+        return Ok(StopOutcome::AlreadyStopped);
+    }
+
+    // Engine lifecycle lock is held by EVERY caller. This short authority
+    // claim linearizes the exact generation/owner, source-specific confirmed
+    // exit, permission/qualification revocation and native disable/release. Reject before any event/UI/save effect.
+    if !super::recording_ownership::claim_stop_request(args.expected.as_ref(), args.manual_generation.as_deref()) {
+        log::info!("Rejected stale or disabled automated recording stop");
         return Ok(StopOutcome::AlreadyStopped);
     }
 
@@ -1457,6 +1575,7 @@ pub async fn get_recording_state() -> serde_json::Value {
         serde_json::json!({
             "is_recording": is_recording,
             "is_stopping": IS_STOPPING.load(Ordering::SeqCst),
+            "recording_lease": super::recording_ownership::current(),
             "in_person": super::recording_mode::in_person(),
             "is_paused": manager.is_paused(),
             "is_microphone_muted": manager.get_state().is_microphone_muted(),
@@ -1471,6 +1590,7 @@ pub async fn get_recording_state() -> serde_json::Value {
         serde_json::json!({
             "is_recording": is_recording,
             "is_stopping": IS_STOPPING.load(Ordering::SeqCst),
+            "recording_lease": super::recording_ownership::current(),
             "in_person": super::recording_mode::in_person(),
             "is_paused": false,
             "is_microphone_muted": false,
@@ -1494,6 +1614,34 @@ pub async fn get_meeting_folder_path() -> Result<Option<String>, String> {
     } else {
         Ok(None)
     }
+}
+
+/// Request-time audio clock for text consumers; pauses do not advance it.
+pub(crate) fn current_text_clock() -> Result<(String, f64), String> {
+    if !is_recording_active() || is_recording_stopping() { return Err("No active recording".into()); }
+    let guard = RECORDING_MANAGER.lock().map_err(|_| "Recording state unavailable")?;
+    let manager = guard.as_ref().ok_or("No active recording")?;
+    let folder = manager.get_meeting_folder().ok_or("Recording identity is not ready")?;
+    let clock = manager.get_active_recording_duration().ok_or("Recording clock is not ready")?;
+    Ok((format!("recording:{}", folder.to_string_lossy()), clock))
+}
+
+/// Text-only consumer boundary: identity, pause-excluding audio clock and an
+/// immutable ASR snapshot are copied together. No caller retains this lock
+/// while accessing SQLite or running a CLI/model. Does not open any audio file.
+pub(crate) fn current_text_context() -> Result<(String, f64, Vec<crate::audio::recording_saver::TranscriptSegment>), String> {
+    let guard = RECORDING_MANAGER.lock().map_err(|_| "Recording state unavailable")?;
+    if !is_recording_active() || is_recording_stopping() { return Err("No active recording. Open the current recording and retry.".into()); }
+    let manager = guard.as_ref().ok_or("No active recording")?;
+    let folder = manager.get_meeting_folder().ok_or("Recording identity is not ready")?;
+    let clock = manager.get_active_recording_duration().ok_or("Recording clock is not ready")?;
+    Ok((format!("recording:{}", folder.to_string_lossy()), clock, manager.get_transcript_segments()))
+}
+
+/// Cheap watchdog query; unlike current_text_context this never clones ASR.
+pub(crate) fn recording_target_is_current(target: &str) -> bool {
+    if !is_recording_active() || is_recording_stopping() { return false; }
+    RECORDING_MANAGER.lock().ok().and_then(|guard| guard.as_ref().and_then(|m| m.get_meeting_folder()).map(|p| format!("recording:{}", p.to_string_lossy()) == target)).unwrap_or(false)
 }
 
 /// Get accumulated transcript segments from current recording session

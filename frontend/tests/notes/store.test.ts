@@ -187,3 +187,130 @@ test('projection refetch cannot replace dirty Notes during conversion, debounce 
   await store.loadNotes(target, true);
   expect(store.getNotesSnapshot(target).content).toEqual(edited);
 });
+
+
+test('committed revision notifications advance only on native read/ack, not pending or failed writes', async () => {
+  const target = 'meeting:committed-revision';
+  documents.set(target, { ...content('Original'), revision: 4 });
+  const revisions: Array<number | undefined> = [];
+  const stop = store.subscribeNotes(target, () => revisions.push(store.getNotesSnapshot(target).committedRevision));
+  try {
+    await store.loadNotes(target);
+    expect(store.getNotesSnapshot(target).committedRevision).toBe(4);
+    const before = revisions.length;
+    store.editNotes(target, content('Updated'), Promise.resolve('Updated'));
+    await settle();
+    let release!: () => void;
+    hold = new Promise(resolve => { release = resolve; });
+    const saving = store.flushNotes(target);
+    expect(store.getNotesSnapshot(target).committedRevision).toBe(4);
+    fail = true; hold = null; release(); await saving;
+    expect(store.getNotesSnapshot(target).state).toBe('error');
+    expect(revisions.slice(before).every(revision => revision === 4)).toBe(true);
+    fail = false; await store.flushNotes(target);
+    expect(store.getNotesSnapshot(target).committedRevision).toBe(5);
+    expect(revisions.at(-1)).toBe(5);
+  } finally { fail = false; hold = null; stop(); }
+});
+
+test('R2 superseded native acknowledgement publishes its revision while newer rich draft fails and retries', async () => {
+  const target = 'meeting:superseded-ack';
+  const native = new Map<string, any>([[target, { ...content('Original'), revision: 4 }]]);
+  const local = new Map<string, string>();
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  let rejectNewer = true;
+  const isolated = store.createNotesStore({ storage: {
+    get length() { return local.size; }, key: (i: number) => [...local.keys()][i] ?? null,
+    getItem: (k: string) => local.get(k) ?? null, setItem: (k: string, v: string) => { local.set(k, v); }, removeItem: (k: string) => { local.delete(k); },
+  } as Storage, invoke: (async (command: string, args: any) => {
+    if (command === 'api_notes_recording_target') return null;
+    if (command === 'api_read_notes_document') return native.get(args.target) ?? null;
+    if (command === 'api_write_notes_document') {
+      if (args.markdown === 'A') await gate;
+      else if (rejectNewer) throw new Error('B failed');
+      expect(args.expectedRevision).toBe(native.get(args.target).revision);
+      const revision = args.expectedRevision + 1;
+      native.set(args.target, { markdown: args.markdown, json: args.json, revision }); return revision;
+    }
+    throw new Error(command);
+  }) as any });
+  await isolated.loadNotes(target);
+  await isolated.loadNotes('meeting:unrelated');
+  isolated.editNotes(target, content('A'), Promise.resolve('A')); await settle();
+  const saving = isolated.flushNotes(target);
+  const b = content('B rich');
+  let convert!: (text: string) => void;
+  isolated.editNotes(target, b, new Promise(resolve => { convert = resolve; }));
+  release(); await saving;
+  expect(native.get(target).revision).toBe(5);
+  expect(isolated.getNotesSnapshot(target).committedRevision).toBe(5);
+  expect(isolated.getNotesSnapshot(target).content).toEqual(b);
+  expect(isolated.getNotesSnapshot(target).converting).toBe(true);
+  expect(isolated.getNotesSnapshot(target).state).not.toBe('saved');
+  expect(isolated.getNotesSnapshot('meeting:unrelated').committedRevision).toBe(0);
+  expect([...local.values()].map(v => JSON.parse(v)).some(d => d.content.markdown === 'B rich' && d.converting)).toBe(true);
+  convert('B rich'); await settle(); await isolated.flushNotes(target);
+  expect(isolated.getNotesSnapshot(target).error).toBe('B failed');
+  expect(isolated.getNotesSnapshot(target).committedRevision).toBe(5);
+  expect(isolated.getNotesSnapshot(target).content).toEqual(b);
+  expect([...local.values()].map(v => JSON.parse(v)).some(d => d.content.markdown === 'B rich' && d.revision === 5)).toBe(true);
+  rejectNewer = false; await isolated.flushNotes(target);
+  expect(native.get(target).revision).toBe(6);
+  expect(isolated.getNotesSnapshot(target).committedRevision).toBe(6);
+  expect(isolated.getNotesSnapshot(target).state).toBe('saved');
+  expect(isolated.getNotesSnapshot(target).content).toEqual(b);
+  expect(local.size).toBe(0);
+});
+
+for (const target of ['meeting:conversion-ack', 'recording:/synthetic/conversion-ack']) {
+  test(`R2 acknowledgement preserves newer conversion error and target isolation (${target})`, async () => {
+    documents.set(target, { ...content('Original'), revision: 3 });
+    await store.loadNotes(target);
+    const other = 'meeting:conversion-control';
+    await store.loadNotes(other);
+    const before = store.getNotesSnapshot(other);
+    store.editNotes(target, content('A'), Promise.resolve('A')); await settle();
+    let release!: () => void;
+    hold = new Promise(resolve => { release = resolve; });
+    const saving = store.flushNotes(target);
+    const b = content('B exact rich JSON');
+    store.editNotes(target, b, Promise.reject(new Error('B conversion failed'))); await settle();
+    expect(store.getNotesSnapshot(target).error).toBe('B conversion failed');
+    hold = null; release(); await saving;
+    expect(store.getNotesSnapshot(target).committedRevision).toBe(4);
+    expect(store.getNotesSnapshot(target).state).toBe('error');
+    expect(store.getNotesSnapshot(target).error).toBe('B conversion failed');
+    expect(store.getNotesSnapshot(target).content).toEqual(b);
+    expect(store.getNotesSnapshot(target).converting).toBe(true);
+    expect(draftFor(target).content).toEqual(b);
+    expect(draftFor(target).revision).toBe(4);
+    expect(store.getNotesSnapshot(other)).toBe(before);
+    store.editNotes(target, b, Promise.resolve(b.markdown)); await settle(); await store.flushNotes(target);
+    expect(store.getNotesSnapshot(target).state).toBe('saved');
+    expect(store.getNotesSnapshot(target).committedRevision).toBe(5);
+  });
+}
+
+test('unchanged editor readiness keeps the committed Notes revision and leaves no recovery draft', async () => {
+  const target = 'meeting:unchanged-readiness';
+  documents.set(target, { ...content('Saved Notes'), revision: 7 });
+  await store.loadNotes(target);
+  const before = writes;
+  store.editNotes(target, content('Saved Notes'), Promise.resolve('Saved Notes'));
+  await settle(); await store.flushNotes(target);
+  expect(writes).toBe(before);
+  expect(store.getNotesSnapshot(target).committedRevision).toBe(7);
+  expect(store.getNotesSnapshot(target).state).toBe('saved');
+  expect(draftFor(target)).toBeNull();
+  // Equal blocks do not excuse a changed conversion, and formatting-only
+  // changes still own an exact rich draft even when Markdown is unchanged.
+  store.editNotes(target, content('Saved Notes'), Promise.resolve('New conversion'));
+  await settle(); await store.flushNotes(target);
+  expect(documents.get(target).markdown).toBe('New conversion');
+  expect(documents.get(target).revision).toBe(8);
+  store.editNotes(target, { markdown: 'New conversion', json: [{ type: 'heading', content: 'Saved Notes' }] }, Promise.resolve('New conversion'));
+  await settle(); await store.flushNotes(target);
+  expect(documents.get(target).revision).toBe(9);
+  expect(documents.get(target).json[0].type).toBe('heading');
+});

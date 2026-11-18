@@ -127,7 +127,14 @@ invariant, not evidence that remote speech leaking into the physical microphone
 will never be transcribed as local. #9's Zoom-through-speakers remote-only and
 simultaneous-speech physical gate remains mandatory on both Macs.
 
-## Integration seam with concurrent #10 (not included here)
+## Integration seam with concurrent #10
+
+**Combined update (2026-11-18):** accepted #10/#11 scaffold is now integrated with
+#12/#14. [ISSUE10_14_IDENTITY_INTEGRATION.md](ISSUE10_14_IDENTITY_INTEGRATION.md)
+supersedes the historical pending requirements below: both native paths resolve
+original and stored policy before decode, preserve effective restrictions beside
+opaque metadata/source maps, and keep generated identity separate from manual
+snapshots. Physical source/acoustic qualification remains open.
 
 #10 owns flagged-session provenance and identity policy, including suppression of
 polluted legacy voiceprints and classification of generated `Microphone` in the

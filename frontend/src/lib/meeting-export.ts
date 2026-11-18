@@ -75,7 +75,9 @@ export function renderMeetingMarkdown(snapshot: MeetingExportSnapshot, parts: Se
   }
   if (parts.has('summary')) {
     const summary = savedSummary(snapshot.summary);
-    sections.push(`## Meeting summary\n\nSource: meeting_summary (generated or user-edited conclusions; not verbatim speech). Status: ${literal(snapshot.summaryStatus ?? 'not generated')}.\n\n${summary.trim() ? verbatim(summary) : '_No summary available._'}`);
+    const source = parseSummaryData(snapshot.summary)?.post_call;
+    const provenance = source ? `\n\nPost-call provenance: job epoch ${source.job_epoch}; selected version ${literal(String(source.version_id))}; transcript revision ${source.transcript_revision}; Notes revision ${source.notes_revision}; approved vocabulary revision ${source.vocabulary_revision}. ${parseSummaryData(snapshot.summary)?.user_edited ? 'User-edited projection; original immutable artifact retained.' : 'Generated projection; original immutable artifact retained.'}` : '';
+    sections.push(`## Meeting summary\n\nSource: meeting_summary (generated or user-edited conclusions; not verbatim speech). Status: ${literal(snapshot.summaryStatus ?? 'not generated')}.\n\n${summary.trim() ? verbatim(summary) : '_No summary available._'}${provenance}`);
   }
   if (parts.has('transcript')) {
     const lines = snapshot.transcripts.map(row => `${row.audioStartTime != null ? `[${clock(row.audioStartTime)}] ` : ''}${row.speaker?.trim() ? `${row.speaker}: ` : ''}${row.text}`);

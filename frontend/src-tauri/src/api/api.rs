@@ -135,6 +135,8 @@ pub struct SaveTranscriptConfigRequest {
 pub struct WhisperVocabularyConfig {
     pub global: String,
     pub meeting: String,
+    pub approved_global: String,
+    pub vocabulary_revision: i64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -897,10 +899,7 @@ pub async fn api_get_whisper_vocabulary(
     meeting_id: Option<String>,
 ) -> Result<WhisperVocabularyConfig, String> {
     let pool = state.db_manager.pool();
-    let global = VocabularyRepository::get_global(pool)
-        .await
-        .map_err(|error| error.to_string())?
-        .unwrap_or_default();
+    let snapshot = VocabularyRepository::global_state(pool).await.map_err(|error| error.to_string())?;
     let meeting = match meeting_id.as_deref() {
         Some(meeting_id) => VocabularyRepository::get_meeting(pool, meeting_id)
             .await
@@ -908,19 +907,53 @@ pub async fn api_get_whisper_vocabulary(
             .unwrap_or_default(),
         None => String::new(),
     };
-    Ok(WhisperVocabularyConfig { global, meeting })
+    Ok(WhisperVocabularyConfig { global: snapshot.global, meeting, approved_global: snapshot.approved_global, vocabulary_revision: snapshot.revision })
 }
 
 #[tauri::command]
 pub async fn api_save_global_whisper_vocabulary(
     state: tauri::State<'_, AppState>,
     vocabulary: String,
+    expected_vocabulary: String,
+    expected_revision: i64,
 ) -> Result<String, String> {
-    let normalized = VocabularyRepository::normalize(&vocabulary)?;
-    VocabularyRepository::save_global(state.db_manager.pool(), normalized.as_deref())
-        .await
-        .map_err(|error| error.to_string())?;
-    Ok(normalized.unwrap_or_default())
+    VocabularyRepository::replace_global_at_revision(state.db_manager.pool(), &expected_vocabulary, expected_revision, &vocabulary)
+        .await.map(|value| value.unwrap_or_default())
+}
+
+/// Explicit user confirmation only; never called by ordinary text correction.
+#[tauri::command]
+pub async fn api_confirm_vocabulary_term(
+    state: tauri::State<'_, AppState>,
+    term: String,
+) -> Result<String, String> {
+    VocabularyRepository::confirm_global(state.db_manager.pool(), &term)
+        .await.map(|value| value.unwrap_or_default())
+}
+
+/// A scan is read-only, including for old meetings without initialized history.
+#[tauri::command]
+pub async fn api_get_vocabulary_suggestion_context(
+    state: tauri::State<'_, AppState>,
+    meeting_id: String,
+) -> Result<crate::database::vocabulary_suggestions::SuggestionContext, String> {
+    crate::database::vocabulary_suggestions::context(state.db_manager.pool(), &meeting_id).await
+}
+
+/// Explicit suggestion acceptance only. Manual #16 confirmation stays separate.
+#[tauri::command]
+pub async fn api_confirm_vocabulary_suggestion(
+    state: tauri::State<'_, AppState>,
+    meeting_id: String,
+    version_id: String,
+    revision: i64,
+    transcript_id: String,
+    term: String,
+) -> Result<String, String> {
+    VocabularyRepository::confirm_suggestion(state.db_manager.pool(), &term,
+        crate::database::repositories::vocabulary::SuggestionSource {
+            meeting_id: &meeting_id, version_id: &version_id, revision, transcript_id: &transcript_id,
+        }).await.map(|value| value.unwrap_or_default())
 }
 
 #[tauri::command]

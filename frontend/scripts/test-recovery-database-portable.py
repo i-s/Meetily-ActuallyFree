@@ -61,6 +61,9 @@ serde={{version="={versions['serde']}",features=["derive"]}}
             end = person_source.index('\n    }', start) + len('\n    }')
             return person_source[start:end]
         person_methods = '\n'.join(person_method(name) for name in ('link_named_speakers', 'reconcile_speaker_identity'))
+        action_source = (ROOT / 'frontend/src-tauri/src' / 'database/repositories/action_item.rs').read_text()
+        owner = action_source[action_source.index('pub(crate) async fn resolve_owner('):action_source.index('pub struct ActionItemsRepository;')]
+        (work / 'src/action_owner.rs').write_text('use sqlx::{Sqlite, Transaction}; use super::speaker_identity::{is_person_name, normalize_person_name}; pub(crate) use super::speaker_identity::normalize_person_name as normalize_task_text;\n' + owner)
         (work / 'src/lib.rs').write_text(f'''#![allow(dead_code)]
 extern crate self as tauri;
 mod diarization {{ {offline_guard} }}
@@ -74,10 +77,12 @@ mod state {{
     pub struct DbManager(pub sqlx::SqlitePool);
     impl DbManager {{ pub fn pool(&self)->&sqlx::SqlitePool{{&self.0}} }}
 }}
+pub mod post_call {{ #[path="{ROOT}/frontend/src-tauri/src/post_call/store.rs"] pub mod store; }}
 mod api;
 pub use database::repositories::notes_document;
 mod database {{ #[path="{ROOT}/frontend/src-tauri/src/database/transcript_versions.rs"] pub mod transcript_versions; pub mod repositories {{
     #[path="{ROOT}/frontend/src-tauri/src/database/repositories/speaker_identity.rs"] pub mod speaker_identity;
+    #[path="{work}/src/action_owner.rs"] pub mod action_item;
     #[path="{work}/src/meeting_notes.rs"] pub mod meeting_notes;
     #[path="{work}/src/notes_document.rs"] pub mod notes_document;
     pub mod person {{

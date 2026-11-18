@@ -83,7 +83,8 @@ export function useRecordingStop(
       return;
     }
     stopInProgressRef.current = true;
-    endAutomatedRecording();
+    // Native start settlement owns automation release. A delayed save callback
+    // for A must not revoke whichever owner/pending B exists when it runs.
 
     // Manual Stop saves the take, even when short or ASR has produced no text.
     // Discarding user audio requires an explicit user action, not a duration guess.

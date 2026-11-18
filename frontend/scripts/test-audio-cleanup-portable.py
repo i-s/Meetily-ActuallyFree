@@ -31,7 +31,7 @@ with tempfile.TemporaryDirectory(prefix='meetily-cleanup-test-build-') as folder
     diarization = (native / 'diarization/mod.rs').read_text()
     offline = diarization[diarization.index('static OPERATION_LOCK:'):diarization.index('/// Record where the bundled')]
     diarize_start = diarization.index('pub async fn diarize_meeting(')
-    diarize_command = diarization[diarize_start:diarization.index('/// Called under the native post-meeting', diarize_start)]
+    diarize_command = diarization[diarize_start:diarization.index('/// Resolve authority', diarize_start)]
     diarize_command = diarize_command.replace("tauri::State<'_, crate::state::AppState>", '&crate::state::AppState')
     (work / 'diarization_reader.rs').write_text("""
 use std::sync::{Arc,Barrier,Mutex};
@@ -63,6 +63,31 @@ fn recover_recording_audio(_folder:&std::path::Path)->Result<AudioRecoveryStatus
     playback_command = api[api_start:api.index('#[tauri::command]', api_start)]
     playback_command = playback_command.replace("tauri::State<'_, AppState>", '&AppState').replace('use tauri::Manager;', 'use crate::tauri::Manager;')
     (work / 'playback_api.rs').write_text('use serde::Serialize; use crate::tauri::{AppHandle,Runtime}; use crate::state::AppState;\n#[derive(Debug,Serialize)]\n' + dto + playback_command)
+    action = (native / 'database/repositories/action_item.rs').read_text()
+    owner = action[action.index('pub(crate) async fn resolve_owner('):action.index('pub struct ActionItemsRepository;')]
+    (work / 'action_owner.rs').write_text('use sqlx::{Sqlite,Transaction}; use super::speaker_identity::{is_person_name,normalize_person_name}; pub(crate) use super::speaker_identity::normalize_person_name as normalize_task_text;\n' + owner)
+    segment_start = api.index('pub struct TranscriptSegment {')
+    segment = api[segment_start:api.index('\n#[derive',segment_start)]
+    extra_production = f"""
+mod api {{ #[derive(Debug,Clone,serde::Serialize,serde::Deserialize)] {segment} }}
+mod config {{ pub const DEFAULT_PARAKEET_MODEL:&str="synthetic"; }}
+mod codex_cli {{ #[path="{native}/codex_cli/vocabulary.rs"] pub mod vocabulary; }}
+mod post_call {{
+ #[path="{native}/post_call/store.rs"] pub mod store;
+ #[path="{native}/post_call/runner.rs"] pub mod runner;
+ #[path="{native}/post_call/summary.rs"] pub mod summary;
+ #[path="{native}/post_call/priority.rs"] pub mod priority;
+}}
+mod database {{
+ #[path="{native}/database/transcript_versions.rs"] pub mod transcript_versions;
+ #[path="{native}/database/vocabulary_suggestions.rs"] pub mod vocabulary_suggestions;
+ pub mod repositories {{
+  #[path="{native}/database/repositories/speaker_identity.rs"] pub mod speaker_identity;
+  #[path="{work}/action_owner.rs"] pub mod action_item;
+  #[path="{native}/database/repositories/vocabulary.rs"] pub mod vocabulary;
+ }}
+}}
+"""
     migrations = sorted((ROOT / 'frontend/src-tauri/migrations').glob('*.sql'))
     if not any('post_call_queue' in p.name for p in migrations):
         path = work / 'queue.sql'
@@ -89,7 +114,7 @@ mod tauri {{
     pub trait Emitter {{ fn emit<T:serde::Serialize>(&self,_event:&str,payload:T)->Result<(),String>{{ EMITTED.lock().unwrap().push(serde_json::to_value(payload).unwrap()); Ok(()) }} }}
     impl<R> Emitter for AppHandle<R> {{}}
 }}
-mod database {{ pub mod transcript_versions {{ pub async fn checkpoint_current(_pool:&sqlx::SqlitePool,_meeting:&str)->Result<(),String>{{Ok(())}} }} }}
+{extra_production}
 mod audio {{
  pub mod retranscription {{ pub fn recording_in_person(_folder:&std::path::Path)->Result<bool,String>{{Ok(false)}} }}
  #[path="{native}/audio/playback_identity.rs"] pub mod playback_identity;
@@ -101,7 +126,8 @@ mod audio {{
  pub mod recording_commands {{
  pub static ACTIVE: std::sync::atomic::AtomicBool=std::sync::atomic::AtomicBool::new(false);
  pub fn is_recording_active()->bool{{ACTIVE.load(std::sync::atomic::Ordering::SeqCst)}}
- pub fn is_recording_stopping()->bool{{false}}
+ pub static STOPPING: std::sync::atomic::AtomicBool=std::sync::atomic::AtomicBool::new(false);
+ pub fn is_recording_stopping()->bool{{STOPPING.load(std::sync::atomic::Ordering::SeqCst)}}
  }}
 }}
 mod diarization {{ {offline} }}
@@ -125,7 +151,7 @@ mod repositories {{
     sqlx_fp = sqlx_artifact.stem.removeprefix('lib')
     core_fp = dependency('sqlx_core', sqlx_fp)
     tokio_fp = dependency('tokio', core_fp)
-    for name in ['serde', 'serde_json', 'sqlx', 'tokio', 'chrono', 'uuid', 'once_cell']:
+    for name in ['serde', 'serde_json', 'sqlx', 'tokio', 'chrono', 'uuid', 'once_cell', 'tracing', 'regex', 'tokio_util']:
         artifacts = sorted(deps.glob(f'lib{name}-*.rlib'), key=lambda p: p.stat().st_mtime, reverse=True)
         if not artifacts:
             raise SystemExit(f'No warm {name} library in {deps}; refusing a dependency build')

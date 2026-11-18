@@ -192,3 +192,13 @@ full isolated frontend **54/54 files**. All fixtures are generated/disposable.
 The accepted bridge head is now supplied as
 `2d388cf15adb95f2d37ab1e9ff17b82df723e328`; preserve this standalone R1 commit for
 recheck first, then integrate that exact head only after P1/P2 acceptance.
+
+
+## Accepted bridge integration — 2026-11-19
+
+Standalone R1 was accepted at `9cd59f429a50506cd38da45a7c55792a10c734eb`.
+The exact bridge `2d388cf15adb95f2d37ab1e9ff17b82df723e328` is now integrated
+with both histories retained. [Combined evidence and boundaries](ISSUE19_BRIDGE_INTEGRATION.md)
+supersede the earlier pending-convergence statements, including the Notes
+readiness revision fix, normal-command cleanup/retention/export regressions,
+fresh portable results and remaining heavy/physical qualification limits.

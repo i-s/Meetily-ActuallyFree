@@ -27,16 +27,16 @@
 - [x] Add generated fixture tests for inventory, explicit plan scope, changed file, symlink/shared folder, recovery/job transitions and partial failure.
 - [x] Implement audio_cleanup.rs with inventory/prepare/execute and native command wrappers; register commands.
 - [x] Use shared offline/lifecycle locks and SQLite immediate fence; verify narrow production module in portable harness.
-- [ ] Commit with required attribution.
+- [x] Commit with required attribution.
 
 ### Task 2: Normal library review/consent UI
 - [x] Add component tests: total/proposal rule, empty default selection, exact confirmation list/preserved materials, no delete before consent, partial errors and retry.
 - [x] Implement AudioStorage panel/dialog in normal meetings page; refresh workspace material observations after results.
 - [x] Run isolated Bun tests and lightweight static checks only.
-- [ ] Commit with required attribution.
+- [x] Commit with required attribution.
 
 ### Task 3: Integration and handoff
-- [ ] Reconcile committed #18 convergence head when supplied, retain its canonical summary bridge.
+- [x] Reconcile committed #18 convergence head when supplied, retain its canonical summary bridge.
 - [x] Document AC/evidence/limits and architecture map seam.
 - [ ] Verify diff, test evidence, attributed local commits and clean worktree; send exact SHAs and integration seam to coordinator.
 
@@ -73,3 +73,21 @@ independent callers must never reuse the lifecycle-owned helper without that own
 Bridge 2d388cf15adb95f2d37ab1e9ff17b82df723e328 is supplied and accepted upstream;
 standalone R1 must be rechecked/accepted before the separate history-preserving
 integration commit and combined regression. No owner/dependency relay is needed.
+
+
+## Combined accepted bridge ledger — 2026-11-19
+
+Exact parents: standalone R1 9cd59f429a50506cd38da45a7c55792a10c734eb and
+accepted bridge 2d388cf15adb95f2d37ab1e9ff17b82df723e328. Three conflicts
+resolved with native task + inner original-folder identity policy, version audio
+revision + vocabulary UI, and library audio revision + canonical subscriptions.
+Ruling: fix unchanged Notes readiness in the shared store rather than weaken
+canonical tuple validation or republish after cleanup — the mounted normal
+navigation test proved an unnecessary save invalidated the summary; cost if
+wrong is a missed Notes edit, bounded by explicit changed-conversion/formatting
+and full recovery/CAS frontend regressions. Store red (19 vs 18 writes) → green;
+mounted cleanup + both exports green. No delegates used, per explicit constraint.
+Fresh results: frontend 73/73 files; cleanup native 43; Stop/shutdown 48; targeted
+recovery 17 (68 filtered); native queue 4 (50 filtered); queue/projection 28; guarded
+Stop 15; start authority 39, all passing. No ignored model/acoustic tests ran.
+See docs/ISSUE19_BRIDGE_INTEGRATION.md for exact boundaries and remaining limits.

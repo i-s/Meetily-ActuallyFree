@@ -14,7 +14,7 @@ import {
 import type { MeetingExportContent, MeetingExportFormat } from '@/hooks/meeting-details/useCopyOperations';
 
 const contentOptions: Array<{ value: MeetingExportContent; label: string; description: string }> = [
-  { value: 'all', label: 'Complete meeting', description: 'Transcript, your Notes and available summary, separately labelled' },
+  { value: 'all', label: 'Complete meeting', description: 'Transcript, your Notes, tasks and available summary, separately labelled' },
   { value: 'notes', label: 'Your Notes', description: 'Your own saved thoughts, not recognized speech' },
   { value: 'transcript', label: 'Transcript', description: 'Everything said, with timestamps' },
   { value: 'summary', label: 'Summary', description: 'The current AI meeting summary' },
@@ -81,7 +81,7 @@ export function MeetingExportDialog({
           <DialogTitle>{step === 'content' ? 'What do you want to export?' : 'How should it be exported?'}</DialogTitle>
           <DialogDescription>
             {step === 'content'
-              ? 'Complete meeting includes saved Notes, selected transcript and available summary. Missing materials are marked explicitly. Later edits are not included in the captured snapshot.'
+              ? 'Complete meeting includes saved Notes, selected transcript, tasks and available summary. Missing materials are marked explicitly. Later edits are not included in the captured snapshot.'
               : `Choose a format for the ${content === 'both' ? 'transcript and summary' : content}.`}
           </DialogDescription>
         </DialogHeader>

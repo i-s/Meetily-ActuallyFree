@@ -40,7 +40,7 @@ pub struct MeetingMetadata {
     pub duration_seconds: Option<f64>,
     pub devices: DeviceInfo,
     pub audio_file: String,
-    /// Dedicated local-user track for reliable offline identity.
+    /// Dedicated microphone source track; metadata decides whether identity is trusted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mic_audio_file: Option<String>,
     /// Dedicated system/remote track for remote-speaker clustering.
@@ -51,6 +51,9 @@ pub struct MeetingMetadata {
     pub status: String,  // "recording", "completed", "error"
     #[serde(default)]
     pub in_person: bool,
+    /// Source audio is retained but mic-to-You identity is not acoustically proven.
+    #[serde(default)]
+    pub microphone_identity_unverified: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,7 +65,7 @@ pub struct DeviceInfo {
 /// New recording saver using incremental saving strategy.
 /// Writes three tracks when auto-save is on:
 ///   - `audio.mp4`  mixed playback
-///   - `mic.mp4`    local user (You)
+///   - `mic.mp4`    microphone source (not necessarily the local user)
 ///   - `system.mp4` remote / computer audio
 pub struct RecordingSaver {
     mixed_saver: Option<Arc<AsyncMutex<IncrementalAudioSaver>>>,
@@ -324,6 +327,7 @@ impl RecordingSaver {
         let metadata = MeetingMetadata {
             version: "1.0".to_string(),
             in_person: super::recording_mode::in_person(),
+            microphone_identity_unverified: super::recording_mode::microphone_identity_unverified(),
             meeting_id: None,  // Will be set by backend
             meeting_name: Some(meeting_name.to_string()),
             created_at: chrono::Utc::now().to_rfc3339(),

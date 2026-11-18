@@ -15,7 +15,7 @@ import { useConfig } from '@/contexts/ConfigContext';
 import { useWorkspace } from '@/contexts/WorkspaceContext';
 import { TemplateEditorModal } from '@/components/MeetingDetails/TemplateEditorModal';
 import { MeetingExportDialog } from '@/components/MeetingDetails/MeetingExportDialog';
-import { PostCallProcessingDialog } from '@/components/MeetingDetails/PostCallProcessingDialog';
+import { PostCallQueueNotice } from '@/components/PostCallQueue';
 import { ModelConfig } from '@/components/ModelSettingsModal';
 import { VirtualizedTranscriptView } from '@/components/VirtualizedTranscriptView';
 import { TranscriptVersions } from '@/components/MeetingDetails/TranscriptVersions';
@@ -560,11 +560,9 @@ export default function PageContent({
         hasSummary={!!meetingData.aiSummary}
         onExport={copyOperations.handleExportMeeting}
       />
-      <PostCallProcessingDialog
+      <PostCallQueueNotice
         enabled={isPostCallRecording}
         meetingId={meeting.id}
-        meetingFolderPath={meeting.folder_path}
-        onRefetchTranscripts={onRefetchTranscripts}
         onComplete={() => setPostCallDoneFor(meeting.id)}
       />
     </motion.div>

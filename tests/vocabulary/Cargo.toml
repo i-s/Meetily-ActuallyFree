@@ -1,0 +1,18 @@
+[package]
+name = "meetily-vocabulary-tests"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Device-free tests compile the production repository without GTK/audio engines.
+[workspace]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = "0.4"
+uuid = { version = "1", features = ["v4"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "derive"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+log = "0.4"
+regex = "1.11.0"

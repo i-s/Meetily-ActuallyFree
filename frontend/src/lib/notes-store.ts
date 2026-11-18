@@ -4,6 +4,8 @@ export interface NotesContent { markdown: string; json: unknown[] | null }
 export interface NotesDocument extends NotesContent { revision: number; updatedAt?: string }
 export interface NotesSnapshot {
   loaded: boolean;
+  /** Last native revision read or successfully committed, never a draft revision. */
+  committedRevision?: number;
   content: NotesContent;
   state: 'loading' | 'saved' | 'pending' | 'saving' | 'error';
   error: string | null;
@@ -177,7 +179,7 @@ export function createNotesStore(options: { invoke?: typeof invoke; storage?: St
         // Recovery can read/reconvert the original immutable source and commit
         // it natively even when Storage cannot allocate a copy. Keep that source
         // intact, mount read-only, and require an explicit native-save action.
-        publish(entry, { loaded: true, state: entry.backupBlocked ? 'error' : selected ? 'pending' : 'saved', error: entry.backupBlocked ? entry.snapshot.error : null, warning: entry.backupBlocked ? entry.snapshot.warning : null, recoveryDrafts: undefined });
+        publish(entry, { loaded: true, committedRevision: stored?.revision ?? 0, state: entry.backupBlocked ? 'error' : selected ? 'pending' : 'saved', error: entry.backupBlocked ? entry.snapshot.error : null, warning: entry.backupBlocked ? entry.snapshot.warning : null, recoveryDrafts: undefined });
         if (selected && !entry.converting && !entry.backupBlocked) void flushNotes(target);
       } catch (e) {
         publish(entry, { state: 'error', error: message(e) });
@@ -201,24 +203,24 @@ export function createNotesStore(options: { invoke?: typeof invoke; storage?: St
     // A read-only readiness/reconversion callback is not a new user edit.
     // After native recovery, reconverting the same blocks must not fabricate
     // another unsaved document solely because the editor remounted.
-    if (!entry.backupBlocked) entry.dirty = true;
+    if (!entry.backupBlocked && !sameJson(content.json, entry.snapshot.content.json)) entry.dirty = true;
     entry.converting = true;
     publish(entry, { content: structuredClone(content), state: 'pending', error: null });
-    if (!entry.backupBlocked) {
+    if (!entry.backupBlocked && entry.dirty) {
       try { journal(target, entry); }
       catch (error) { backupFailure(entry, error); }
     }
     void markdown.then(value => {
       if (generation !== entry.generation || entry.paused) return;
       entry.converting = false;
-      if (entry.backupBlocked && value !== previousMarkdown) entry.dirty = true;
+      if (value !== previousMarkdown) entry.dirty = true;
       publish(entry, { content: { ...entry.snapshot.content, markdown: value }, state: entry.dirty ? 'pending' : 'saved' });
-      if (!entry.backupBlocked) {
+      if (!entry.backupBlocked && entry.dirty) {
         try { journal(target, entry); }
         catch (error) { backupFailure(entry, error); }
       }
       clearTimeout(entry.timer);
-      if (!entry.backupBlocked) entry.timer = setTimeout(() => void flushNotes(target), 400);
+      if (!entry.backupBlocked && entry.dirty) entry.timer = setTimeout(() => void flushNotes(target), 400);
     }).catch(e => {
       if (generation === entry.generation) publish(entry, { state: 'error', error: message(e) });
     });
@@ -238,14 +240,18 @@ export function createNotesStore(options: { invoke?: typeof invoke; storage?: St
         try {
           const revision = await transport<number>('api_write_notes_document', { target, ...content, expectedRevision: entry.revision });
           entry.revision = revision;
+          if (entry.backupBlocked) {
+            // Do not retire the only durable browser copy on just a UI promise
+            // or failed verification. Native readback must match the exact
+            // document/revision acknowledged by the CAS write.
+            const verified = await readNotesDocument(target);
+            if (verified?.revision !== revision || verified.markdown !== content.markdown || !sameJson(verified.json ?? null, content.json)) throw new Error('Notes conflict or native recovery verification failed. Original draft retained.');
+          }
+          // This acknowledgement belongs to the captured target, even when a
+          // newer draft owns its editor. Notify canonical readers without marking
+          // that draft saved or retiring its recovery journal.
+          publish(entry, { committedRevision: revision });
           if (generation === entry.generation) {
-            if (entry.backupBlocked) {
-              // Do not retire the only durable browser copy on just a UI promise
-              // or failed verification. Native readback must match the exact
-              // document/revision acknowledged by the CAS write.
-              const verified = await readNotesDocument(target);
-              if (entry.generation !== generation || verified?.revision !== revision || verified.markdown !== content.markdown || !sameJson(verified.json ?? null, content.json)) throw new Error('Notes conflict or native recovery verification failed. Original draft retained.');
-            }
             const consumed = [...entry.sources, ...(entry.journal ? [entry.journal] : [])];
             // A legacy receipt itself needs storage. With zero capacity, keep
             // the immutable supersession record AND its legacy sources instead

@@ -27,17 +27,27 @@ let selectedText='Live text',selectedRowId='old-line';
 let outputPath:string|null='/synthetic/user-selected.custom',writeError=false,pickerWait:Promise<void>|null=null;
 const written:Array<{path:string;text:string}>=[],toasts:Array<{kind:string;text:string}>=[];
 let savedSummary='Stored summary', archivedSummary='', mutations=0, failNotes=false, failSummary=false, version=0, pendingSummary=false;
-let holdNotes=false, holdSummary=false, holdWrite=false, failNotesConversion=false;
+let holdNotes=false, holdSummary=false, holdWrite=false, failNotesConversion=false, failAfterSuccessfulWrite=false;
 const conversions:Array<{kind:string;resolve:(value:string)=>void}> = [];
 let releaseWrite:(()=>void)|undefined;
 let actionWait:Promise<void>|null=null, actionReplyWait:Promise<void>|null=null, actionStarted=false, summaryToken=0, summaryExists=true;
 let actionRows:any[]=[];
+let canonicalSummary:any=null, canonicalWait:Promise<void>|null=null;
+const nativeEvents=new Set<()=>void>();
+const audioEvents=new Set<(event:any)=>void>();let audioPresent=false;
+mock.module('@tauri-apps/api/event',()=>({listen:async(name:string,fn:any)=>{const events=name==='post-call-queue-changed'?nativeEvents:name==='audio-cleanup-finished'?audioEvents:null;events?.add(fn);return()=>events?.delete(fn);}}));
 const documents=new Map<string,any>();
 const calls:Array<[string,any]>=[];
 const rows=()=>[{id:selectedRowId,text:selectedText,speaker:'You',audio_start_time:1,audio_end_time:2}];
 const canonical=(target:string)=>target.startsWith('recording:/synthetic/')?`meeting:${target.slice('recording:/synthetic/'.length)}`:target;
 const transport=async(name:string,args:any):Promise<any>=>{
  calls.push([name,structuredClone(args)]);
+ const recording={meetingId:active,title:'Meeting',createdAt:'2020-01-01',bytes:audioPresent?72:0,files:['audio.mp4','mic.mp4','system.mp4'].map(name=>({name,bytes:24})),blocked:audioPresent?null:'No saved audio remains'};
+ if(name==='api_audio_storage')return {totalBytes:recording.bytes,usageComplete:true,recordings:[recording]};
+ if(name==='api_prepare_audio_cleanup'){if(!audioPresent||JSON.stringify(args.meetingIds)!==JSON.stringify([active]))throw new Error('Invalid selection');return {token:`consent:${active}`,recordings:[recording],bytes:72};}
+ if(name==='api_confirm_audio_cleanup'){if(args.token!==`consent:${active}`)throw new Error('Unreviewed scope');audioPresent=false;for(const fn of audioEvents)fn({payload:[active]});return {removedBytes:72,files:recording.files.map(file=>({meetingId:active,name:file.name,status:'removed',removedBytes:24,error:null}))};}
+
+ if(name==='post_call_canonical_summary'){const snapshot=structuredClone(canonicalSummary?.user_edited||canonicalSummary?.post_call?.notes_revision===(documents.get(`meeting:${args.meetingId}`)?.revision??0)?canonicalSummary:null);if(canonicalWait)await canonicalWait;return snapshot;}
  if(name==='api_notes_recording_target')return `recording:/synthetic/${args.meetingId}`;
  if(name==='api_read_notes_document')return structuredClone(documents.get(canonical(args.target))??null);
  if(name==='api_write_notes_document'){
@@ -47,9 +57,10 @@ const transport=async(name:string,args:any):Promise<any>=>{
   if((previous?.revision??0)!==args.expectedRevision)throw new Error('Notes conflict: competing writer');
   const revision=args.expectedRevision+1;
   documents.set(target,{markdown:args.markdown,json:structuredClone(args.json),revision,source:'user_notes'});
+  if(failAfterSuccessfulWrite){failAfterSuccessfulWrite=false;failNotes=true;}
   return revision;
  }
- if(name==='list_transcript_versions')return {selected_id:version?'new':'live',revision:7+version,audio_available:true,versions:[{id:'new',kind:'refined',status:'ready',created_at:'2026-11-18',settings_json:'{"recording_metadata":{"in_person":false},"source_map":{"new-line":"microphone"}}'}]};
+ if(name==='list_transcript_versions')return {selected_id:version?'new':'live',revision:7+version,audio_available:audioPresent,versions:[{id:'new',kind:'refined',status:'ready',created_at:'2026-11-18',settings_json:'{"recording_metadata":{"in_person":false},"source_map":{"new-line":"microphone"}}'}]};
  if(name==='get_transcript_version')return [{id:'new-line',text:'Selected text',speaker:'You'}];
  if(name==='get_selected_transcript')return {version_id:version?'new':'live',revision:7+version,settings_json:'{"source_map":{"new-line":"microphone"}}',segments:rows()};
  if(name==='api_action_sync_context')return !summaryExists?null:{meetingId:args.meetingId,versionId:version?'new':'live',revision:7+version,summaryToken:String(summaryToken),summary:{markdown:savedSummary},transcripts:rows()};
@@ -63,7 +74,7 @@ const transport=async(name:string,args:any):Promise<any>=>{
   return [];
  }
  if(name==='api_get_meeting_summary_language')return {language:null,storage:'metadata'};
- if(name==='api_save_meeting_summary'){if(failSummary)throw new Error('Summary storage unavailable');if(summaryExists){savedSummary=args.summary.markdown;summaryToken++;}return;}
+ if(name==='api_save_meeting_summary'){if(failSummary)throw new Error('Summary storage unavailable');if(summaryExists){savedSummary=args.summary.markdown;summaryToken++;if(args.summary.post_call)canonicalSummary=structuredClone(args.summary);}return;}
  if(name==='select_transcript_version'||name==='correct_transcript_text'){
   if(pendingSummary)throw new Error('Wait for or cancel summary generation before selecting a transcript version');
   archivedSummary=savedSummary;savedSummary='';summaryExists=false;summaryToken++;version++;mutations++;if(name==='select_transcript_version'){selectedText='Selected text';selectedRowId='new-line';}else selectedText=args.text;return;
@@ -71,18 +82,18 @@ const transport=async(name:string,args:any):Promise<any>=>{
  if(name==='api_export_meeting_snapshot'){
   const notes=structuredClone(documents.get(`meeting:${args.meetingId}`)??{markdown:'',json:null,revision:0});
   if(notes.revision!==args.expectedNotesRevision)throw new Error('Notes changed while capturing export');
-  return {id:args.meetingId,title:'Meeting',createdAt:'2026-11-18',capturedAt:'2026-11-18T10:00:00Z',audioAvailable:false,notes:{...notes,source:'user_notes'},summary:savedSummary?JSON.stringify({markdown:savedSummary}):null,summaryStatus:savedSummary?'completed':null,transcripts:rows().map(row=>({id:row.id,text:row.text,speaker:row.speaker,audioStartTime:row.audio_start_time})),actions:[]};
+  return {id:args.meetingId,title:'Meeting',createdAt:'2026-11-18',capturedAt:'2026-11-18T10:00:00Z',audioAvailable:audioPresent,notes:{...notes,source:'user_notes'},summary:savedSummary?(canonicalSummary&&!canonicalSummary.user_edited&&canonicalSummary.post_call.notes_revision!==notes.revision?null:JSON.stringify(canonicalSummary??{markdown:savedSummary})):null,summaryStatus:savedSummary?'completed':null,transcripts:rows().map(row=>({id:row.id,text:row.text,speaker:row.speaker,audioStartTime:row.audio_start_time})),actions:actionRows};
  }
- if(name==='api_library_materials')return [{id:active,transcriptCount:rows().length,hasNotes:documents.has(`meeting:${active}`),hasSummary:!!savedSummary,summaryStatus:savedSummary?'completed':null,audioAvailable:false}];
+ if(name==='api_library_materials')return [{id:active,transcriptCount:rows().length,hasNotes:documents.has(`meeting:${active}`),hasSummary:!!savedSummary,summaryStatus:savedSummary?'completed':null,audioAvailable:audioPresent}];
  if(name==='api_search_library'){
   const needle=args.query.toLowerCase(),notes=documents.get(`meeting:${active}`),hits:any[]=[];
   if(needle==='api'&&notes?.markdown===richMarkdown)hits.push({kind:'notes',id:`notes-${active}`,meetingId:active,title:'Meeting',snippet:'Заметки RU/EN\nAPI follow-up'});
+  if(!hits.length&&savedSummary.toLowerCase().includes(needle))hits.push({kind:'summary',id:`summary-${active}`,meetingId:active,title:'Meeting',snippet:savedSummary});
   if(!hits.length&&selectedText.toLowerCase().includes(needle))hits.push({kind:'transcript',id:selectedRowId,transcriptId:selectedRowId,meetingId:active,title:'Meeting',snippet:selectedText,audioStartTime:1});
   return hits;
  }
  throw new Error(name);
 };
-mock.module('@tauri-apps/api/event', () => ({ listen: async () => () => {} }));
 mock.module('@tauri-apps/api/core',()=>({invoke:transport}));
 const empty=()=>null;
 mock.module('lucide-react',()=>Object.fromEntries(['AlertTriangle','ChevronDown','FileText','Languages','ListChecks','NotebookPen','RefreshCw','Settings2','Sparkles','Square','Wand2','Clipboard','FileJson','FileType','Files','ScrollText','ArrowUpRight','Check','Download','FileAudio','FolderInput','Layers','Library','MoreHorizontal','Pencil','Plus','Search','Trash2','X'].map(name=>[name,empty])));
@@ -154,7 +165,7 @@ mock.module('@/components/groups/GroupEditor',()=>({openGroupEditor(){}}));
 
 const {default:MeetingsPage}=await import('../../src/app/meetings/page');
 const {default:PageContent}=await import('../../src/app/meeting-details/page-content');
-const {createNotesStore,flushNotes,getNotesSnapshot,notesForContext}=await import('../../src/lib/notes-store');
+const {createNotesStore,flushNotes,getNotesSnapshot,notesForContext,loadNotes,editNotes}=await import('../../src/lib/notes-store');
 let root:ReactTestRenderer|undefined;
 let navigateView:(id:string,summary:string)=>void;
 function Page(){
@@ -169,7 +180,7 @@ const ready=async()=>{await act(async()=>{for(const fn of [...timers.values()])f
 async function mount(seed=true){active=`combined-${++seq}`;if(seed)documents.set(`meeting:${active}`,{markdown:'Stored notes',json:null,revision:1,source:'user_notes'});await act(async()=>{root=create(<Page/>);});await ready();await act(async()=>{await flushNotes(`meeting:${active}`);});}
 async function review(operation:string){await act(async()=>button(operation==='select'?'Review snapshot':'Correct selected text').props.onClick());}
 const mutate=(operation:string)=>button(operation==='select'?'Save current corrections':'Save text correction').props.onClick();
-afterEach(async()=>{holdNotes=false;holdSummary=false;holdWrite=false;failNotes=false;failSummary=false;pendingSummary=false;failNotesConversion=false;releaseWrite?.();for(const p of conversions.splice(0))p.resolve(richMarkdown);await act(async()=>root?.unmount());root=undefined;timers.clear();storeTimers.clear();storage.clear();documents.clear();calls.length=0;reloads=0;mutations=0;version=0;selectedText='Live text';selectedRowId='old-line';written.length=0;toasts.length=0;outputPath='/synthetic/user-selected.custom';writeError=false;pickerWait=null;navigated='';quota=false;savedSummary='Stored summary';archivedSummary='';releaseWrite=undefined;clock=0;actionWait=null;actionReplyWait=null;actionStarted=false;summaryToken=0;summaryExists=true;actionRows=[];});
+afterEach(async()=>{failAfterSuccessfulWrite=false;holdNotes=false;holdSummary=false;holdWrite=false;failNotes=false;failSummary=false;pendingSummary=false;failNotesConversion=false;releaseWrite?.();for(const p of conversions.splice(0))p.resolve(richMarkdown);await act(async()=>root?.unmount());root=undefined;timers.clear();storeTimers.clear();storage.clear();documents.clear();calls.length=0;reloads=0;mutations=0;version=0;selectedText='Live text';selectedRowId='old-line';written.length=0;toasts.length=0;outputPath='/synthetic/user-selected.custom';writeError=false;pickerWait=null;navigated='';quota=false;savedSummary='Stored summary';archivedSummary='';releaseWrite=undefined;clock=0;actionWait=null;actionReplyWait=null;actionStarted=false;summaryToken=0;summaryExists=true;actionRows=[];canonicalSummary=null;canonicalWait=null;nativeEvents.clear();audioEvents.clear();audioPresent=false;});
 
 const visible=(node:any):string=>typeof node==='string'?node:Array.isArray(node)?node.map(visible).join(''):(node?.children??[]).map(visible).join('');
 const exactButton=(label:string,last=false)=>{const found=root!.root.findAllByType('button').filter(node=>visible(node)===label);return last?found.at(-1)!:found[0]!;};
@@ -353,4 +364,180 @@ test('navigation cancels old extraction UI completion without blocking the new m
   expect(root!.root.findAllByProps({'aria-label':'Summary editor'})).toHaveLength(0);
   expect(editor('Notes editor').props.value).toContain('Meeting B notes');
  }finally{await act(async()=>{release();await work;});}
+},60000);
+
+
+const publishCanonical=()=>{
+ canonicalSummary={markdown:'## Summary\n\nCanonical report discussed',post_call:{source:'post_call_results',job_epoch:3,version_id:'live',transcript_revision:7,notes_revision:documents.get(`meeting:${active}`)?.revision??0,vocabulary_revision:0}};
+ savedSummary=canonicalSummary.markdown;summaryExists=true;summaryToken++;
+ actionRows=[{id:'generated-task',text:'Send report',done:false,source:'ai',transcriptId:'old-line',audioTime:1}];
+};
+
+test('canonical native publication refreshes normal detail editor/tasks/library and both exports',async()=>{
+ savedSummary='';summaryExists=false;await mount();
+ const notesIdentity=editor('Notes editor').props['data-engine'];
+ await act(async()=>{publishCanonical();for(const event of nativeEvents)event();});await ready();
+ expect(editor('Summary editor').props.value).toContain('Canonical report discussed');
+ expect(visible(root!.toJSON())).toContain('Send report');expect(editor('Notes editor').props['data-engine']).toBe(notesIdentity);
+ await detailExport();expect(written).toHaveLength(1);expect(written[0].text).toContain('Canonical report discussed');expect(written[0].text).toContain('Send report');
+ await act(async()=>root!.update(<MeetingsPage/>));await search('Canonical');
+ expect(visible(root!.toJSON())).toContain('Canonical report discussed');
+ await act(async()=>exactButton('Export…').props.onClick());await act(async()=>exactButton('Export',true).props.onClick());
+ expect(written).toHaveLength(2);expect(written[1].text).toContain('Canonical report discussed');expect(written[1].text).toContain('Send report');expect(written[0].text).toContain('job epoch 3');expect(written[1].text).toContain(`Notes revision ${canonicalSummary.post_call.notes_revision}`);
+},60000);
+
+test('canonical late refresh cannot replace an immediate rich summary draft or navigated meeting',async()=>{
+ await mount();const summaryIdentity=editor('Summary editor').props['data-engine'];
+ let release!:()=>void;canonicalWait=new Promise<void>(resolve=>{release=resolve;});
+ await act(async()=>{publishCanonical();for(const event of nativeEvents)event();});
+ holdSummary=true;await act(async()=>editor('Summary editor').props.onChange({target:{blocks:rich}}));
+ await act(async()=>{release();root!.update(<Page/>);});expect(editor('Summary editor').props['data-engine']).toBe(summaryIdentity);expect(editor('Summary editor').props.value).toContain('API follow-up');
+ holdSummary=false;await act(async()=>{for(const item of conversions.splice(0))item.resolve(richMarkdown);});
+ canonicalWait=new Promise<void>(resolve=>{release=resolve;});
+ await act(async()=>{for(const event of nativeEvents)event();});
+ active=`combined-${++seq}`;documents.set(`meeting:${active}`,{markdown:'Meeting B notes',json:null,revision:1,source:'user_notes'});
+ canonicalSummary=null;savedSummary='Meeting B summary';await act(async()=>{navigateView(active,savedSummary);release();});await ready();
+ expect(editor('Summary editor').props.value).toContain('Meeting B summary');expect(editor('Summary editor').props.value).not.toContain('Canonical report');
+},60000);
+
+
+test('R1 same-target committed Notes save clears obsolete generated summary without focus or queue events',async()=>{
+ savedSummary='';summaryExists=false;await mount();
+ await act(async()=>{publishCanonical();for(const event of nativeEvents)event();});await ready();
+ const identity=editor('Notes editor').props['data-engine'];
+ expect(editor('Summary editor').props.value).toContain('Canonical report discussed');
+ await act(async()=>editor('Notes editor').props.onChange({target:{blocks:rich}}));
+ await act(async()=>{await flushNotes(`meeting:${active}`);});
+ expect(await transport('post_call_canonical_summary',{meetingId:active})).toBeNull();
+ const {captureMeetingExport}=await import('../../src/lib/meeting-export');expect((await captureMeetingExport(active)).summary).toBeNull();
+ expect(root!.root.findAllByProps({'aria-label':'Summary editor'})).toHaveLength(0);
+ expect(editor('Notes editor').props['data-engine']).toBe(identity);expect(documents.get(`meeting:${active}`).json).toEqual(rich);
+ await detailExport();expect(written[0].text).toContain('No summary available');expect(written[0].text).not.toContain('Canonical report discussed');
+ await act(async()=>root!.update(<MeetingsPage/>));await act(async()=>exactButton('Export…').props.onClick());await act(async()=>exactButton('Export',true).props.onClick());
+ expect(written[1].text).toContain('No summary available');expect(written[1].text).not.toContain('Canonical report discussed');expect(written[1].text).toContain(richMarkdown);
+},60000);
+
+
+test('R1 pending or failed Notes and commits for another target do not invalidate the focused summary',async()=>{
+ savedSummary='';summaryExists=false;await mount();await act(async()=>{publishCanonical();for(const event of nativeEvents)event();});await ready();
+ const revision=documents.get(`meeting:${active}`).revision;
+ const reads=()=>calls.filter(([name])=>name==='post_call_canonical_summary').length;
+ const before=reads();holdNotes=true;
+ await act(async()=>editor('Notes editor').props.onChange({target:{blocks:rich}}));
+ await act(async()=>{await flushNotes(`meeting:${active}`);});
+ expect(getNotesSnapshot(`meeting:${active}`).committedRevision).toBe(revision);expect(reads()).toBe(before);expect(root!.root.findAllByProps({'aria-label':'Summary editor'})).toHaveLength(1);
+ holdNotes=false;failNotes=true;await act(async()=>{for(const c of conversions.splice(0))c.resolve(richMarkdown);});await act(async()=>{await flushNotes(`meeting:${active}`);});
+ expect(getNotesSnapshot(`meeting:${active}`).state).toBe('error');expect(reads()).toBe(before);
+ failNotes=false;await act(async()=>{await loadNotes('meeting:unrelated');editNotes('meeting:unrelated',{markdown:'Other notes',json:[]},Promise.resolve('Other notes'));});
+ await act(async()=>{await flushNotes('meeting:unrelated');});expect(reads()).toBe(before);expect(editor('Summary editor').props.value).toContain('Canonical report discussed');
+ await act(async()=>{await flushNotes(`meeting:${active}`);});
+ expect(getNotesSnapshot(`meeting:${active}`).committedRevision).toBe(revision+1);expect(root!.root.findAllByProps({'aria-label':'Summary editor'})).toHaveLength(0);
+},60000);
+
+test('R1 Notes commit preserves a dirty rich summary awaiting conversion',async()=>{
+ savedSummary='';summaryExists=false;await mount();await act(async()=>{publishCanonical();for(const event of nativeEvents)event();});await ready();
+ const identity=editor('Summary editor').props['data-engine'];holdSummary=true;
+ await act(async()=>editor('Summary editor').props.onChange({target:{blocks:rich}}));
+ await act(async()=>editor('Notes editor').props.onChange({target:{value:'New personal Notes'}}));
+ await act(async()=>{await flushNotes(`meeting:${active}`);root!.update(<Page/>);});
+ expect(await transport('post_call_canonical_summary',{meetingId:active})).toBeNull();
+ expect(editor('Summary editor').props['data-engine']).toBe(identity);expect(editor('Summary editor').props.value).toContain('API follow-up');
+ holdSummary=false;await act(async()=>{for(const c of conversions.splice(0))c.resolve(richMarkdown);});
+ expect(editor('Summary editor').props['data-engine']).toBe(identity);expect(editor('Summary editor').props.value).toContain('API follow-up');
+},60000);
+
+test('R1 manual saved summary remains visible and exportable after Notes commit',async()=>{
+ savedSummary='';summaryExists=false;await mount();await act(async()=>{publishCanonical();for(const event of nativeEvents)event();});await ready();
+ await act(async()=>editor('Summary editor').props.onChange({target:{value:'Manual summary kept'}}));
+ await ready();expect(canonicalSummary.user_edited).toBe(true);
+ await act(async()=>editor('Notes editor').props.onChange({target:{blocks:rich}}));await act(async()=>{await flushNotes(`meeting:${active}`);});
+ expect(editor('Summary editor').props.value).toContain('Manual summary kept');
+ const {captureMeetingExport}=await import('../../src/lib/meeting-export');expect((await captureMeetingExport(active)).summary).toContain('Manual summary kept');
+},60000);
+
+test('R1 committed Notes revision fences a previously captured canonical reply after await',async()=>{
+ savedSummary='';summaryExists=false;await mount();await act(async()=>{publishCanonical();for(const event of nativeEvents)event();});await ready();
+ let release!:()=>void;canonicalWait=new Promise<void>(resolve=>{release=resolve;});
+ await act(async()=>{for(const event of nativeEvents)event();});
+ await act(async()=>editor('Notes editor').props.onChange({target:{blocks:rich}}));await act(async()=>{await flushNotes(`meeting:${active}`);});
+ await act(async()=>{release();});
+ expect(root!.root.findAllByProps({'aria-label':'Summary editor'})).toHaveLength(0);
+},60000);
+
+ test('R2 superseded Notes ack clears focused generated summary while rich B fails, then exports agree after retry',async()=>{
+ savedSummary='';summaryExists=false;await mount();await act(async()=>{publishCanonical();for(const event of nativeEvents)event();});await ready();
+ const target=`meeting:${active}`,revision=documents.get(target).revision;
+ const identity=editor('Notes editor').props['data-engine'];
+ holdWrite=true;failAfterSuccessfulWrite=true;
+ await act(async()=>editor('Notes editor').props.onChange({target:{value:'A committed'}}));
+ let saving!:Promise<void>;await act(async()=>{saving=flushNotes(target);});
+ await act(async()=>editor('Notes editor').props.onChange({target:{blocks:rich}}));
+ holdWrite=false;await act(async()=>{releaseWrite?.();await saving;});
+ expect(documents.get(target).revision).toBe(revision+1);
+ expect(getNotesSnapshot(target).state).toBe('error');
+ expect(getNotesSnapshot(target).content.json).toEqual(rich);
+ expect(await transport('post_call_canonical_summary',{meetingId:active})).toBeNull();
+ expect(root!.root.findAllByProps({'aria-label':'Summary editor'})).toHaveLength(0);
+ expect(getNotesSnapshot(target).committedRevision).toBe(revision+1);
+ expect(editor('Notes editor').props['data-engine']).toBe(identity);
+ const {captureMeetingExport}=await import('../../src/lib/meeting-export');
+ await act(async()=>{await expect(captureMeetingExport(active)).rejects.toThrow('Notes disk unavailable');});
+ expect([...storage.values()].some(raw=>JSON.parse(raw).content?.markdown===richMarkdown)).toBe(true);
+ failNotes=false;await act(async()=>{await flushNotes(target);});
+ expect(getNotesSnapshot(target).committedRevision).toBe(revision+2);
+ expect(getNotesSnapshot(target).state).toBe('saved');
+ expect((await captureMeetingExport(active)).summary).toBeNull();
+ await detailExport();expect(written[0].text).toContain('No summary available');expect(written[0].text).not.toContain('Canonical report discussed');
+ await act(async()=>root!.update(<MeetingsPage/>));await act(async()=>exactButton('Export…').props.onClick());await act(async()=>exactButton('Export',true).props.onClick());
+ expect(written[1].text).toContain(richMarkdown);expect(written[1].text).not.toContain('Canonical report discussed');
+ },60000);
+
+for(const control of ['manual draft','navigation'])test(`R2 superseded Notes ack preserves ${control} ownership`,async()=>{
+ savedSummary='';summaryExists=false;await mount();await act(async()=>{publishCanonical();for(const event of nativeEvents)event();});await ready();
+ const target=`meeting:${active}`,revision=documents.get(target).revision;
+ holdWrite=true;failAfterSuccessfulWrite=true;
+ await act(async()=>editor('Notes editor').props.onChange({target:{value:'A committed'}}));
+ let saving!:Promise<void>;await act(async()=>{saving=flushNotes(target);});
+ await act(async()=>editor('Notes editor').props.onChange({target:{blocks:rich}}));
+ let identity:any;
+ if(control==='manual draft'){
+  holdSummary=true;await act(async()=>editor('Summary editor').props.onChange({target:{blocks:rich}}));
+  identity=editor('Summary editor').props['data-engine'];
+ }else{
+  active=`combined-${++seq}`;documents.set(`meeting:${active}`,{markdown:'Other meeting notes',json:null,revision:9,source:'user_notes'});
+  canonicalSummary=null;savedSummary='Other meeting summary';await act(async()=>navigateView(active,savedSummary));await ready();
+ }
+ holdWrite=false;await act(async()=>{releaseWrite?.();await saving;});
+ expect(getNotesSnapshot(target).committedRevision).toBe(revision+1);expect(getNotesSnapshot(target).state).toBe('error');
+ if(control==='manual draft'){
+  await act(async()=>root!.update(<Page/>));
+  expect(editor('Summary editor').props['data-engine']).toBe(identity);expect(editor('Summary editor').props.value).toContain('API follow-up');
+ }else{
+  expect(editor('Summary editor').props.value).toContain('Other meeting summary');expect(getNotesSnapshot(`meeting:${active}`).committedRevision).toBe(9);
+ }
+},60000);
+
+
+test('authorized audio-only cleanup retains corrected speech Notes canonical tasks search and both ordinary exports',async()=>{
+ audioPresent=true;selectedText='Corrected retained speech';await mount();
+ // Commit the actual rich representation before binding a canonical tuple;
+ // remounting a legacy rich-null document otherwise performs a separate Notes conversion save.
+ await act(async()=>{editNotes(`meeting:${active}`,{markdown:'Stored notes',json:JSON.parse(editor('Notes editor').props.value)},Promise.resolve('Stored notes'));await flushNotes(`meeting:${active}`);});
+ await act(async()=>{publishCanonical();for(const fn of nativeEvents)fn();});await ready();
+ actionRows.push({id:'curated',text:'Curated task retained',owner:'Alice',done:true,edited:true,transcriptId:'old-line',audioTime:1});
+ const original=structuredClone({text:selectedText,notes:documents.get(`meeting:${active}`),summary:canonicalSummary,actions:actionRows});
+ await act(async()=>root!.update(<MeetingsPage/>));
+ await act(async()=>exactButton('Review audio cleanup').props.onClick());
+ const checkbox=root!.root.findByProps({'aria-label':'Select audio for Meeting'});expect(checkbox.props.checked).toBe(false);
+ await act(async()=>checkbox.props.onChange({target:{checked:true}}));
+ await act(async()=>exactButton('Review selected audio').props.onClick());expect(audioPresent).toBe(true);
+ await act(async()=>exactButton('Delete listed audio').props.onClick());expect(audioPresent).toBe(false);
+ expect({text:selectedText,notes:documents.get(`meeting:${active}`),summary:canonicalSummary,actions:actionRows}).toEqual(original);
+ // Navigation closes the storage review; ordinary row export uses the same
+ // saved canonical snapshot, without needing the removed audio.
+ await act(async()=>root!.update(<Page/>));await ready();await detailExport();
+ expect(written[0].text).toContain('Corrected retained speech');expect(written[0].text).toContain('Stored notes');expect(written[0].text).toContain('Canonical report discussed');expect(written[0].text).toContain('Curated task retained');expect(written[0].text).toContain('Audio: unavailable');
+ await act(async()=>root!.update(<MeetingsPage/>));await search('Canonical');expect(visible(root!.toJSON())).toContain('Canonical report discussed');
+ await act(async()=>exactButton('Export…').props.onClick());await act(async()=>exactButton('Export',true).props.onClick());
+ expect(written).toHaveLength(2);for(const value of ['Corrected retained speech','Stored notes','Canonical report discussed','Curated task retained','Audio: unavailable'])expect(written[1].text).toContain(value);
 },60000);

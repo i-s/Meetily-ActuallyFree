@@ -48,6 +48,8 @@ import {
 } from '@/lib/workspace-api';
 import { syncMeetingActionItems, type TranscriptLine } from '@/lib/action-item-sync';
 import { extractActionItems } from '@/lib/action-items';
+import { onPostCallCanonicalChange } from '@/lib/post-call-canonical';
+import { getNotesSnapshot, subscribeNotes } from '@/lib/notes-store';
 import { completeSummaryMarkdown } from '@/lib/summary-markdown';
 import { labelForCode } from '@/lib/summary-languages';
 import { readMeetingSummaryLanguage, saveMeetingSummaryLanguage } from '@/lib/summary-language-preferences';
@@ -220,8 +222,8 @@ function NotesTab({
   const syncing = useRef({ meetingId, work: Promise.resolve() });
   if (syncing.current.meetingId !== meetingId) syncing.current = { meetingId, work: Promise.resolve() };
   const summaryDraftEpoch = useRef(0);
-  const actionView = useRef({ meetingId, aiSummary, transcriptChanging });
-  actionView.current = { meetingId, aiSummary, transcriptChanging };
+  const actionView = useRef({ meetingId, aiSummary, transcriptChanging, summaryUserEdited });
+  actionView.current = { meetingId, aiSummary, transcriptChanging, summaryUserEdited };
   const onSummaryChangeRef = useRef(onSummaryChange);
   onSummaryChangeRef.current = onSummaryChange;
   useEffect(() => {
@@ -244,10 +246,49 @@ function NotesTab({
     return () => { cancelled = true; };
   }, [aiSummary, markdown, meetingId, transcriptChanging, loadItems]);
 
+  const canonicalRefresh = useRef(0);
+  useEffect(() => {
+    let disposed = false;
+    const target = `meeting:${meetingId}`;
+    let notesRevision = getNotesSnapshot(target).committedRevision;
+    const refresh = async () => {
+      const request = ++canonicalRefresh.current;
+      const expectedNotesRevision = getNotesSnapshot(target).committedRevision;
+      const epoch = summaryDraftEpoch.current;
+      const view = actionView.current;
+      // A local user draft owns this editor, including while conversion waits.
+      if (epoch !== 0 || view.transcriptChanging || view.summaryUserEdited || view.aiSummary?.user_edited) return;
+      try {
+        const summary = await invoke<any>('post_call_canonical_summary', { meetingId });
+        const current = actionView.current;
+        if (disposed || request !== canonicalRefresh.current || epoch !== summaryDraftEpoch.current || expectedNotesRevision !== getNotesSnapshot(target).committedRevision || current.meetingId !== meetingId || current.aiSummary !== view.aiSummary || current.transcriptChanging || current.summaryUserEdited) return;
+        if (summary && JSON.stringify(summary) !== JSON.stringify(current.aiSummary)) {
+          onSummaryChangeRef.current(summary, 'system');
+          void loadItems();
+        } else if (!summary && current.aiSummary?.post_call) {
+          onSummaryChangeRef.current(null, 'system');
+          void loadItems();
+        }
+      } catch (error) { console.error('Canonical post-call summary refresh failed', error); }
+    };
+    summaryDraftEpoch.current = 0;
+    void refresh();
+    const stop = onPostCallCanonicalChange(() => void refresh());
+    const stopNotes = subscribeNotes(target, () => {
+      const committed = getNotesSnapshot(target).committedRevision;
+      if (committed === undefined || committed === notesRevision) return;
+      notesRevision = committed;
+      // The native canonical view checks this exact committed Notes revision.
+      // Draft/conversion/error notifications do not invalidate saved output.
+      void refresh();
+    });
+    return () => { disposed = true; ++canonicalRefresh.current; stop(); stopNotes(); };
+  }, [meetingId, loadItems]);
+
   const summarySaver = useAutosave<NotesContent>(async (content) => {
     await invoke('api_save_meeting_summary', {
       meetingId,
-      summary: { markdown: content.markdown, summary_json: content.json },
+      summary: { markdown: content.markdown, summary_json: content.json, ...(aiSummary?.post_call ? { post_call: aiSummary.post_call, user_edited: true } : {}) },
       userEdit: true,
     });
     setUserEdited(true);
@@ -500,7 +541,7 @@ function NotesTab({
               placeholder="The summary is empty."
               onChange={(content) => {
                 lastEditorMarkdown.current = completeSummaryMarkdown({ markdown: content.markdown });
-                onSummaryChange({ markdown: content.markdown, summary_json: content.json }, 'user');
+                onSummaryChange({ markdown: content.markdown, summary_json: content.json, ...(aiSummary?.post_call ? { post_call: aiSummary.post_call, user_edited: true } : {}) }, 'user');
                 summarySaver.schedule(content);
               }}
             />

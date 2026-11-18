@@ -272,6 +272,10 @@ async fn normal_command_rejects_active_capture_and_draining_native_jobs() {
             .is_err()
     );
     crate::audio::recording_commands::ACTIVE.store(false, Ordering::SeqCst);
+    crate::audio::recording_commands::STOPPING.store(true, Ordering::SeqCst);
+    assert!(crate::commands::api_confirm_audio_cleanup(app(), &state, plan.token.clone()).await.is_err());
+    assert!(dir.join("audio.mp4").exists());
+    crate::audio::recording_commands::STOPPING.store(false, Ordering::SeqCst);
     let reader = crate::diarization::operation_guard().await;
     assert!(
         crate::commands::api_confirm_audio_cleanup(app(), &state, plan.token.clone())
@@ -341,7 +345,7 @@ async fn actual_library_search_and_export_survive_cleanup_with_all_database_rows
         sqlx::raw_sql(migration).execute(&f.pool).await.unwrap();
     }
     sqlx::query("INSERT INTO meetings(id,title,created_at,updated_at,folder_path) VALUES('a','Generated meeting','2020-01-01','2020-01-01',?)").bind(dir.to_str().unwrap()).execute(&f.pool).await.unwrap();
-    sqlx::raw_sql("INSERT INTO transcripts(id,meeting_id,transcript,timestamp,speaker,audio_start_time) VALUES('line','a','Исправленная speech API','00:01','You',1.25); INSERT INTO meeting_notes(meeting_id,notes_markdown,revision,created_at,updated_at) VALUES('a','Моя Notes мысль',7,'now','now'); INSERT INTO summary_processes(meeting_id,status,created_at,updated_at,result,user_edited) VALUES('a','completed','now','now','Generated summary',1); INSERT INTO transcript_versions(id,meeting_id,kind,status,created_at,segments_json,summary_json) VALUES('corrected','a','corrections','ready','now','[]','Archived summary'); INSERT INTO transcript_selection VALUES('a','corrected',9); INSERT INTO action_items(id,meeting_id,text,source,edited,transcript_id,audio_time,created_at,updated_at) VALUES('task','a','Preserved user task','user',1,'line',1.25,'now','now'); INSERT INTO post_call_jobs(meeting_id,status,stage,epoch,error) VALUES('a','complete','summary',4,'retained diagnostic'); INSERT INTO post_call_results(meeting_id,version_id,transcript_revision,notes_revision,result_json) VALUES('a','corrected',9,7,'{\"generated\":true}');").execute(&f.pool).await.unwrap();
+    sqlx::raw_sql("INSERT INTO transcripts(id,meeting_id,transcript,timestamp,speaker,audio_start_time) VALUES('line','a','Исправленная speech API','00:01','You',1.25); INSERT INTO meeting_notes(meeting_id,notes_markdown,revision,created_at,updated_at) VALUES('a','Моя Notes мысль',7,'now','now'); INSERT INTO summary_processes(meeting_id,status,created_at,updated_at,result,user_edited) VALUES('a','completed','now','now','Generated summary',1); INSERT INTO transcript_versions(id,meeting_id,kind,status,created_at,segments_json,summary_json) VALUES('corrected','a','corrections','ready','now','[]','Archived summary'); INSERT INTO transcript_selection VALUES('a','corrected',9); INSERT INTO action_items(id,meeting_id,text,source,edited,transcript_id,audio_time,created_at,updated_at) VALUES('task','a','Preserved user task','user',1,'line',1.25,'now','now'); INSERT INTO post_call_jobs(meeting_id,status,stage,epoch,error) VALUES('a','complete','summary',4,'retained diagnostic'); INSERT INTO post_call_results(meeting_id,version_id,transcript_revision,notes_revision,vocabulary_revision,result_json) VALUES('a','corrected',9,7,0,'{\"generated\":true}');").execute(&f.pool).await.unwrap();
     let before = retained_dump(&f.pool).await;
     let plans = Plans::default();
     let plan = prepare(&f.pool, &plans, vec!["a".into()]).await.unwrap();
@@ -488,4 +492,73 @@ async fn abandoned_diarize_meeting_waiter_retains_admission_until_blocking_reade
     let _drained = crate::diarization::operation_guard().await;
     assert!(retained,"diarize_meeting must not release offline admission while its blocking file reader is alive");
     *crate::diarization_reader::BARRIERS.lock().unwrap() = None;
+}
+
+async fn merged_fixture() -> Fixture {
+    let mut f=fixture().await;
+    f.pool=SqlitePoolOptions::new().max_connections(4).connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(f.root.join("merged.sqlite")).create_if_missing(true)).await.unwrap();
+    for migration in crate::migrations::MIGRATIONS {sqlx::raw_sql(migration).execute(&f.pool).await.unwrap();}
+    let dir=meeting_files(&f.root,"owned");
+    sqlx::query("INSERT INTO meetings(id,title,created_at,updated_at,folder_path) VALUES('owned','Generated merged meeting','2020','2020',?)").bind(dir.to_str().unwrap()).execute(&f.pool).await.unwrap();
+    sqlx::raw_sql("INSERT INTO transcripts(id,meeting_id,transcript,timestamp,audio_start_time,audio_end_time,speaker) VALUES('speech','owned','Alice will send report Friday','00:01',1.25,3,'Alice'); INSERT INTO people(id,display_name,normalized_name,is_manual,created_at,updated_at) VALUES('alice','Alice','alice',1,'now','now'); INSERT INTO person_speakers(person_id,meeting_id,speaker_label) VALUES('alice','owned','Alice'); INSERT INTO meeting_notes(meeting_id,notes_markdown,revision,created_at,updated_at) VALUES('owned','Мои Notes, не речь',7,'now','now');").execute(&f.pool).await.unwrap();
+    let selected=crate::database::transcript_versions::selected(&f.pool,"owned").await.unwrap();
+    crate::database::transcript_versions::correct_text(&f.pool,"owned","speech","Alice will send corrected report Friday",selected.revision).await.unwrap();
+    f
+}
+fn meeting_files(root:&std::path::Path,id:&str)->PathBuf {
+    let dir=root.join(id);fs::create_dir(&dir).unwrap();
+    fs::write(dir.join("metadata.json"),br#"{"status":"completed","audio_file":"audio.mp4","mic_audio_file":"mic.mp4","system_audio_file":"system.mp4"}"#).unwrap();
+    for name in ["audio.mp4","mic.mp4","system.mp4"]{fs::write(dir.join(name),b"GENERATED-NOT-REAL-AUDIO").unwrap();}
+    dir
+}
+async fn merged_snapshot(pool:&SqlitePool,job:&crate::post_call::store::Job)->crate::post_call::summary::Snapshot {
+    let mut tx=pool.begin().await.unwrap();crate::post_call::store::projection::capture(&mut tx,job).await.unwrap();tx.commit().await.unwrap();
+    let selected=crate::database::transcript_versions::selected(pool,"owned").await.unwrap();
+    let (notes,revision):(String,i64)=sqlx::query_as("SELECT notes_markdown,revision FROM meeting_notes WHERE meeting_id='owned'").fetch_one(pool).await.unwrap();
+    crate::post_call::summary::Snapshot{revision:crate::post_call::store::Revision{meeting_id:"owned".into(),version_id:selected.version_id,transcript_revision:selected.revision,notes_revision:revision},lines:selected.segments,notes,approved_vocabulary:crate::database::repositories::vocabulary::ApprovedGlobalVocabulary{revision:0,terms:String::new()}}
+}
+fn merged_summary()->String {serde_json::json!({"summary":[{"text":"Corrected report agreed","evidence":[{"source":"transcript","row_id":"speech","quote":"corrected report"}],"owner":null,"deadline":null}],"decisions":[],"tasks":[{"text":"Send corrected report","evidence":[{"source":"transcript","row_id":"speech","quote":"Alice will send corrected report Friday"}],"owner":{"value":"Alice","quote":"Alice will send corrected report Friday"},"deadline":{"value":"Friday","quote":"Friday"}}],"open_questions":[],"uncertainty":[]}).to_string()}
+
+#[tokio::test]
+async fn merged_queue_claim_cancel_cleanup_canonical_search_export_and_text_only_refresh() {
+    use crate::post_call::{store,runner};
+    let f=merged_fixture().await;let plans=Plans::default();
+    let old=prepare(&f.pool,&plans,vec!["owned".into()]).await.unwrap();
+    let mut tx=f.pool.begin().await.unwrap();store::enqueue(&mut tx,"owned").await.unwrap();tx.commit().await.unwrap();
+    assert!(prepare(&f.pool,&plans,vec!["owned".into()]).await.is_err());
+    let claim=store::claim(&f.pool).await.unwrap().unwrap();
+    assert_eq!(execute(&f.pool,&plans,&old.token).await.unwrap().removed_bytes,0);
+    let priority=std::sync::Arc::new(crate::post_call::priority::Priority::default());
+    let background=priority.try_background("owned").await.unwrap();
+    let reader=crate::diarization::operation_guard().await;
+    store::control(&f.pool,"owned","cancel").await.unwrap();priority.cancel("owned");assert!(background.token.is_cancelled());
+    assert!(!store::current(&f.pool,&claim).await.unwrap());
+    let state=crate::state::AppState{db_manager:crate::state::Db(f.pool.clone())};
+    let p=crate::commands::api_prepare_audio_cleanup(&state,vec!["owned".into()]).await.unwrap();
+    assert!(crate::commands::api_confirm_audio_cleanup(crate::tauri::AppHandle::<crate::tauri::TestRuntime>::default(),&state,p.token).await.is_err());
+    drop(reader);drop(background);
+    // A stopped/cancelled local job can explicitly summarize saved text instead.
+    store::control(&f.pool,"owned","refresh").await.unwrap();
+    let job=store::claim(&f.pool).await.unwrap().unwrap();assert_eq!(job.stage,"summary");
+    let token=tokio_util::sync::CancellationToken::new();
+    runner::execute(&f.pool,&job,&token,|_|async{panic!("summary refresh must not invoke ASR")},||async{Ok(merged_snapshot(&f.pool,&job).await)},|_,_|async{Ok(merged_summary())}).await.unwrap();
+    sqlx::query("INSERT INTO action_items(id,meeting_id,text,person_id,done,edited,source,transcript_id,audio_time,created_at,updated_at) VALUES('curated','owned','Keep my task','alice',1,1,'user','speech',1.25,'now','now')").execute(&f.pool).await.unwrap();
+    let before=retained_dump(&f.pool).await;
+    let p=crate::commands::api_prepare_audio_cleanup(&state,vec!["owned".into()]).await.unwrap();let result=crate::commands::api_confirm_audio_cleanup(crate::tauri::AppHandle::<crate::tauri::TestRuntime>::default(),&state,p.token).await.unwrap();assert_eq!(result.removed_bytes,72);
+    assert_eq!(retained_dump(&f.pool).await,before);
+    let snapshot=crate::repositories::library::export_snapshot(&f.pool,"owned",7).await.unwrap();assert!(!snapshot.audio_available);
+    assert_eq!(snapshot.transcripts[0].text,"Alice will send corrected report Friday");assert_eq!(snapshot.notes.markdown,"Мои Notes, не речь");assert!(snapshot.summary.unwrap().contains("Corrected report agreed"));
+    assert_eq!(snapshot.actions.len(),2);assert!(snapshot.actions.iter().any(|a|a.owner.as_deref()==Some("Alice")));
+    for query in ["corrected report","мои notes","Corrected report agreed"] {assert!(!crate::repositories::library::search(&f.pool,query,200,false).await.unwrap().is_empty());}
+    assert_eq!(retained_dump(&f.pool).await,before);
+    // New committed text context after removal proves the real summary runner
+    // dispatches only text, not just an old tuple's cached result.
+    sqlx::query("UPDATE meeting_notes SET notes_markdown='New personal Notes',revision=8 WHERE meeting_id='owned'").execute(&f.pool).await.unwrap();
+    store::control(&f.pool,"owned","refresh").await.unwrap();let job=store::claim(&f.pool).await.unwrap().unwrap();
+    let generated=std::sync::atomic::AtomicBool::new(false); let generated_ref=&generated;
+    runner::execute(&f.pool,&job,&token,|_|async{panic!("deleted audio must not be reopened")},||async{Ok(merged_snapshot(&f.pool,&job).await)},|prompt,_|async move{assert!(prompt.contains("New personal Notes"));generated_ref.store(true,std::sync::atomic::Ordering::SeqCst);Ok(merged_summary())}).await.unwrap();
+    assert!(generated.load(std::sync::atomic::Ordering::SeqCst));assert_eq!(store::results(&f.pool,"owned").await.unwrap().len(),2);
+    let task:(String,String,f64,i64)=sqlx::query_as("SELECT person_id,transcript_id,audio_time,done FROM action_items WHERE id='curated'").fetch_one(&f.pool).await.unwrap();assert_eq!(task,("alice".into(),"speech".into(),1.25,1));
+    assert!(crate::repositories::library::export_snapshot(&f.pool,"owned",8).await.unwrap().summary.unwrap().contains("Corrected report agreed"));
+    assert!(!f.root.join("owned/audio.mp4").exists());
 }
