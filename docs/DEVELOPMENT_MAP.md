@@ -115,6 +115,21 @@ source labels rather than guessing a speaker or switching engines.
 
 ## 3. Post-call processing and model selection
 
+Issue #14's local ASR + diarization candidate workflow, immutable live/refined/
+corrections snapshots, revision-checked selection and text corrections, restart/
+cancellation ownership, source-neutral in-person policy, #9 recovery invariants,
+#15/#16 interfaces and deferred same-audio RU/EN/Mac qualification are documented
+in [ISSUE14_TRANSCRIPT_VERSIONS.md](ISSUE14_TRANSCRIPT_VERSIONS.md). Read it before
+changing retranscription commit or post-call sequencing. Native refinement now
+saves a separate version; it never deletes selected transcript rows on success.
+Meeting details owns the normal version review/select/correction UI. Automatic
+post-recording summary handoff is deferred to the approved subscriber Codex CLI
+integration, rather than silently using a legacy configured text provider.
+The feature note also names the #10 seam: opaque recording metadata and per-row
+capture source maps survive candidate/correction/restore; generated labels are
+not manual identity. #10's accepted session-policy resolution must cover the
+shared native inner path, before the candidate-only restrictive adapter.
+
 Summary-generated title ownership, placeholder rejection and completion refresh
 are documented in [SUMMARY_GENERATED_TITLES.md](SUMMARY_GENERATED_TITLES.md).
 

@@ -950,6 +950,11 @@ pub fn run() {
             #[cfg(target_os = "macos")]
             utils::open_system_settings,
             // Retranscription commands
+            database::transcript_version_commands::get_selected_transcript,
+            database::transcript_version_commands::correct_transcript_text,
+            database::transcript_version_commands::list_transcript_versions,
+            database::transcript_version_commands::get_transcript_version,
+            database::transcript_version_commands::select_transcript_version,
             audio::retranscription::start_retranscription_command,
             audio::retranscription::cancel_retranscription_command,
             audio::retranscription::is_retranscription_in_progress_command,

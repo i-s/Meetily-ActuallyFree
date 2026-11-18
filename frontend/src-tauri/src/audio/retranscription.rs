@@ -2,7 +2,7 @@
 
 use crate::audio::decoder::decode_audio_file;
 use crate::audio::vad::get_speech_chunks_with_thresholds_and_progress;
-use super::common::{create_transcript_segments, split_segment_at_silence, write_transcripts_json};
+use super::common::{create_transcript_segments, split_segment_at_silence};
 use super::constants::AUDIO_EXTENSIONS;
 use crate::config::{DEFAULT_WHISPER_MODEL, DEFAULT_PARAKEET_MODEL};
 use crate::database::models::DateTimeUtc;
@@ -16,7 +16,7 @@ use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager, Runtime};
 
 /// Global flag to track if retranscription is in progress
@@ -24,6 +24,7 @@ static RETRANSCRIPTION_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 
 /// Global flag to signal cancellation
 static RETRANSCRIPTION_CANCELLED: AtomicBool = AtomicBool::new(false);
+static ACTIVE_RETRANSCRIPTION: Mutex<Option<(String, String)>> = Mutex::new(None);
 
 /// RAII guard for RETRANSCRIPTION_IN_PROGRESS flag
 /// Ensures flag is cleared even if retranscription panics or returns early
@@ -44,6 +45,7 @@ impl RetranscriptionGuard {
 
 impl Drop for RetranscriptionGuard {
     fn drop(&mut self) {
+        *ACTIVE_RETRANSCRIPTION.lock().unwrap_or_else(|e| e.into_inner()) = None;
         RETRANSCRIPTION_IN_PROGRESS.store(false, Ordering::SeqCst);
     }
 }
@@ -70,6 +72,7 @@ pub struct RetranscriptionResult {
     pub segments_count: usize,
     pub duration_seconds: f64,
     pub language: Option<String>,
+    pub version_id: String,
 }
 
 /// Error during retranscription
@@ -83,6 +86,8 @@ pub struct RetranscriptionError {
 pub fn is_retranscription_in_progress() -> bool {
     RETRANSCRIPTION_IN_PROGRESS.load(Ordering::SeqCst)
 }
+
+pub(crate) fn refinement_cancelled() -> bool { RETRANSCRIPTION_CANCELLED.load(Ordering::SeqCst) }
 
 /// Cancel ongoing retranscription
 pub fn cancel_retranscription() {
@@ -99,6 +104,7 @@ async fn start_retranscription<R: Runtime>(
     model: Option<String>,
     provider: Option<String>,
     initial_prompt: Option<String>,
+    version_id: String,
 ) -> Result<RetranscriptionResult> {
     let use_parakeet = provider.as_deref() == Some("parakeet");
     let batch_lease = super::common::acquire_stt_batch_lease().await;
@@ -110,6 +116,7 @@ async fn start_retranscription<R: Runtime>(
         model,
         provider,
         initial_prompt,
+        version_id.clone(),
     )
     .await;
     drop(batch_lease);
@@ -120,27 +127,48 @@ async fn start_retranscription<R: Runtime>(
     // Guard will automatically clear flag on drop
     // No need for manual: RETRANSCRIPTION_IN_PROGRESS.store(false, Ordering::SeqCst);
 
+    let result = match result {
+        Ok(res) => {
+            let state = app.state::<AppState>();
+            let pool = state.db_manager.pool();
+            emit_progress(&app, &meeting_id, "diarizing", 90, "Refining speakers locally (cancellation waits for the current inference)...");
+            let refinement = if RETRANSCRIPTION_CANCELLED.load(Ordering::SeqCst) {
+                Err("Retranscription cancelled".into())
+            } else {
+                crate::diarization::diarize_version(&state, &meeting_id, &version_id).await.map(|_| ())
+            };
+            match refinement {
+                Ok(_) if !RETRANSCRIPTION_CANCELLED.load(Ordering::SeqCst) => {
+                    crate::database::transcript_versions::set_status(pool, &version_id, "ready", None).await.map_err(|e| anyhow!(e))?;
+                    Ok(res)
+                }
+                Ok(_) => Err(anyhow!("Retranscription cancelled")),
+                Err(e) => Err(anyhow!(e)),
+            }
+        }
+        Err(e) => Err(e),
+    };
+    if let Err(error) = &result {
+        let state = app.state::<AppState>();
+        let status = if RETRANSCRIPTION_CANCELLED.load(Ordering::SeqCst) { "cancelled" } else { "failed" };
+        crate::database::transcript_versions::set_status(state.db_manager.pool(), &version_id, status, Some(error.to_string())).await.map_err(|e| anyhow!(e))?;
+    }
+
     match &result {
         Ok(res) => {
+            emit_progress(&app, &meeting_id, "complete", 100, "Refined version ready for review; current text unchanged");
             let _ = app.emit(
                 "retranscription-complete",
                 serde_json::json!({
                     "meeting_id": res.meeting_id,
                     "segments_count": res.segments_count,
                     "duration_seconds": res.duration_seconds,
-                    "language": res.language
+                    "language": res.language,
+                    "version_id": res.version_id
                 }),
             );
         }
-        Err(e) => {
-            let _ = app.emit(
-                "retranscription-error",
-                RetranscriptionError {
-                    meeting_id: meeting_id.clone(),
-                    error: e.to_string(),
-                },
-            );
-        }
+        Err(_) => {} // The owning task monitor emits every failure, including persistence errors.
     }
 
     result
@@ -148,7 +176,7 @@ async fn start_retranscription<R: Runtime>(
 
 /// Find audio file in meeting folder
 /// Tries common names first, then scans for any file with an audio extension
-fn find_audio_file(folder: &Path) -> Result<PathBuf> {
+pub(crate) fn find_audio_file(folder: &Path) -> Result<PathBuf> {
     let candidates = [
         "audio.mp4", "audio.m4a", "audio.wav", "audio.mp3",
         "audio.flac", "audio.ogg", "recording.mp4",
@@ -181,24 +209,33 @@ fn find_audio_file(folder: &Path) -> Result<PathBuf> {
 struct RetranscriptionSource {
     path: PathBuf,
     label: &'static str,
+    source_id: &'static str,
     speaker_hint: Option<&'static str>,
     positive_threshold: f32,
     negative_threshold: f32,
 }
 
-fn find_retranscription_sources(folder: &Path, fallback: &Path) -> Result<Vec<RetranscriptionSource>> {
-    let metadata_path = folder.join("metadata.json");
-    let in_person = match std::fs::read(&metadata_path) {
+pub(crate) fn recording_metadata(folder: &Path) -> Result<serde_json::Value> {
+    match std::fs::read(folder.join("metadata.json")) {
         Ok(bytes) => {
             let metadata: serde_json::Value = serde_json::from_slice(&bytes)?;
-            match metadata.get("in_person") {
-                Some(value) => value.as_bool().ok_or_else(|| anyhow!("Invalid in_person recording provenance"))?,
-                None => false, // Legacy recordings used the call-source convention.
-            }
+            if !metadata.is_object() { return Err(anyhow!("Recording metadata is not an object")); }
+            Ok(metadata)
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-        Err(error) => return Err(error.into()),
-    };
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(serde_json::json!({})),
+        Err(error) => Err(error.into()),
+    }
+}
+
+pub(crate) fn recording_in_person(folder: &Path) -> Result<bool> {
+    match recording_metadata(folder)?.get("in_person") {
+        Some(value) => value.as_bool().ok_or_else(|| anyhow!("Invalid in_person recording provenance")),
+        None => Ok(false),
+    }
+}
+
+fn find_retranscription_sources(folder: &Path, fallback: &Path) -> Result<Vec<RetranscriptionSource>> {
+    let in_person = recording_in_person(folder)?;
     let mic_path = folder.join("mic.mp4");
     let system_path = folder.join("system.mp4");
     let mut sources = Vec::new();
@@ -207,15 +244,20 @@ fn find_retranscription_sources(folder: &Path, fallback: &Path) -> Result<Vec<Re
         return Ok(vec![RetranscriptionSource {
             path: if mic_path.is_file() { mic_path } else { fallback.to_path_buf() },
             label: "room microphone",
+            source_id: "room",
             speaker_hint: Some("Microphone"),
             positive_threshold: 0.20,
             negative_threshold: 0.10,
         }]);
     }
+    if mic_path.is_file() != system_path.is_file() {
+        return Err(anyhow!("A retained call source track is missing. Restore both microphone and system tracks before refinement; mixed fallback could lose a speaker."));
+    }
     if mic_path.is_file() && system_path.is_file() {
         sources.push(RetranscriptionSource {
             path: mic_path,
             label: "microphone",
+            source_id: "microphone",
             speaker_hint: Some("You"),
             positive_threshold: 0.20,
             negative_threshold: 0.10,
@@ -223,6 +265,7 @@ fn find_retranscription_sources(folder: &Path, fallback: &Path) -> Result<Vec<Re
         sources.push(RetranscriptionSource {
             path: system_path,
             label: "system audio",
+            source_id: "system",
             speaker_hint: Some("Guest"),
             positive_threshold: 0.50,
             negative_threshold: 0.35,
@@ -232,6 +275,7 @@ fn find_retranscription_sources(folder: &Path, fallback: &Path) -> Result<Vec<Re
         sources.push(RetranscriptionSource {
             path: fallback.to_path_buf(),
             label: "mixed audio",
+            source_id: "mixed",
             speaker_hint: None,
             positive_threshold: 0.50,
             negative_threshold: 0.35,
@@ -241,43 +285,10 @@ fn find_retranscription_sources(folder: &Path, fallback: &Path) -> Result<Vec<Re
     Ok(sources)
 }
 
-fn is_manual_speaker_label(label: &str) -> bool {
-    let trimmed = label.trim();
-    if trimmed.is_empty() {
-        return false;
-    }
-    let is_generated = trimmed.split(" + ").all(|part| {
-        let p = part.trim();
-        p.eq_ignore_ascii_case("guest")
-            || p.eq_ignore_ascii_case("you")
-            || p.eq_ignore_ascii_case("unknown")
-            || p.eq_ignore_ascii_case("mic")
-            || p.eq_ignore_ascii_case("microphone")
-            || p.eq_ignore_ascii_case("system")
-            || p.eq_ignore_ascii_case("system audio")
-            || (p.to_ascii_lowercase().starts_with("speaker ")
-                && p[8..].trim().chars().all(|c| c.is_ascii_digit()))
-    });
-    !is_generated
-}
-
-/// Keep named people across Enhance runs, never promote a source label into
-/// an identity. Legacy call-mic hints retain their existing You convention.
-fn speaker_after_manual_ranges(hint: Option<&str>, start: f64, end: f64, ranges: &[(f64, f64, String)]) -> Option<String> {
-    if hint.is_some_and(|label| label.eq_ignore_ascii_case("you")) {
-        return hint.map(str::to_string);
-    }
-    let mut result = hint.map(str::to_string);
-    let mut best_overlap = 0.05;
-    for (range_start, range_end, name) in ranges {
-        if !is_manual_speaker_label(name) { continue; }
-        let overlap = (end.min(*range_end) - start.max(*range_start)).max(0.0);
-        if overlap > best_overlap {
-            best_overlap = overlap;
-            result = Some(name.clone());
-        }
-    }
-    result
+pub(crate) fn saved_sources(folder: &Path) -> Result<()> {
+    let fallback = find_audio_file(folder)?;
+    let sources = find_retranscription_sources(folder, &fallback)?;
+    if sources.iter().all(|s| s.path.is_file()) { Ok(()) } else { Err(anyhow!("Saved audio is unavailable")) }
 }
 
 fn create_source_labeled_segments(
@@ -302,7 +313,11 @@ async fn run_retranscription<R: Runtime>(
     model: Option<String>,
     provider: Option<String>,
     initial_prompt: Option<String>,
+    version_id: String,
 ) -> Result<RetranscriptionResult> {
+    if super::recording_commands::is_recording_active() || super::recording_commands::is_recording_stopping() {
+        return Err(anyhow!("Recording has priority. Retry post-meeting refinement after recording stops."));
+    }
     let folder_path = PathBuf::from(&meeting_folder_path);
     let audio_path = find_audio_file(&folder_path)?;
     let sources = find_retranscription_sources(&folder_path, &audio_path)?;
@@ -351,6 +366,7 @@ async fn run_retranscription<R: Runtime>(
         let meeting_id_for_vad = meeting_id.clone();
         let source_label = source.label;
         let speaker_hint = source.speaker_hint;
+        let source_id = source.source_id;
         let positive_threshold = source.positive_threshold;
         let negative_threshold = source.negative_threshold;
         let source_progress_span = 20.0 / source_count as f32;
@@ -390,7 +406,7 @@ async fn run_retranscription<R: Runtime>(
         speech_segments.extend(
             source_segments
                 .drain(..)
-                .map(|segment| (segment, speaker_hint)),
+                .map(|segment| (segment, speaker_hint, source_id)),
         );
     }
 
@@ -406,7 +422,7 @@ async fn run_retranscription<R: Runtime>(
     // Diagnostic: log segment duration distribution
     if !speech_segments.is_empty() {
         let durations_ms: Vec<f64> = speech_segments.iter()
-            .map(|(s, _)| s.end_timestamp_ms - s.start_timestamp_ms)
+            .map(|(s, _, _)| s.end_timestamp_ms - s.start_timestamp_ms)
             .collect();
         let total_speech_ms: f64 = durations_ms.iter().sum();
         let avg_duration = total_speech_ms / durations_ms.len() as f64;
@@ -419,7 +435,7 @@ async fn run_retranscription<R: Runtime>(
             (total_speech_ms / 1000.0 / duration_seconds) * 100.0
         );
         // Log first 10 segments for detailed inspection
-        for (i, (seg, speaker_hint)) in speech_segments.iter().take(10).enumerate() {
+        for (i, (seg, speaker_hint, _)) in speech_segments.iter().take(10).enumerate() {
             let dur = seg.end_timestamp_ms - seg.start_timestamp_ms;
             debug!("  Segment {}: {:.0}ms-{:.0}ms ({:.0}ms, {} samples, {:?})",
                 i, seg.start_timestamp_ms, seg.end_timestamp_ms, dur, seg.samples.len(), speaker_hint);
@@ -453,8 +469,8 @@ async fn run_retranscription<R: Runtime>(
     // for the lowest-energy window near the target split point and cut there.
     const MAX_SEGMENT_SAMPLES: usize = 25 * 16000; // 25 seconds at 16kHz
 
-    let mut processable_segments: Vec<(crate::audio::vad::SpeechSegment, Option<&'static str>)> = Vec::new();
-    for (segment, speaker_hint) in &speech_segments {
+    let mut processable_segments: Vec<(crate::audio::vad::SpeechSegment, Option<&'static str>, &'static str)> = Vec::new();
+    for (segment, speaker_hint, source_id) in &speech_segments {
         if segment.samples.len() > MAX_SEGMENT_SAMPLES {
             debug!(
                 "Splitting large segment ({:.0}ms, {} samples) at silence boundaries",
@@ -467,10 +483,10 @@ async fn run_retranscription<R: Runtime>(
             processable_segments.extend(
                 sub_segments
                     .into_iter()
-                    .map(|segment| (segment, *speaker_hint)),
+                    .map(|segment| (segment, *speaker_hint, *source_id)),
             );
         } else {
-            processable_segments.push((segment.clone(), *speaker_hint));
+            processable_segments.push((segment.clone(), *speaker_hint, *source_id));
         }
     }
 
@@ -480,9 +496,10 @@ async fn run_retranscription<R: Runtime>(
     // Process each speech segment with progress updates
     let mut all_transcripts: Vec<(String, f64, f64)> = Vec::new(); // (text, start_ms, end_ms)
     let mut speaker_hints: Vec<Option<&'static str>> = Vec::new();
+    let mut transcript_sources: Vec<&'static str> = Vec::new();
     let mut total_confidence = 0.0f32;
 
-    for (i, (segment, speaker_hint)) in processable_segments.iter().enumerate() {
+    for (i, (segment, speaker_hint, source_id)) in processable_segments.iter().enumerate() {
         // Check for cancellation before each segment
         if RETRANSCRIPTION_CANCELLED.load(Ordering::SeqCst) {
             return Err(anyhow!("Retranscription cancelled"));
@@ -558,6 +575,7 @@ async fn run_retranscription<R: Runtime>(
             );
             all_transcripts.push((text, segment.start_timestamp_ms, segment.end_timestamp_ms));
             speaker_hints.push(*speaker_hint);
+            transcript_sources.push(*source_id);
             total_confidence += conf;
         } else {
             debug!("Segment {}/{}: {:.1}s — empty transcription", i + 1, processable_count, segment_duration_sec);
@@ -588,7 +606,7 @@ async fn run_retranscription<R: Runtime>(
         .try_state::<AppState>()
         .ok_or_else(|| anyhow!("App state not available"))?;
 
-    // Wrap delete+insert+update in a transaction to prevent data loss
+    // Candidate JSON is independent from selected rows and recording recovery files.
     let pool = app_state.db_manager.pool();
     let stored_recording_start: DateTimeUtc =
         sqlx::query_scalar("SELECT created_at FROM meetings WHERE id = ?")
@@ -599,120 +617,19 @@ async fn run_retranscription<R: Runtime>(
     let recording_started_at = crate::api::recording_started_at_from_folder(&meeting_folder_path)
         .unwrap_or(stored_recording_start.0);
 
-    // Load existing transcripts before deleting them to preserve any manually assigned speaker names
-    let existing_transcripts: Vec<(Option<f64>, Option<f64>, Option<String>)> = sqlx::query_as(
-        "SELECT audio_start_time, audio_end_time, speaker FROM transcripts WHERE meeting_id = ? ORDER BY audio_start_time ASC",
-    )
-    .bind(&meeting_id)
-    .fetch_all(pool)
-    .await
-    .unwrap_or_default();
+    let segments = create_source_labeled_segments(&all_transcripts, &speaker_hints, recording_started_at)?;
+    if segments.is_empty() { return Err(anyhow!("No transcript produced; previous version retained")); }
+    let source_map = segments.iter().zip(transcript_sources).map(|(segment, source)| (segment.id.clone(), source.to_string())).collect();
+    crate::database::transcript_versions::finish_with_sources(pool, &version_id, &segments, &source_map).await.map_err(|e| anyhow!(e))?;
 
-    let manual_ranges: Vec<(f64, f64, String)> = existing_transcripts
-        .into_iter()
-        .filter_map(|(s_opt, e_opt, spk_opt)| {
-            let spk = spk_opt?;
-            if is_manual_speaker_label(&spk) {
-                let s = s_opt?;
-                let e = e_opt?;
-                if e > s {
-                    Some((s, e, spk))
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    // Reconstructed timestamps must remain stable across repeated runs.
-    let mut segments =
-        create_source_labeled_segments(&all_transcripts, &speaker_hints, recording_started_at)?;
-
-    for segment in &mut segments {
-        if let (Some(start), Some(end)) = (segment.audio_start_time, segment.audio_end_time) {
-            segment.speaker = speaker_after_manual_ranges(segment.speaker.as_deref(), start, end, &manual_ranges);
-        }
-    }
-
-    let mut conn = pool.acquire().await.map_err(|e| anyhow!("DB error: {}", e))?;
-    let mut tx = sqlx::Connection::begin(&mut *conn)
-        .await
-        .map_err(|e| anyhow!("Failed to start transaction: {}", e))?;
-
-    if recording_started_at != stored_recording_start.0 {
-        sqlx::query("UPDATE meetings SET created_at = ? WHERE id = ?")
-            .bind(recording_started_at)
-            .bind(&meeting_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| anyhow!("Failed to repair meeting recording start: {}", e))?;
-    }
-
-    sqlx::query("DELETE FROM transcripts WHERE meeting_id = ?")
-        .bind(&meeting_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| anyhow!("Failed to delete existing transcripts: {}", e))?;
-
-    for segment in &segments {
-        sqlx::query(
-            "INSERT INTO transcripts (id, meeting_id, transcript, timestamp, audio_start_time, audio_end_time, duration, speaker)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
-        )
-        .bind(&segment.id)
-        .bind(&meeting_id)
-        .bind(&segment.text)
-        .bind(&segment.timestamp)
-        .bind(segment.audio_start_time)
-        .bind(segment.audio_end_time)
-        .bind(segment.duration)
-        .bind(&segment.speaker)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| anyhow!("Failed to insert transcript: {}", e))?;
-    }
-
-    tx.commit().await
-        .map_err(|e| anyhow!("Failed to commit transaction: {}", e))?;
-
-    info!(
-        "Updated {} transcripts for meeting {} in transaction",
-        segments.len(),
-        meeting_id
-    );
-
-    // Write updated transcripts.json and metadata.json to the meeting folder
-    emit_progress(&app, &meeting_id, "saving", 90, "Writing transcript files...");
-
-    if let Err(e) = write_transcripts_json(&folder_path, &segments) {
-        warn!("Failed to write transcripts.json: {}", e);
-    }
-
-    // Find audio filename for metadata
-    let audio_filename = audio_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("audio.mp4")
-        .to_string();
-
-    if let Err(e) = write_retranscription_metadata(
-        &folder_path,
-        &meeting_id,
-        duration_seconds,
-        &audio_filename,
-    ) {
-        warn!("Failed to update metadata.json: {}", e);
-    }
-
-    emit_progress(&app, &meeting_id, "complete", 100, "Retranscription complete");
+    emit_progress(&app, &meeting_id, "saving", 85, "ASR candidate saved; speaker refinement is next");
 
     Ok(RetranscriptionResult {
         meeting_id,
         segments_count: segments.len(),
         duration_seconds,
         language,
+        version_id,
     })
 }
 
@@ -938,62 +855,17 @@ async fn get_configured_parakeet_model<R: Runtime>(app: &AppHandle<R>) -> Result
     }
 }
 
-/// Write or update metadata.json for retranscription (preserves existing fields, adds retranscribed_at)
-fn write_retranscription_metadata(
-    folder: &Path,
-    meeting_id: &str,
-    duration_seconds: f64,
-    audio_filename: &str,
-) -> Result<()> {
-    let metadata_path = folder.join("metadata.json");
-    let temp_path = folder.join(".metadata.json.tmp");
-    let now = chrono::Utc::now().to_rfc3339();
-
-    // Try to read existing metadata and update it
-    let json = if metadata_path.exists() {
-        let existing = std::fs::read_to_string(&metadata_path)?;
-        let mut value: serde_json::Value = serde_json::from_str(&existing)?;
-        if let Some(obj) = value.as_object_mut() {
-            obj.insert("duration_seconds".to_string(), serde_json::json!(duration_seconds));
-            obj.insert("retranscribed_at".to_string(), serde_json::json!(now));
-            obj.insert("status".to_string(), serde_json::json!("completed"));
-            obj.insert("transcript_file".to_string(), serde_json::json!("transcripts.json"));
-            obj.remove("detected_summary_language");
-        }
-        value
-    } else {
-        serde_json::json!({
-            "version": "1.0",
-            "meeting_id": meeting_id,
-            "created_at": now,
-            "completed_at": now,
-            "retranscribed_at": now,
-            "duration_seconds": duration_seconds,
-            "audio_file": audio_filename,
-            "transcript_file": "transcripts.json",
-            "status": "completed",
-            "source": "retranscription"
-        })
-    };
-
-    let json_string = serde_json::to_string_pretty(&json)?;
-    std::fs::write(&temp_path, &json_string)?;
-    std::fs::rename(&temp_path, &metadata_path)?;
-
-    info!("Wrote metadata.json to {}", metadata_path.display());
-    Ok(())
-}
-
 // Tauri commands
 
 /// Response when retranscription is started
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RetranscriptionStarted {
+    pub version_id: String,
     pub meeting_id: String,
     pub message: String,
 }
 
-// Start retranscription (Beta gated using configContext.betaFeatures)
+// Normal meeting-details entrypoint; only local engines and owned saved audio.
 #[tauri::command]
 pub async fn start_retranscription_command<R: Runtime>(
     app: AppHandle<R>,
@@ -1005,6 +877,19 @@ pub async fn start_retranscription_command<R: Runtime>(
     vocabulary_terms: Option<String>,
     vocabulary_scope: Option<String>,
 ) -> Result<RetranscriptionStarted, String> {
+
+    if !matches!(provider.as_deref(), None | Some("whisper") | Some("parakeet") | Some("localWhisper")) {
+        return Err("Post-meeting ASR supports only local Whisper or Parakeet".into());
+    }
+    let state = app.try_state::<AppState>().ok_or("Database not initialized")?;
+    let stored_folder: Option<String> = sqlx::query_scalar("SELECT folder_path FROM meetings WHERE id = ?")
+        .bind(&meeting_id).fetch_one(state.db_manager.pool()).await.map_err(|e| e.to_string())?;
+    if stored_folder.as_deref() != Some(meeting_folder_path.as_str()) { return Err("Recording folder does not belong to this meeting".into()); }
+    saved_sources(Path::new(&meeting_folder_path)).map_err(|e| e.to_string())?;
+    if super::recording_commands::is_recording_active() || super::recording_commands::is_recording_stopping() {
+        return Err("Finish the current recording before post-meeting refinement".into());
+    }
+    if !recording_in_person(Path::new(&meeting_folder_path)).map_err(|e| e.to_string())? && !crate::diarization::diarization_models_available().await? { return Err("Download the selected local diarization model before refinement".into()); }
 
     // Reserve before returning so duplicate requests and cancellation also see
     // jobs queued behind an offline diarization pass.
@@ -1044,42 +929,69 @@ pub async fn start_retranscription_command<R: Runtime>(
             .map_err(|error| error.to_string())?
     };
 
+    let model = Some(match model {
+        Some(model) => model,
+        None if use_parakeet => get_configured_parakeet_model(&app).await.map_err(|e| e.to_string())?,
+        None => get_configured_whisper_model(&app).await.map_err(|e| e.to_string())?,
+    });
+    let recording_metadata = recording_metadata(Path::new(&meeting_folder_path)).map_err(|e| e.to_string())?;
+    let mut diarization_config = crate::diarization::get_diarization_config();
+    // Candidate auto-detection uses the supported eight-speaker capacity, never
+    // a stale count preference which could suppress a remote track.
+    diarization_config.nemotron_max_speakers = 8;
+    let version_id = crate::database::transcript_versions::begin(state.db_manager.pool(), &meeting_id,
+        &serde_json::json!({"provider": provider, "model": model, "language": language, "vocabulary_prompt": initial_prompt, "recording_metadata": recording_metadata, "label_origin": "generated_asr", "diarization_engine": diarization_config.engine, "diarization_config": diarization_config})).await?;
+    *ACTIVE_RETRANSCRIPTION.lock().unwrap_or_else(|e| e.into_inner()) = Some((meeting_id.clone(), version_id.clone()));
+    let response_version = version_id.clone();
+    drop(state);
+
     // Clone values for the spawned task
     let meeting_id_clone = meeting_id.clone();
 
     // Spawn the retranscription in a background task
     tauri::async_runtime::spawn(async move {
         let _operation_guard = crate::diarization::operation_guard().await;
-        let result = start_retranscription(
-            guard,
-            app,
-            meeting_id_clone,
-            meeting_folder_path,
-            language,
-            model,
-            provider,
-            initial_prompt,
-        )
-        .await;
-
-        // Errors are already emitted as events in start_retranscription
-        // so we just log here for debugging
-        if let Err(e) = result {
-            error!("Retranscription failed: {}", e);
+        let monitor_app = app.clone();
+        let monitor_meeting = meeting_id_clone.clone();
+        let monitor_version = version_id.clone();
+        let result = tauri::async_runtime::spawn(start_retranscription(
+            guard, app, meeting_id_clone, meeting_folder_path, language,
+            model, provider, initial_prompt, version_id,
+        )).await;
+        let failure = match result {
+            Err(join_error) => Some(format!("Local refinement worker stopped: {join_error}")),
+            Ok(Err(error)) => Some(error.to_string()),
+            Ok(Ok(_)) => None,
+        };
+        if let Some(error) = failure {
+            error!("Retranscription failed: {}", error);
+            let state = monitor_app.state::<AppState>();
+            let status = if error.contains("cancelled") { "cancelled" } else { "failed" };
+            // A DB write failure must still terminate the UI wait. If storage
+            // remains unavailable, restart recovery will mark this interrupted.
+            let _ = crate::database::transcript_versions::set_status(state.db_manager.pool(), &monitor_version, status, Some(error.clone())).await;
+            let _ = monitor_app.emit("retranscription-error", RetranscriptionError { meeting_id: monitor_meeting, error });
         }
     });
 
     Ok(RetranscriptionStarted {
+        version_id: response_version,
         meeting_id,
         message: "Retranscription started".to_string(),
     })
 }
 
 #[tauri::command]
-pub async fn cancel_retranscription_command() -> Result<(), String> {
+pub async fn cancel_retranscription_command(meeting_id: Option<String>, version_id: Option<String>) -> Result<(), String> {
     if !is_retranscription_in_progress() {
         return Err("No retranscription in progress".to_string());
     }
+    let active = ACTIVE_RETRANSCRIPTION.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((meeting, version)) = active.as_ref() {
+        if meeting_id.as_ref().is_some_and(|id| id != meeting) || version_id.as_ref().is_some_and(|id| id != version) {
+            return Err("This refinement is no longer the active job; refresh its saved status".into());
+        }
+    } else { return Err("Refinement is still being reserved; retry cancellation".into()); }
     cancel_retranscription();
     Ok(())
 }
@@ -1092,24 +1004,6 @@ pub async fn is_retranscription_in_progress_command() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn retranscription_repairs_duration_and_preserves_metadata() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("metadata.json");
-        std::fs::write(&path, serde_json::to_vec(&serde_json::json!({
-            "meeting_id":"original", "duration_seconds":2.5,
-            "audio_file":"voice.m4a", "summary_language":"fr",
-            "detected_summary_language":"en", "custom_field":"keep"
-        })).unwrap()).unwrap();
-        write_retranscription_metadata(dir.path(), "ignored", 5.16, "voice.m4a").unwrap();
-        let result: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
-        assert_eq!(result["duration_seconds"], 5.16);
-        assert_eq!(result["meeting_id"], "original");
-        assert_eq!(result["summary_language"], "fr");
-        assert_eq!(result["custom_field"], "keep");
-        assert!(result.get("detected_summary_language").is_none());
-    }
 
     fn test_recording_start() -> DateTime<Utc> {
         DateTime::parse_from_rfc3339("2026-08-30T12:00:00Z")
@@ -1303,17 +1197,12 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_retained_tracks_fall_back_to_mixed_audio() {
+    fn incomplete_retained_tracks_reject_unsafe_mixed_fallback() {
         let dir = tempfile::tempdir().unwrap();
         let fallback = dir.path().join("audio.mp4");
         std::fs::write(&fallback, b"mixed").unwrap();
         std::fs::write(dir.path().join("mic.mp4"), b"mic").unwrap();
-
-        let sources = find_retranscription_sources(dir.path(), &fallback).unwrap();
-
-        assert_eq!(sources.len(), 1);
-        assert_eq!(sources[0].label, "mixed audio");
-        assert_eq!(sources[0].path, fallback);
+        assert!(find_retranscription_sources(dir.path(), &fallback).is_err());
     }
 
     #[test]
@@ -1402,25 +1291,13 @@ mod issue9_room_tests {
         assert_eq!(sources[0].speaker_hint, Some("Microphone"));
     }
 
-    #[test]
-    fn room_source_label_is_not_a_manually_identified_person() {
-        assert!(!is_manual_speaker_label("Microphone"));
-        assert!(!is_manual_speaker_label("Microphone + Guest"));
-        assert!(is_manual_speaker_label("Alex"));
-    }
+
 }
 
 
 #[cfg(test)]
 mod issue9_label_retry_tests {
     use super::*;
-    #[test]
-    fn repeated_enhance_preserves_real_names_not_room_source_labels() {
-        let ranges = vec![(0.0, 10.0, "Microphone".into()), (1.0, 3.0, "Alex".into()), (0.0, 10.0, "You".into())];
-        assert_eq!(speaker_after_manual_ranges(Some("Microphone"), 1.0, 3.0, &ranges).as_deref(), Some("Alex"));
-        assert_eq!(speaker_after_manual_ranges(Some("Microphone"), 4.0, 5.0, &ranges).as_deref(), Some("Microphone"));
-        assert_eq!(speaker_after_manual_ranges(Some("You"), 1.0, 3.0, &ranges).as_deref(), Some("You"));
-    }
     #[test]
     fn legacy_call_sources_keep_their_hints_but_room_fallback_never_uses_you() {
         let dir = tempfile::tempdir().unwrap();
@@ -1434,5 +1311,23 @@ mod issue9_label_retry_tests {
         assert_eq!(sources[0].speaker_hint, Some("Microphone"));
         std::fs::write(dir.path().join("metadata.json"), b"truncated").unwrap();
         assert!(find_retranscription_sources(dir.path(), &fallback).is_err());
+    }
+}
+
+#[cfg(test)]
+mod issue14_source_tests {
+    use super::*;
+    #[test]
+    fn missing_call_track_never_falls_back_to_mixed_audio() {
+        let folder = tempfile::tempdir().unwrap();
+        std::fs::write(folder.path().join("mic.mp4"), b"fixture").unwrap();
+        std::fs::write(folder.path().join("audio.mp4"), b"fixture").unwrap();
+        assert!(saved_sources(folder.path()).unwrap_err().to_string().contains("source track is missing"));
+    }
+    #[test]
+    fn deleted_audio_is_explicitly_unavailable() {
+        let folder = tempfile::tempdir().unwrap();
+        std::fs::write(folder.path().join("transcripts.json"), b"[]").unwrap();
+        assert!(saved_sources(folder.path()).is_err());
     }
 }

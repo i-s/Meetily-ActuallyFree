@@ -18,6 +18,7 @@ import { MeetingExportDialog } from '@/components/MeetingDetails/MeetingExportDi
 import { PostCallProcessingDialog } from '@/components/MeetingDetails/PostCallProcessingDialog';
 import { ModelConfig } from '@/components/ModelSettingsModal';
 import { VirtualizedTranscriptView } from '@/components/VirtualizedTranscriptView';
+import { TranscriptVersions } from '@/components/MeetingDetails/TranscriptVersions';
 import { MeetingHeader } from '@/components/meeting/MeetingHeader';
 import { MeetingDocument } from '@/components/meeting/MeetingDocument';
 import { AudioPlayerBar } from '@/components/meeting/AudioPlayerBar';
@@ -39,9 +40,6 @@ import { displayTitle } from '@/lib/meeting-titles';
 import { cn } from '@/lib/utils';
 import { displaySpeaker, speakerColorIndexMap, speakerKey } from '@/utils/speakerUtils';
 
-// Page remounts join the same backend-start attempt. Only accepted attempts are
-// persisted in sessionStorage below; failed preflight attempts remain retryable.
-const autoSummaryInFlight = new Map<string, Promise<boolean>>();
 const NOTES_WIDTH_KEY = 'af-meeting-notes-width';
 const TRANSCRIPT_MIN = 340;
 const DOCUMENT_MIN = 380;
@@ -241,26 +239,11 @@ export default function PageContent({
       if (!shouldAutoGenerate || meetingData.transcripts.length === 0) return;
       if (isPostCallRecording && postCallDoneFor !== meeting.id) return;
       if (isPostCallRecording) {
-        const key = `post-call-summary-started:${meeting.id}`;
-        if (sessionStorage.getItem(key)) {
-          onAutoGenerateComplete?.();
-          return;
-        }
-        let attempt = autoSummaryInFlight.get(meeting.id);
-        if (!attempt) {
-          attempt = summaryGeneration.handleGenerateSummary('');
-          autoSummaryInFlight.set(meeting.id, attempt);
-        }
-        let accepted = false;
-        try {
-          accepted = await attempt;
-        } finally {
-          if (autoSummaryInFlight.get(meeting.id) === attempt) autoSummaryInFlight.delete(meeting.id);
-        }
-        if (accepted) {
-          sessionStorage.setItem(key, 'started');
-          onAutoGenerateComplete?.();
-        }
+        // #14 creates local candidates only. The old handoff could silently
+        // send meeting text to whichever legacy summary API was configured.
+        // #15 owns an explicit subscriber Codex CLI handoff keyed by selected
+        // version + revision; no automatic product-text request starts here.
+        onAutoGenerateComplete?.();
         return;
       }
       await summaryGeneration.handleGenerateSummary('');
@@ -427,6 +410,12 @@ export default function PageContent({
         }}
         onTranscriptChanged={() => refreshAfterSpeakerChange()}
       />
+
+      <TranscriptVersions key={meeting.id} meetingId={meeting.id} onChanged={async () => {
+        // Clear all loaded derived state, not only paginated transcript rows.
+        // The durable selection transaction already archived the old summary.
+        window.location.reload();
+      }} />
 
       <div
         ref={frameRef}

@@ -39,7 +39,7 @@ version="0.0.0"
 edition="2021"
 [dependencies]
 {dependencies}
-sqlx={{version="={versions['sqlx']}",default-features=false,features=["sqlite","runtime-tokio","chrono"]}}
+sqlx={{version="={versions['sqlx']}",default-features=false,features=["sqlite","runtime-tokio","chrono","derive"]}}
 tokio={{version="={versions['tokio']}",features=["full"]}}
 uuid={{version="={versions['uuid']}",features=["v4"]}}
 serde={{version="={versions['serde']}",features=["derive"]}}
@@ -60,7 +60,7 @@ mod state {{
     impl DbManager {{ pub fn pool(&self)->&sqlx::SqlitePool{{&self.0}} }}
 }}
 mod api;
-mod database {{ pub mod repositories {{ pub mod person {{
+mod database {{ #[path="{ROOT}/frontend/src-tauri/src/database/transcript_versions.rs"] pub mod transcript_versions; pub mod repositories {{ pub mod person {{
     pub struct PeopleRepository;
     impl PeopleRepository {{ pub async fn link_named_speakers(_tx:&mut sqlx::Transaction<'_,sqlx::Sqlite>,_meeting:&str)->Result<(),sqlx::Error>{{Ok(())}} }}
 }} }} }}
