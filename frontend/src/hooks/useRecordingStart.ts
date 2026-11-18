@@ -10,6 +10,8 @@ import { readPendingGroup } from '@/lib/groups';
 import { automaticTitle, beginLiveSession } from '@/lib/live-session';
 import { AUTO_START_KEY, START_RECORDING_EVENT } from '@/lib/recording-launch';
 import { beginAutomatedRecording, endAutomatedRecording, takeAutomatedStart } from '@/lib/meeting-automation';
+import { takeDiscordStartRequest, discordMayStart, isDiscordProcess, type DiscordCallStatus } from '@/lib/discord-automation';
+import { loadLabsPreferences } from '@/lib/labs';
 import Analytics from '@/lib/analytics';
 import { showRecordingNotification } from '@/lib/recordingNotification';
 import { toast } from 'sonner';
@@ -188,7 +190,8 @@ export function useRecordingStart(
     // A detected call asked for this start (Labs meeting automation). A start
     // from the record button is the user's own and is never stopped for them.
     const automated = takeAutomatedStart();
-    const call = source === 'home_page' ? null : automated;
+    const discordRequest = takeDiscordStartRequest();
+    const call = source === 'home_page' ? null : discordRequest ? { app: 'Discord', process: discordRequest.process } : automated;
     // Readying the model can take several seconds (it loads a large model
     // into memory), so say so from the first step.
     setStatus(RecordingStatus.STARTING, 'Preparing transcription model…');
@@ -199,6 +202,16 @@ export function useRecordingStart(
     }
 
     try {
+      if (call && isDiscordProcess(call.process)) {
+        // Navigation/model loading may outlive the observed join. Revalidate
+        // immediately before normal capture; Unknown is never permission to start.
+        const status = await invoke<DiscordCallStatus>('get_discord_automation_status');
+        if (!discordRequest || Date.now() - discordRequest.at > 60_000 || !loadLabsPreferences().meetingAutomation || !discordMayStart(status, call.process)) {
+          setStatus(RecordingStatus.IDLE);
+          toast('Discord automatic start cancelled', { description: 'A connected call is no longer confirmed. You can still start recording manually.' });
+          return false;
+        }
+      }
       const startedAt = Date.now();
       const group = readPendingGroup();
       const title = automaticTitle(new Date(startedAt), group?.name, meetings.map((meeting) => meeting.title));
@@ -221,7 +234,9 @@ export function useRecordingStart(
       if (call) {
         beginAutomatedRecording(call);
         toast(`Recording your ${call.app} call`, {
-          description: 'Meeting automation started it, and stops and saves it when the call ends.',
+          description: isDiscordProcess(call.process)
+            ? 'Experimental Discord automation. Client exit can stop this take; leaving with the client open is unqualified. Stop manually if needed.'
+            : 'Meeting automation started it, and stops and saves it when the call ends.',
           duration: 10000,
           action: { label: "Don't stop it", onClick: () => endAutomatedRecording() },
         });

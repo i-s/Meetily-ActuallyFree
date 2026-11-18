@@ -221,6 +221,14 @@ not an automatic recording adapter. Mute/preview and process I/O must not be
 promoted to call lifecycle without evidence; no target Mac measurements or
 verified mechanism are claimed.
 
+Issue #11's isolated read-only Discord macOS AX candidate, native state event,
+normal-recorder integration, manual-stop/session ownership and test coverage are
+mapped in [ISSUE11_DISCORD_AUTOMATION.md](ISSUE11_DISCORD_AUTOMATION.md).
+**Automatic Discord capture remains qualification-gated off**: guild voice, DM
+and group DM are individually unqualified, and leave with the client open has no
+validated signal. Process/mic activity and missing UI never authorize capture or
+prove leave. This adapter does not alter the concurrent Zoom event path.
+
 Issue #5 artifact-only Actions build (pinned source/tree vs workflow SHA),
 sidecar ordering, locked dependencies, model provenance, same-account backup/
 rollback proposal and physical mic/system/restart qualification

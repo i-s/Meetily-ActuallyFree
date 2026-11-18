@@ -30,7 +30,8 @@ import { RecordingPostProcessingProvider } from '@/contexts/RecordingPostProcess
 import { ImportDialogProvider } from '@/contexts/ImportDialogContext'
 import { isAudioExtension, getAudioFormatsDisplayList } from '@/constants/audioFormats'
 import { loadLabsPreferences } from '@/lib/labs'
-import { automatedRecording, endAutomatedRecording, markAutomatedStart } from '@/lib/meeting-automation'
+import { automatedRecording, endAutomatedRecording, markAutomatedStart, AUTOMATION_CHANGED_EVENT } from '@/lib/meeting-automation'
+import { createDiscordAutomation, type DiscordCallStatus } from '@/lib/discord-automation'
 import { getPendingCrashReport, type PendingCrashReport } from '@/services/crashReportService'
 import { WorkspaceProvider } from '@/contexts/WorkspaceContext'
 import { RouteWarmup } from '@/components/RouteWarmup'
@@ -388,6 +389,32 @@ export default function RootLayout({
       unlistenEnd.then((fn) => fn());
     };
   }, [showOnboarding, startupResolved, startupError, pendingCrashReport, isMinibar, router, recordingNoticeAcknowledged]);
+
+  // Discord has separate typed evidence/session events: do not translate AX
+  // Unknown into generic media inactivity, or couple this to the Zoom adapter.
+  useEffect(() => {
+    if (!startupResolved || startupError || pendingCrashReport || isMinibar || !recordingNoticeAcknowledged || showOnboarding) return;
+    const bridge = createDiscordAutomation({
+      allowed: () => loadLabsPreferences().meetingAutomation,
+      status: () => invoke<DiscordCallStatus>('get_discord_automation_status'),
+      recording: () => invoke<{ is_recording?: boolean }>('get_recording_state'),
+      start: () => startRecordingAnywhere.current(),
+      stop: () => {
+        toast('Discord client closed', { description: 'Stopping and saving the recording started for this Discord call.' });
+        requestRecordingStop((href) => router.push(href));
+      },
+      error: (error) => console.error('Discord automation:', error),
+    });
+    const unlisten = listen<DiscordCallStatus>('discord-call-state', (event) => bridge.update(event.payload));
+    void unlisten.then(() => invoke<DiscordCallStatus>('get_discord_automation_status'))
+      .then((status) => bridge.update(status)).catch((error) => console.error('Discord status unavailable:', error));
+    window.addEventListener(AUTOMATION_CHANGED_EVENT, bridge.recordingChanged);
+    return () => {
+      bridge.dispose();
+      window.removeEventListener(AUTOMATION_CHANGED_EVENT, bridge.recordingChanged);
+      void unlisten.then((fn) => fn());
+    };
+  }, [startupResolved, startupError, pendingCrashReport, isMinibar, recordingNoticeAcknowledged, showOnboarding, router]);
 
   // Handle file drop for audio import
   const handleFileDrop = useCallback((paths: string[]) => {

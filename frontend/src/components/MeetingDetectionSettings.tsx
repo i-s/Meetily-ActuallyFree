@@ -8,6 +8,8 @@ import { Radar, Workflow } from "lucide-react"
 import { toast } from "sonner"
 import { useLabs } from "@/hooks/useLabs"
 import { setLabsFeature } from "@/lib/labs-features"
+import { listen } from "@tauri-apps/api/event"
+import type { DiscordCallStatus } from "@/lib/discord-automation"
 
 interface MeetingDetectionSettings {
   enabled: boolean;
@@ -15,11 +17,12 @@ interface MeetingDetectionSettings {
   meeting_apps: string[];
   ignored_apps: string[];
   notify: boolean;
+  discord_automation: boolean;
 }
 
 /**
  * Meeting Detection settings panel. Watches running processes for meeting apps
- * (Zoom / Teams / Slack / Webex / Discord / …) and prompts to start recording.
+ * (Zoom / Teams / Slack / Webex / …) and prompts to start recording.
  * Fully on-device. Persisted install-locally via Rust.
  */
 export function MeetingDetectionSettings() {
@@ -27,6 +30,15 @@ export function MeetingDetectionSettings() {
   const [ignoredInput, setIgnoredInput] = useState('');
   const { labs } = useLabs();
   const [automationBusy, setAutomationBusy] = useState(false);
+  const [discord, setDiscord] = useState<DiscordCallStatus | null>(null);
+
+  useEffect(() => {
+    let disposed = false;
+    const update = (status: DiscordCallStatus) => { if (!disposed) setDiscord(status); };
+    const subscription = listen<DiscordCallStatus>('discord-call-state', (event) => update(event.payload));
+    void subscription.then(() => invoke<DiscordCallStatus>('get_discord_automation_status')).then(update).catch(console.error);
+    return () => { disposed = true; void subscription.then((fn) => fn()); };
+  }, []);
 
   useEffect(() => {
     invoke<MeetingDetectionSettings>('get_meeting_detection_settings')
@@ -75,7 +87,7 @@ export function MeetingDetectionSettings() {
               Meeting Detection
             </h3>
             <p className="text-sm text-af-text-2">
-              Watch for meeting apps (Zoom, Teams, Slack, Webex, Discord…) and prompt you to start
+              Watch for meeting apps (Zoom, Teams, Slack, Webex…) and prompt you to start
               recording when one starts. Runs entirely on-device — no network, no telemetry.
             </p>
           </div>
@@ -132,6 +144,31 @@ export function MeetingDetectionSettings() {
           </div>
         )}
       </div>
+
+      <section className="rounded-2xl border border-af-border bg-af-panel-2/40 p-5" aria-label="Discord macOS signal adapter">
+        <div className="flex items-center justify-between gap-4">
+          <h3 className="text-[15px] font-semibold text-af-text">Discord macOS — qualification pending</h3>
+          <Switch checked={md.discord_automation ?? false} disabled={!md.enabled}
+            aria-label="Observe Discord macOS call signals"
+            onCheckedChange={(value) => void saveMd({ ...md, discord_automation: value })} />
+        </div>
+        <p className="mt-2 text-sm text-af-text-2">
+          Opt-in read-only Accessibility observation, every 3 seconds. Stable desktop client only.
+          Grant Meetily Accessibility access in macOS System Settings if you choose to observe.
+          No RPC scopes, user token, bot, microphone probing or audio capture is used for detection.
+        </p>
+        <p className="mt-2 text-sm text-af-text-2" role="status">
+          Signal: {discord?.state ?? 'unknown'} · {discord?.reason ?? 'status unavailable'}.
+          {' '}Automatic Discord recording is blocked until the signal is qualified on a physical Mac.
+        </p>
+        <p className="mt-2 text-sm text-af-text-3">
+          Guild voice, DM and group DM are each unqualified; this adapter cannot identify the call type.
+          Mute, silence, channel/device changes and hidden or unreadable controls do not prove leave.
+          Leaving with the client open has no qualified signal. Client exit has a 45-second reconnect grace.
+          PTB, Canary, browser Discord, Stage and Windows are unsupported here.
+          Use manual Start, Pause, Resume and Stop. Manual Stop will not rearm the same detected session.
+        </p>
+      </section>
 
       <div className="flex items-start gap-4 rounded-2xl border border-af-border bg-af-panel-2/40 p-5">
         <span className="mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-af-accent/[0.12] text-af-accent">
