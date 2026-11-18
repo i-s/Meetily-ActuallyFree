@@ -31,24 +31,90 @@ pub fn audio_available(folder: Option<&str>) -> bool {
 }
 
 fn notes_text(markdown: Option<&str>, json: Option<&str>) -> String {
-    if let Some(text) = markdown.filter(|text| !text.trim().is_empty()) { return text.into() }
-    fn visible(value: &serde_json::Value, output: &mut Vec<String>) {
+    use pulldown_cmark::{Event, Options, Parser, TagEnd};
+    use serde_json::Value;
+
+    fn inline(value: &Value) -> Option<String> {
         match value {
-            serde_json::Value::String(text) => output.push(text.clone()),
-            serde_json::Value::Array(values) => { for value in values { visible(value, output); } },
-            serde_json::Value::Object(object) => {
-                // Only user-visible content, including table cells. Editor IDs,
-                // types, links and formatting properties are not search terms.
-                for key in ["text", "content", "children", "rows", "cells"] {
-                    if let Some(value) = object.get(key) { visible(value, output); }
+            Value::Null => Some(String::new()),
+            Value::String(text) => Some(text.clone()),
+            Value::Array(values) => values.iter().map(inline).collect(),
+            Value::Object(object) => {
+                if let Some(text) = object.get("text").and_then(Value::as_str) {
+                    Some(text.into())
+                } else {
+                    object.get("content").and_then(inline)
                 }
-            },
+            }
+            _ => None,
+        }
+    }
+    fn blocks(value: &Value) -> Option<String> {
+        let mut output = Vec::new();
+        for block in value.as_array()? {
+            // A syntactically valid cache/object is not a rich Notes document.
+            block.get("type")?.as_str()?;
+            let text = match block.get("content") {
+                Some(content) if content.get("rows").is_some() => {
+                    let mut rows = Vec::new();
+                    for row in content.get("rows")?.as_array()? {
+                        let cells = row.get("cells")?.as_array()?;
+                        rows.push(cells.iter().map(inline).collect::<Option<Vec<_>>>()?.join("\t"));
+                    }
+                    rows.join("\n")
+                }
+                Some(content) => inline(content)?,
+                None => String::new(),
+            };
+            output.push(text);
+            if let Some(children) = block.get("children") {
+                let children = blocks(children)?;
+                if !children.is_empty() {
+                    output.push(children);
+                }
+            }
+        }
+        Some(output.join("\n"))
+    }
+    if let Some(text) = json
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+        .as_ref()
+        .filter(|value| value.as_array().is_some_and(|blocks| !blocks.is_empty()))
+        .and_then(blocks)
+    {
+        // Adjacent styled/link runs are one visible inline string. Only actual
+        // block/list/cell boundaries separate words; IDs/URLs/styles never enter
+        // either matching or snippets. Valid empty rich content stays empty.
+        return text.trim().into();
+    }
+
+    fn line_break(output: &mut String) {
+        while output.ends_with('\t') {
+            output.pop();
+        }
+        if !output.is_empty() && !output.ends_with('\n') {
+            output.push('\n');
+        }
+    }
+    let options = Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
+    let mut output = String::new();
+    for event in Parser::new_ext(markdown.unwrap_or_default(), options) {
+        match event {
+            Event::Text(text) | Event::Code(text) => output.push_str(&text),
+            Event::SoftBreak => output.push(' '),
+            Event::HardBreak | Event::Rule => line_break(&mut output),
+            Event::End(TagEnd::TableCell) => output.push('\t'),
+            Event::End(
+                TagEnd::Paragraph | TagEnd::Heading(_) | TagEnd::BlockQuote(_)
+                | TagEnd::CodeBlock | TagEnd::Item | TagEnd::TableHead
+                | TagEnd::TableRow | TagEnd::Table,
+            ) => line_break(&mut output),
+            // Link/image destinations, titles, reference definitions, raw HTML
+            // attributes and code language hints are metadata, not visible text.
             _ => {},
         }
     }
-    let mut output = Vec::new();
-    if let Some(value) = json.and_then(|raw| serde_json::from_str(raw).ok()) { visible(&value, &mut output); }
-    output.join(" ")
+    output.trim().into()
 }
 
 pub async fn materials(pool: &SqlitePool) -> Result<Vec<LibraryMaterial>, sqlx::Error> {

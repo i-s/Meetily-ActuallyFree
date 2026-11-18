@@ -151,3 +151,107 @@ async fn legacy_rich_notes_without_markdown_are_not_silently_empty_or_searched_b
     let snapshot = serde_json::to_value(library::export_snapshot(&pool,"legacy-rich",0).await.unwrap()).unwrap();
     assert_eq!(snapshot["notes"]["json"],serde_json::from_str::<serde_json::Value>(json).unwrap());
 }
+
+#[tokio::test]
+async fn notes_search_matches_visible_phrases_across_inline_formatting() {
+    let pool = db().await; meeting(&pool,"rich","Rich Notes").await;
+    notes(&pool,"rich","План **API**: _обсудить_",1).await;
+    sqlx::query("UPDATE meeting_notes SET notes_json=? WHERE meeting_id='rich'")
+        .bind(r#"[{"type":"paragraph","content":[{"type":"text","text":"План "},{"type":"text","text":"AP","styles":{"bold":true}},{"type":"text","text":"I: обсудить"}]}]"#)
+        .execute(&pool).await.unwrap();
+    let hits = library::search(&pool,"план api",10,false).await.unwrap();
+    assert_eq!(hits.len(),1);
+    assert!(hits[0].snippet.contains("План API: обсудить"));
+}
+
+async fn assert_normal_notes_search(pool: &SqlitePool, query: &str, expected: Option<&str>) {
+    let state = AppState { db_manager: Db(pool.clone()) };
+    let library_hits = api_search_library(&state, query.into()).await.unwrap();
+    let global_hits = crate::database::repositories::person::api_global_search(&state, query.into(), Some(40)).await.unwrap();
+    match expected {
+        Some(snippet) => {
+            assert_eq!(library_hits.len(),1,"library query: {query}");
+            assert_eq!(global_hits.len(),1,"global query: {query}");
+            assert_eq!(library_hits[0].kind,"notes"); assert_eq!(global_hits[0].kind,"notes");
+            assert_eq!(library_hits[0].snippet,snippet,"library snippet for {query}");
+            assert_eq!(global_hits[0].snippet,snippet,"global snippet for {query}");
+        }
+        None => { assert!(library_hits.is_empty(),"library unexpectedly matched {query}"); assert!(global_hits.is_empty(),"global unexpectedly matched {query}"); }
+    }
+}
+
+#[tokio::test]
+async fn r1_normal_search_prefers_rich_visible_text_and_joins_adjacent_runs() {
+    let pool = db().await; meeting(&pool,"rich","Rich Notes").await;
+    notes(&pool,"rich","STALE Markdown [ссылка](https://hidden-host.example)",1).await;
+    sqlx::query("UPDATE meeting_notes SET notes_json=? WHERE meeting_id='rich'")
+        .bind(r#"[{"id":"hidden-editor-id","type":"paragraph","content":[{"type":"text","text":"Обсуждение AP"},{"type":"text","text":"I сегодня","styles":{"bold":true}},{"type":"text","text":" и "},{"type":"link","href":"https://hidden-host.example","content":[{"type":"text","text":"ссылка"}]}]}]"#)
+        .execute(&pool).await.unwrap();
+    assert_normal_notes_search(&pool,"api",Some("Обсуждение API сегодня и ссылка")).await;
+    assert_normal_notes_search(&pool,"обсуждение api",Some("Обсуждение API сегодня и ссылка")).await;
+    for query in ["hidden-host","hidden-editor-id","STALE Markdown","AP I"] { assert_normal_notes_search(&pool,query,None).await; }
+}
+
+#[tokio::test]
+async fn r1_legacy_markdown_search_uses_rendered_text_not_link_destinations_or_formatting() {
+    let pool = db().await; meeting(&pool,"legacy","Legacy").await;
+    notes(&pool,"legacy","План **API**: _обсудить_ [ссылка](https://hidden-host.example \"hidden-title\")",0).await;
+    assert_normal_notes_search(&pool,"план api",Some("План API: обсудить ссылка")).await;
+    assert_normal_notes_search(&pool,"обсудить ссылка",Some("План API: обсудить ссылка")).await;
+    for query in ["hidden-host","hidden-title","**API**"] { assert_normal_notes_search(&pool,query,None).await; }
+}
+
+#[tokio::test]
+async fn r1_legacy_markdown_preserves_code_escaped_punctuation_references_and_table_boundaries() {
+    let pool = db().await; meeting(&pool,"legacy","Legacy").await;
+    notes(&pool,"legacy", "## План\n\n- **API** и [ярлык][ref]\n- `**literal** 50%_off\\today`\n\n```text\n# literal [not a link](hidden-code)\n```\n\n| Термин | Действие |\n| --- | --- |\n| API | _Обсудить_ |\n\nEscape \\*звёздочки\\* &amp; A\\_B\n\n[ref]: https://hidden-reference.example \"hidden-reference-title\"",0).await;
+    let expected="План\nAPI и ярлык\n**literal** 50%_off\\today\n# literal [not a link](hidden-code)\nТермин\tДействие\nAPI\tОбсудить\nEscape *звёздочки* & A_B";
+    for query in ["api и ярлык","**literal**","50%_off\\today","hidden-code","API\tОбсудить","*звёздочки*","A_B"] { assert_normal_notes_search(&pool,query,Some(expected)).await; }
+    for query in ["hidden-reference.example","hidden-reference-title","ярлык**literal**","ТерминДействие","APIОбсудить"] { assert_normal_notes_search(&pool,query,None).await; }
+}
+
+#[tokio::test]
+async fn r1_link_destinations_are_not_visible_notes_text() {
+    let pool = db().await; meeting(&pool,"link","Legacy").await;
+    notes(&pool,"link","[ссылка](https://hidden-host.example)",0).await;
+    assert_normal_notes_search(&pool,"hidden-host",None).await;
+    assert_normal_notes_search(&pool,"ссылка",Some("ссылка")).await;
+}
+
+#[tokio::test]
+async fn r1_snippet_window_is_cut_from_the_same_visible_inline_text_as_the_match() {
+    let pool = db().await; meeting(&pool,"long-rich","Long rich").await;
+    notes(&pool,"long-rich","Unrelated stale Markdown",1).await;
+    let blocks=serde_json::json!([{"type":"paragraph","content":[{"type":"text","text":format!("{} ","x".repeat(1000))},{"type":"text","text":"AP","styles":{"bold":true}},{"type":"text","text":format!("I today {}","y".repeat(1000))}]}]);
+    sqlx::query("UPDATE meeting_notes SET notes_json=? WHERE meeting_id='long-rich'").bind(blocks.to_string()).execute(&pool).await.unwrap();
+    let expected=format!("...{} API today {}...","x".repeat(72),"y".repeat(137));
+    assert_normal_notes_search(&pool,"api today",Some(&expected)).await;
+}
+
+#[tokio::test]
+async fn r1_rich_tables_lists_and_nested_blocks_keep_real_boundaries() {
+    let pool=db().await; meeting(&pool,"rich","Rich").await;
+    notes(&pool,"rich","",2).await;
+    let blocks=serde_json::json!([
+        {"type":"paragraph","content":[{"type":"text","text":"First"}]},
+        {"type":"bulletListItem","content":[{"type":"text","text":"AP"},{"type":"text","text":"I","styles":{"bold":true}}],"children":[{"type":"numberedListItem","content":[{"type":"text","text":"Nested"}]}]},
+        {"type":"table","content":{"rows":[{"cells":[[{"type":"text","text":"Left"}],{"type":"tableCell","content":[{"type":"text","text":"Right"}]}]}]}}
+    ]);
+    sqlx::query("UPDATE meeting_notes SET notes_json=? WHERE meeting_id='rich'").bind(blocks.to_string()).execute(&pool).await.unwrap();
+    let expected="First\nAPI\nNested\nLeft\tRight";
+    for query in ["API","Nested","Left\tRight"] { assert_normal_notes_search(&pool,query,Some(expected)).await; }
+    for query in ["AP I","FirstAPI","APINested","LeftRight"] { assert_normal_notes_search(&pool,query,None).await; }
+}
+
+#[tokio::test]
+async fn r1_invalid_rich_data_falls_back_to_parsed_markdown_but_valid_empty_does_not_replay_stale_text() {
+    let pool=db().await; meeting(&pool,"legacy","Legacy").await;
+    notes(&pool,"legacy","План **API** [ярлык](https://hidden.example)",0).await;
+    for raw in ["{broken",r#"{"cache":"hidden"}"#,r#"[{"id":"not-a-block"}]"#,"[]"] {
+        sqlx::query("UPDATE meeting_notes SET notes_json=? WHERE meeting_id='legacy'").bind(raw).execute(&pool).await.unwrap();
+        assert_normal_notes_search(&pool,"план api",Some("План API ярлык")).await;
+        assert_normal_notes_search(&pool,"hidden.example",None).await;
+    }
+    sqlx::query("UPDATE meeting_notes SET notes_json='[{\"type\":\"paragraph\",\"content\":[]}]' WHERE meeting_id='legacy'").execute(&pool).await.unwrap();
+    assert_normal_notes_search(&pool,"план api",None).await;
+}

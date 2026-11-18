@@ -177,3 +177,82 @@ Production frontend export, full desktop native build, real Tauri picker/asset
 protocol/playback, installed app, physical M4/M1 Mac and release are separate
 facts. No DMG, Actions, push, PR, package, release or Mac operation is part of #18.
 No claim of acoustic/ASR quality or target-Mac acceptance follows from these tests.
+
+## R1 — search the visible Notes representation
+
+Independent review of `ef1678051de86104297eb703ad670767d55a25e0` found that
+`notes_text` preferred raw Markdown and joined rich inline leaves with invented
+spaces. The normal library/global search therefore missed `план api` in
+`План **API**: _обсудить_`, matched a hidden Markdown link destination, and missed
+`api` when adjacent styled runs displayed `AP` + `I`. These were reproduced red
+through the production SQL search path before the fix.
+
+`notes_text` now prefers a structurally valid, nonempty rich block array, joining
+inline text/link runs without adding characters. Paragraphs, list items, nested
+blocks and table rows have line boundaries; cells have tab boundaries. Editor
+IDs, link destinations, styles and other hidden properties do not enter text.
+A valid empty paragraph remains empty; a missing/empty block array or malformed
+rich data uses the legacy Markdown path, matching the ordinary editor's
+Markdown-only fallback. Matching and snippet extraction receive this same visible
+string; snippets do not use offsets into raw Markdown/JSON.
+
+No native Markdown parser was present in the accepted dependency graph. Legacy
+Markdown uses pinned `pulldown-cmark = 0.13.6`, with default features disabled,
+CommonMark plus tables/strikethrough/task lists. Its MIT license and Rust 1.71.1
+minimum were checked (the workspace minimum is 1.77.2). Parser events retain
+visible link labels, code/literal punctuation and decoded escapes/entities,
+exclude hidden link/reference destinations/titles and code-language metadata,
+and preserve block/cell boundaries. It does not render HTML, execute code, open
+links or perform network requests. This is a read-only searchable projection:
+**Markdown export bytes/source distinctions and original saved Notes are unchanged.**
+
+The lock adds only `pulldown-cmark`; all prior package records and dependency edges
+are unchanged except the new `meetily` dependency. The first Cargo update proposed
+unrelated graph rewrites, which were not retained. The original graph plus the
+Cargo-resolved parser package was validated by `cargo tree --offline --locked -p
+meetily --target x86_64-unknown-linux-gnu --depth 1` and the fixture's locked version
+assertions. No whole-workspace/native desktop build was started.
+
+### R1 final verification
+
+- Production `api_search_library` **and actual `api_global_search` command body**
+  (only Tauri State transport adapted), real SQLite/migrations: **14 passed**.
+  Cases include all review examples, rich preference over stale Markdown,
+  adjacent inline runs, links/references/titles, literals/code/escapes/entities,
+  rich and Markdown tables/lists, malformed/empty-block fallback, exact full
+  short snippets and an exact long 220-character visible snippet window.
+- Combined read-only `b231d184d03b914348b9ca1eeb4d71ded433d55a` compatibility plus
+  the version repository suite: **40 passed, 0 failed, 0 ignored**. This includes
+  actual selection/correction and the unchanged source-labelled export snapshot
+  tests. The cached, single-job command waited for Cargo's package cache lock and
+  compiled only the fixture binary; it finished in 17m35s wall time under load,
+  then tests took 10.98s. No lock/cache cleanup was used.
+- Default full isolated frontend runner: **44/45 files passed**; the first
+  `tests/library/batch-dialog.test.tsx` test exceeded its default 5s deadline under
+  load (the file executed all 13 assertions). Its isolated `--timeout 60000` rerun
+  passed both tests. A fresh complete rerun of the identical 45-file set, still
+  one Bun process per file with a bounded 60s per-test limit, passed **45/45 files,
+  206 tests**. No frontend product or export-test behavior was changed for R1.
+- `git diff ef167805 --` the renderer, exporter, detail hook and export dialogs is
+  empty. R1 changes searchable text, its parser dependency, native tests/fixture
+  and this documentation only.
+
+### Production build evidence remains scoped to its actual source
+
+The reserved bounded Next attempt ran from the real `frontend/` directory at
+clean commit **`ef1678051de86104297eb703ad670767d55a25e0`**, tree
+**`4cf01139bf95f92a22098d56e9bace3a811cf299`**, with Node 22.16, two CPU/one worker
+settings, a 4GB heap cap and a 900-second timeout. It logged **Compiled successfully**
+then **Linting and checking validity of types ...**, and exited **124** at its
+limit. This is optimized frontend compilation evidence, **not a completed
+production build/static export**. Log: `/tmp/issue18-next-build.log` (local only).
+Standalone TypeScript passed during implementation before that build; no
+concurrent standalone checking was started during it. R1 has no frontend source
+changes, but no fresh production export or full desktop-native build is claimed.
+
+The build slot was released, and an exact-cwd `/proc` check found no surviving
+Next/worker process. An immediate coordinator notification after the background
+exit failed with `parent_not_active`; it was relayed successfully when the R1 turn
+became active. No second competing export, DMG, Actions, push or Mac operation was
+started. Full production export and real installed macOS UI/picker/audio playback
+remain qualification limits, not silently promoted acceptance passes.

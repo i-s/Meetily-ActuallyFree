@@ -19,7 +19,7 @@ REPO = ROOT / 'frontend/src-tauri/src/database/repositories'
 def main():
     lock = tomllib.loads((ROOT / 'Cargo.lock').read_text())
     versions = {n: next(p['version'] for p in lock['package'] if p['name'] == n)
-                for n in ('sqlx', 'tokio', 'serde', 'serde_json', 'chrono', 'tempfile', 'uuid')}
+                for n in ('sqlx', 'tokio', 'serde', 'serde_json', 'chrono', 'tempfile', 'uuid', 'pulldown-cmark')}
     with tempfile.TemporaryDirectory(prefix='meetily-library-sql-') as folder:
         work = Path(folder)
         (work / 'src').mkdir()
@@ -48,9 +48,11 @@ def main():
         search = person[person.index('    pub async fn global_search('):person.index('    pub async fn get_profile(')]
         dto = '#[derive(Debug,serde::Serialize)]\n#[serde(rename_all="camelCase")]\n' + person[person.index('pub struct GlobalSearchResult {'):person.index('\n#[derive',person.index('pub struct GlobalSearchResult {'))]
         ranking = person[person.index('struct RankedResult {'):person.index('pub(crate) struct SpeakerRenameOutcome')]
+        command_start = person.index('pub async fn api_global_search(')
+        global_command = person[command_start:person.index('#[tauri::command]', command_start)].replace("tauri::State<'_, AppState>", '&AppState')
         helpers = person[person.index('fn escape_like'):person.index('pub(crate) fn snippet_around')]
         normalize = person[person.index('pub(crate) fn normalize_person_name'):person.index('pub(crate) fn is_person_name')]
-        (work / 'src/person.rs').write_text('use sqlx::SqlitePool; use std::cmp::Ordering; const DEFAULT_SEARCH_LIMIT:i64=40; const MAX_SEARCH_LIMIT:i64=100;\n' + dto + ranking + 'impl PeopleRepository {\n' + search + '}\n' + normalize + helpers + visible + '\n' + snippet)
+        (work / 'src/person.rs').write_text('use sqlx::SqlitePool; use std::cmp::Ordering; use crate::state::AppState; const DEFAULT_SEARCH_LIMIT:i64=40; const MAX_SEARCH_LIMIT:i64=100;\n' + dto + ranking + 'impl PeopleRepository {\n' + search + '}\n' + global_command + normalize + helpers + visible + '\n' + snippet)
         commands = (ROOT / 'frontend/src-tauri/src/database/library_commands.rs').read_text().replace('#[tauri::command]\n', '')
         commands = commands.replace("tauri::State<'_, AppState>", '&AppState').replace('use super::repositories::library;', 'use crate::database::repositories::library;')
         (work / 'src/commands.rs').write_text(commands)
@@ -65,6 +67,7 @@ edition="2021"
 versions=[]
 [dependencies]
 {deps}
+pulldown-cmark={{version="={versions['pulldown-cmark']}",default-features=false}}
 uuid={{version="={versions['uuid']}",features=["v4"]}}
 serde={{version="={versions['serde']}",features=["derive"]}}
 sqlx={{version="={versions['sqlx']}",features=["runtime-tokio", "sqlite", "chrono"]}}
