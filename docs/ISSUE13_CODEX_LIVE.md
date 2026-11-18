@@ -254,10 +254,21 @@ MEETILY_CODEX_TEST_BINARY=/absolute/codex CARGO_BUILD_JOBS=1 CARGO_TARGET_DIR=<w
   `/tmp/meetily-issue13-real-cli-final.log`,
   `/tmp/meetily-issue13-frontend-final.log`. Reproduce with the commands above;
   temporary synthetic prompts/homes are removed by fixture ownership.
-- Standalone frontend types passed during implementation. The final production
-  export is assigned a serialized coordinator slot after the local implementation
-  commit; its exact SHA/result must be reported separately, not inferred here.
-  No full desktop/native, DMG, install, Actions, push, PR, release or Mac/private
+- Final standalone frontend types and `git diff --check` passed. All tests above
+  were run on the code committed as
+  `7f017dbbf75fccb0400a08ff3e48e1a1cb1447d0`.
+- The one coordinator-approved production frontend export at that exact SHA
+  **exited 137** during `Creating an optimized production build`. It did not report
+  compiled success or reach completed lint/types, page generation or static export.
+  Node 22.16.0, `NODE_OPTIONS=--max-old-space-size=2048`, `CIRCLE_NODE_TOTAL=2`,
+  telemetry disabled and a 20-minute outer bound were used from `frontend/`.
+  `/tmp/meetily-issue13-next-7f017db.log` contains Browserslist/Tailwind warnings
+  and `BUILD_EXIT_CODE=137`, not a source diagnostic proving the termination's
+  cause. No OOM or product-code diagnosis is inferred. No build workers survived;
+  the slot was released and no second attempt was started. Production export
+  verification therefore remains **incomplete**, not passed. This result note is
+  documentation-only; product/test sources remain identical to the tested SHA.
+- No full desktop/native, DMG, install, Actions, push, PR, release or Mac/private
   data operation is part of this implementation.
 
 **Pending:** owner sign-in to this isolated home and a real subscription smoke on
