@@ -134,3 +134,48 @@ async fn bridge_pending_manual_summary_save_after_notes_change_has_a_row_to_comm
  crate::database::repositories::summary::SummaryProcessesRepository::update_meeting_summary(&p,"m",&json!({"markdown":"Preserved manual draft"}),true).await.unwrap();
  assert!(library::export_snapshot(&p,"m",2).await.unwrap().summary.unwrap().contains("Preserved manual draft"));
 }
+
+#[tokio::test]
+async fn bridge_r1_unicode_curated_task_identity_survives_vocab_republication(){
+ for edited in [false,true]{
+  let p=db().await;let(j,r)=claim(&p).await;
+  let mut artifact:Value=serde_json::from_str(&result()).unwrap();artifact["tasks"][0]["text"]=json!("Отправить отчёт");let raw=artifact.to_string();
+  store::publish(&p,&j,&r,0,&raw).await.unwrap();
+  let id:String=sqlx::query_scalar("SELECT id FROM action_items WHERE meeting_id='m'").fetch_one(&p).await.unwrap();
+  crate::database::repositories::action_item::ActionItemsRepository::update(&p,&id,if edited{" ОТПРАВИТЬ ОТЧЁТ "}else{"Отправить отчёт"},None,None,None,true).await.unwrap();
+  let source_before:(String,Option<String>,Option<f64>)=sqlx::query_as("SELECT version_id,transcript_id,audio_time FROM action_item_transcript_sources WHERE action_id=?").bind(&id).fetch_one(&p).await.unwrap();
+  let before:(String,String,i64,i64,Option<String>,Option<f64>)=sqlx::query_as("SELECT id,text,done,edited,transcript_id,audio_time FROM action_items WHERE id=?").bind(&id).fetch_one(&p).await.unwrap();
+  store::control(&p,"m","refresh").await.unwrap();let j=store::claim(&p).await.unwrap().unwrap();store::bind_vocabulary(&p,&j,1).await.unwrap();
+  let mut tx=p.begin().await.unwrap();store::projection::capture(&mut tx,&j).await.unwrap();tx.commit().await.unwrap();
+  // A distinct Unicode task is a positive insertion control, not a blanket skip.
+  let mut next=artifact.clone();next["tasks"].as_array_mut().unwrap().push(json!({"text":"Проверить договор","evidence":[{"source":"transcript","row_id":"line","quote":"send report"}],"owner":null,"deadline":null}));
+  store::publish(&p,&j,&r,1,&next.to_string()).await.unwrap();
+  let after:Vec<(String,String,i64,i64,Option<String>,Option<f64>)>=sqlx::query_as("SELECT id,text,done,edited,transcript_id,audio_time FROM action_items WHERE meeting_id='m' ORDER BY position").fetch_all(&p).await.unwrap();
+  assert_eq!(after.len(),2,"spurious unchecked Unicode task duplicate");assert_eq!(after[0],before);assert_eq!(after[1].1,"Проверить договор");assert_eq!(after[1].2,0);
+  let source_after:(String,Option<String>,Option<f64>)=sqlx::query_as("SELECT version_id,transcript_id,audio_time FROM action_item_transcript_sources WHERE action_id=?").bind(&id).fetch_one(&p).await.unwrap();assert_eq!(source_after,source_before);
+  assert_eq!(store::results(&p,"m").await.unwrap().last().unwrap().result_json,raw);
+  let export=library::export_snapshot(&p,"m",1).await.unwrap();assert_eq!(export.actions.len(),2);assert!(export.actions[0].done);assert_eq!(store::results(&p,"m").await.unwrap().len(),2);
+ }
+}
+
+#[tokio::test]
+async fn bridge_r1_owner_resolution_prefers_meeting_mapping_with_genuine_fallback_only(){
+ for mapping in ["meeting","global","unknown","source-label"]{
+  let p=db().await;
+  sqlx::raw_sql("INSERT INTO people(id,display_name,normalized_name,created_at,updated_at) VALUES('global-alice','Alice','alice','2026','2026'),('meeting-alice','Alice Smith','alice smith','2026','2026');").execute(&p).await.unwrap();
+  if mapping=="source-label"{sqlx::raw_sql("INSERT INTO people(id,display_name,normalized_name,created_at,updated_at) VALUES('not-an-identity','You','you','2026','2026');").execute(&p).await.unwrap();}
+  if mapping=="meeting"{sqlx::raw_sql("INSERT INTO person_speakers(person_id,meeting_id,speaker_label) VALUES('meeting-alice','m','Alice');").execute(&p).await.unwrap();}
+  sqlx::query("UPDATE transcripts SET transcript='Alice will send report Friday. Unlisted will send report Friday. You will send report Friday.' WHERE id='line'").execute(&p).await.unwrap();
+  let(j,r)=claim(&p).await;let mut artifact:Value=serde_json::from_str(&result()).unwrap();
+  if mapping=="unknown"||mapping=="source-label"{
+   let owner=if mapping=="unknown"{"Unlisted"}else{"You"};let quote=format!("{owner} will send report Friday");
+   artifact["tasks"][0]["owner"]=json!({"value":owner,"quote":quote});
+   artifact["tasks"][0]["evidence"][0]["quote"]=json!(quote);
+  }
+  store::publish(&p,&j,&r,0,&artifact.to_string()).await.unwrap();
+  let person:Option<String>=sqlx::query_scalar("SELECT person_id FROM action_items WHERE meeting_id='m'").fetch_one(&p).await.unwrap();
+  assert_eq!(person,match mapping{"meeting"=>Some("meeting-alice".into()),"global"=>Some("global-alice".into()),_=>None});
+  assert_eq!(sqlx::query_scalar::<_,i64>("SELECT count(*) FROM people").fetch_one(&p).await.unwrap(),if mapping=="source-label"{3}else{2});
+  let export=library::export_snapshot(&p,"m",1).await.unwrap();assert_eq!(export.actions[0].owner.as_deref(),match mapping{"meeting"=>Some("Alice Smith"),"global"=>Some("Alice"),"unknown"=>Some("Unlisted"),_=>Some("You")});
+ }
+}

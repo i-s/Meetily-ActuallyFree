@@ -52,6 +52,9 @@ regex="={v['regex']}"
     for name in ('store', 'summary', 'priority', 'runner', 'worker'):
         post = post.replace(f'pub mod {name};', f'#[path="{SRC}/post_call/{name}.rs"] pub mod {name};')
     (work / 'src/post_call.rs').write_text(post)
+    action_source = (SRC / 'database/repositories/action_item.rs').read_text()
+    owner = action_source[action_source.index('pub(crate) async fn resolve_owner('):action_source.index('pub struct ActionItemsRepository;')]
+    (work / 'src/action_owner.rs').write_text('use sqlx::{Sqlite, Transaction}; use super::speaker_identity::{is_person_name, normalize_person_name}; pub(crate) use super::speaker_identity::normalize_person_name as normalize_task_text;\n' + owner)
     (work / 'src/lib.rs').write_text(f'''#![allow(dead_code,unused_imports)]
 extern crate self as tauri;
 use std::sync::{{Arc,Mutex}};
@@ -76,6 +79,7 @@ pub mod database{{
  #[path="{SRC}/database/transcript_versions.rs"]pub mod transcript_versions;
  pub mod repositories{{
   #[path="{SRC}/database/repositories/speaker_identity.rs"]pub mod speaker_identity;
+    #[path="{work}/src/action_owner.rs"] pub mod action_item;
   pub mod setting{{pub struct SettingsRepository;impl SettingsRepository{{pub async fn get_post_call_transcript_config(p:&sqlx::SqlitePool)->Result<Option<(String,String)>,sqlx::Error>{{sqlx::query_as("SELECT postCallProvider,postCallModel FROM transcript_settings WHERE id='1' AND postCallProvider IS NOT NULL AND postCallModel IS NOT NULL").fetch_optional(p).await}}}}}}
   #[path="{SRC}/database/repositories/vocabulary.rs"]pub mod vocabulary;
  }}

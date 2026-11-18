@@ -41,7 +41,7 @@ const rows=()=>[{id:selectedRowId,text:selectedText,speaker:'You',audio_start_ti
 const canonical=(target:string)=>target.startsWith('recording:/synthetic/')?`meeting:${target.slice('recording:/synthetic/'.length)}`:target;
 const transport=async(name:string,args:any):Promise<any>=>{
  calls.push([name,structuredClone(args)]);
- if(name==='post_call_canonical_summary'){const snapshot=structuredClone(canonicalSummary);if(canonicalWait)await canonicalWait;return snapshot;}
+ if(name==='post_call_canonical_summary'){const snapshot=structuredClone(canonicalSummary?.user_edited||canonicalSummary?.post_call?.notes_revision===(documents.get(`meeting:${args.meetingId}`)?.revision??0)?canonicalSummary:null);if(canonicalWait)await canonicalWait;return snapshot;}
  if(name==='api_notes_recording_target')return `recording:/synthetic/${args.meetingId}`;
  if(name==='api_read_notes_document')return structuredClone(documents.get(canonical(args.target))??null);
  if(name==='api_write_notes_document'){
@@ -67,7 +67,7 @@ const transport=async(name:string,args:any):Promise<any>=>{
   return [];
  }
  if(name==='api_get_meeting_summary_language')return {language:null,storage:'metadata'};
- if(name==='api_save_meeting_summary'){if(failSummary)throw new Error('Summary storage unavailable');if(summaryExists){savedSummary=args.summary.markdown;summaryToken++;}return;}
+ if(name==='api_save_meeting_summary'){if(failSummary)throw new Error('Summary storage unavailable');if(summaryExists){savedSummary=args.summary.markdown;summaryToken++;if(args.summary.post_call)canonicalSummary=structuredClone(args.summary);}return;}
  if(name==='select_transcript_version'||name==='correct_transcript_text'){
   if(pendingSummary)throw new Error('Wait for or cancel summary generation before selecting a transcript version');
   archivedSummary=savedSummary;savedSummary='';summaryExists=false;summaryToken++;version++;mutations++;if(name==='select_transcript_version'){selectedText='Selected text';selectedRowId='new-line';}else selectedText=args.text;return;
@@ -75,7 +75,7 @@ const transport=async(name:string,args:any):Promise<any>=>{
  if(name==='api_export_meeting_snapshot'){
   const notes=structuredClone(documents.get(`meeting:${args.meetingId}`)??{markdown:'',json:null,revision:0});
   if(notes.revision!==args.expectedNotesRevision)throw new Error('Notes changed while capturing export');
-  return {id:args.meetingId,title:'Meeting',createdAt:'2026-11-18',capturedAt:'2026-11-18T10:00:00Z',audioAvailable:false,notes:{...notes,source:'user_notes'},summary:savedSummary?JSON.stringify(canonicalSummary??{markdown:savedSummary}):null,summaryStatus:savedSummary?'completed':null,transcripts:rows().map(row=>({id:row.id,text:row.text,speaker:row.speaker,audioStartTime:row.audio_start_time})),actions:actionRows};
+  return {id:args.meetingId,title:'Meeting',createdAt:'2026-11-18',capturedAt:'2026-11-18T10:00:00Z',audioAvailable:false,notes:{...notes,source:'user_notes'},summary:savedSummary?(canonicalSummary&&!canonicalSummary.user_edited&&canonicalSummary.post_call.notes_revision!==notes.revision?null:JSON.stringify(canonicalSummary??{markdown:savedSummary})):null,summaryStatus:savedSummary?'completed':null,transcripts:rows().map(row=>({id:row.id,text:row.text,speaker:row.speaker,audioStartTime:row.audio_start_time})),actions:actionRows};
  }
  if(name==='api_library_materials')return [{id:active,transcriptCount:rows().length,hasNotes:documents.has(`meeting:${active}`),hasSummary:!!savedSummary,summaryStatus:savedSummary?'completed':null,audioAvailable:false}];
  if(name==='api_search_library'){
@@ -158,7 +158,7 @@ mock.module('@/components/groups/GroupEditor',()=>({openGroupEditor(){}}));
 
 const {default:MeetingsPage}=await import('../../src/app/meetings/page');
 const {default:PageContent}=await import('../../src/app/meeting-details/page-content');
-const {createNotesStore,flushNotes,getNotesSnapshot,notesForContext}=await import('../../src/lib/notes-store');
+const {createNotesStore,flushNotes,getNotesSnapshot,notesForContext,loadNotes,editNotes}=await import('../../src/lib/notes-store');
 let root:ReactTestRenderer|undefined;
 let navigateView:(id:string,summary:string)=>void;
 function Page(){
@@ -361,7 +361,7 @@ test('navigation cancels old extraction UI completion without blocking the new m
 
 
 const publishCanonical=()=>{
- canonicalSummary={markdown:'## Summary\n\nCanonical report discussed',post_call:{source:'post_call_results',job_epoch:3,version_id:'live',transcript_revision:7,notes_revision:1,vocabulary_revision:0}};
+ canonicalSummary={markdown:'## Summary\n\nCanonical report discussed',post_call:{source:'post_call_results',job_epoch:3,version_id:'live',transcript_revision:7,notes_revision:documents.get(`meeting:${active}`)?.revision??0,vocabulary_revision:0}};
  savedSummary=canonicalSummary.markdown;summaryExists=true;summaryToken++;
  actionRows=[{id:'generated-task',text:'Send report',done:false,source:'ai',transcriptId:'old-line',audioTime:1}];
 };
@@ -376,7 +376,7 @@ test('canonical native publication refreshes normal detail editor/tasks/library 
  await act(async()=>root!.update(<MeetingsPage/>));await search('Canonical');
  expect(visible(root!.toJSON())).toContain('Canonical report discussed');
  await act(async()=>exactButton('Export…').props.onClick());await act(async()=>exactButton('Export',true).props.onClick());
- expect(written).toHaveLength(2);expect(written[1].text).toContain('Canonical report discussed');expect(written[1].text).toContain('Send report');expect(written[0].text).toContain('job epoch 3');expect(written[1].text).toContain('Notes revision 1');
+ expect(written).toHaveLength(2);expect(written[1].text).toContain('Canonical report discussed');expect(written[1].text).toContain('Send report');expect(written[0].text).toContain('job epoch 3');expect(written[1].text).toContain(`Notes revision ${canonicalSummary.post_call.notes_revision}`);
 },60000);
 
 test('canonical late refresh cannot replace an immediate rich summary draft or navigated meeting',async()=>{
@@ -391,4 +391,68 @@ test('canonical late refresh cannot replace an immediate rich summary draft or n
  active=`combined-${++seq}`;documents.set(`meeting:${active}`,{markdown:'Meeting B notes',json:null,revision:1,source:'user_notes'});
  canonicalSummary=null;savedSummary='Meeting B summary';await act(async()=>{navigateView(active,savedSummary);release();});await ready();
  expect(editor('Summary editor').props.value).toContain('Meeting B summary');expect(editor('Summary editor').props.value).not.toContain('Canonical report');
+},60000);
+
+
+test('R1 same-target committed Notes save clears obsolete generated summary without focus or queue events',async()=>{
+ savedSummary='';summaryExists=false;await mount();
+ await act(async()=>{publishCanonical();for(const event of nativeEvents)event();});await ready();
+ const identity=editor('Notes editor').props['data-engine'];
+ expect(editor('Summary editor').props.value).toContain('Canonical report discussed');
+ await act(async()=>editor('Notes editor').props.onChange({target:{blocks:rich}}));
+ await act(async()=>{await flushNotes(`meeting:${active}`);});
+ expect(await transport('post_call_canonical_summary',{meetingId:active})).toBeNull();
+ const {captureMeetingExport}=await import('../../src/lib/meeting-export');expect((await captureMeetingExport(active)).summary).toBeNull();
+ expect(root!.root.findAllByProps({'aria-label':'Summary editor'})).toHaveLength(0);
+ expect(editor('Notes editor').props['data-engine']).toBe(identity);expect(documents.get(`meeting:${active}`).json).toEqual(rich);
+ await detailExport();expect(written[0].text).toContain('No summary available');expect(written[0].text).not.toContain('Canonical report discussed');
+ await act(async()=>root!.update(<MeetingsPage/>));await act(async()=>exactButton('Export…').props.onClick());await act(async()=>exactButton('Export',true).props.onClick());
+ expect(written[1].text).toContain('No summary available');expect(written[1].text).not.toContain('Canonical report discussed');expect(written[1].text).toContain(richMarkdown);
+},60000);
+
+
+test('R1 pending or failed Notes and commits for another target do not invalidate the focused summary',async()=>{
+ savedSummary='';summaryExists=false;await mount();await act(async()=>{publishCanonical();for(const event of nativeEvents)event();});await ready();
+ const revision=documents.get(`meeting:${active}`).revision;
+ const reads=()=>calls.filter(([name])=>name==='post_call_canonical_summary').length;
+ const before=reads();holdNotes=true;
+ await act(async()=>editor('Notes editor').props.onChange({target:{blocks:rich}}));
+ await act(async()=>{await flushNotes(`meeting:${active}`);});
+ expect(getNotesSnapshot(`meeting:${active}`).committedRevision).toBe(revision);expect(reads()).toBe(before);expect(root!.root.findAllByProps({'aria-label':'Summary editor'})).toHaveLength(1);
+ holdNotes=false;failNotes=true;await act(async()=>{for(const c of conversions.splice(0))c.resolve(richMarkdown);});await act(async()=>{await flushNotes(`meeting:${active}`);});
+ expect(getNotesSnapshot(`meeting:${active}`).state).toBe('error');expect(reads()).toBe(before);
+ failNotes=false;await act(async()=>{await loadNotes('meeting:unrelated');editNotes('meeting:unrelated',{markdown:'Other notes',json:[]},Promise.resolve('Other notes'));});
+ await act(async()=>{await flushNotes('meeting:unrelated');});expect(reads()).toBe(before);expect(editor('Summary editor').props.value).toContain('Canonical report discussed');
+ await act(async()=>{await flushNotes(`meeting:${active}`);});
+ expect(getNotesSnapshot(`meeting:${active}`).committedRevision).toBe(revision+1);expect(root!.root.findAllByProps({'aria-label':'Summary editor'})).toHaveLength(0);
+},60000);
+
+test('R1 Notes commit preserves a dirty rich summary awaiting conversion',async()=>{
+ savedSummary='';summaryExists=false;await mount();await act(async()=>{publishCanonical();for(const event of nativeEvents)event();});await ready();
+ const identity=editor('Summary editor').props['data-engine'];holdSummary=true;
+ await act(async()=>editor('Summary editor').props.onChange({target:{blocks:rich}}));
+ await act(async()=>editor('Notes editor').props.onChange({target:{value:'New personal Notes'}}));
+ await act(async()=>{await flushNotes(`meeting:${active}`);root!.update(<Page/>);});
+ expect(await transport('post_call_canonical_summary',{meetingId:active})).toBeNull();
+ expect(editor('Summary editor').props['data-engine']).toBe(identity);expect(editor('Summary editor').props.value).toContain('API follow-up');
+ holdSummary=false;await act(async()=>{for(const c of conversions.splice(0))c.resolve(richMarkdown);});
+ expect(editor('Summary editor').props['data-engine']).toBe(identity);expect(editor('Summary editor').props.value).toContain('API follow-up');
+},60000);
+
+test('R1 manual saved summary remains visible and exportable after Notes commit',async()=>{
+ savedSummary='';summaryExists=false;await mount();await act(async()=>{publishCanonical();for(const event of nativeEvents)event();});await ready();
+ await act(async()=>editor('Summary editor').props.onChange({target:{value:'Manual summary kept'}}));
+ await ready();expect(canonicalSummary.user_edited).toBe(true);
+ await act(async()=>editor('Notes editor').props.onChange({target:{blocks:rich}}));await act(async()=>{await flushNotes(`meeting:${active}`);});
+ expect(editor('Summary editor').props.value).toContain('Manual summary kept');
+ const {captureMeetingExport}=await import('../../src/lib/meeting-export');expect((await captureMeetingExport(active)).summary).toContain('Manual summary kept');
+},60000);
+
+test('R1 committed Notes revision fences a previously captured canonical reply after await',async()=>{
+ savedSummary='';summaryExists=false;await mount();await act(async()=>{publishCanonical();for(const event of nativeEvents)event();});await ready();
+ let release!:()=>void;canonicalWait=new Promise<void>(resolve=>{release=resolve;});
+ await act(async()=>{for(const event of nativeEvents)event();});
+ await act(async()=>editor('Notes editor').props.onChange({target:{blocks:rich}}));await act(async()=>{await flushNotes(`meeting:${active}`);});
+ await act(async()=>{release();});
+ expect(root!.root.findAllByProps({'aria-label':'Summary editor'})).toHaveLength(0);
 },60000);

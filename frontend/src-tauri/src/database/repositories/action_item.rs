@@ -8,6 +8,7 @@ use sqlx::{Sqlite, SqlitePool, Transaction};
 use uuid::Uuid;
 
 use super::person::{is_person_name, normalize_person_name};
+pub(crate) use super::person::normalize_person_name as normalize_task_text;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -130,7 +131,7 @@ fn clean(value: Option<String>) -> Option<String> {
 
 /// Links an owner name to a contact: first someone who spoke in this meeting
 /// under that name, then any contact with exactly that name.
-async fn resolve_owner(
+pub(crate) async fn resolve_owner(
     tx: &mut Transaction<'_, Sqlite>,
     meeting_id: &str,
     owner: Option<&str>,
@@ -375,7 +376,7 @@ impl ActionItemsRepository {
                 .bind(meeting_id)
                 .fetch_all(&mut **tx)
                 .await?;
-        let mut seen: Vec<String> = kept.iter().map(|text| normalize_person_name(text)).collect();
+        let mut seen: Vec<String> = kept.iter().map(|text| normalize_task_text(text)).collect();
         let mut position: i64 = sqlx::query_scalar(
             "SELECT COALESCE(MAX(position), -1) + 1 FROM action_items WHERE meeting_id = ?",
         )
@@ -385,7 +386,7 @@ impl ActionItemsRepository {
 
         for draft in drafts {
             let text = draft.text.trim().to_string();
-            let key = normalize_person_name(&text);
+            let key = normalize_task_text(&text);
             if text.is_empty() || seen.contains(&key) {
                 continue;
             }

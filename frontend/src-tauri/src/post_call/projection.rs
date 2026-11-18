@@ -4,6 +4,7 @@ use super::{Job, Revision};
 use serde_json::{json, Value};
 use sqlx::{Sqlite, SqlitePool, Transaction};
 use uuid::Uuid;
+use crate::database::repositories::action_item::{normalize_task_text, resolve_owner};
 
 pub async fn capture(tx: &mut Transaction<'_, Sqlite>, job: &Job) -> Result<(), String> {
     let row: Option<(String,i64,String)> = sqlx::query_as("SELECT action_sync_token,user_edited,status FROM summary_processes WHERE meeting_id=?")
@@ -100,11 +101,14 @@ pub async fn apply(tx:&mut Transaction<'_,Sqlite>,job:&Job,revision:&Revision,vo
     sqlx::query("INSERT INTO summary_processes(meeting_id,status,created_at,updated_at,result,user_edited) VALUES(?,'completed',datetime('now'),datetime('now'),?,0) ON CONFLICT(meeting_id) DO UPDATE SET status='completed',result=excluded.result,updated_at=excluded.updated_at,error=NULL,result_backup=NULL,result_backup_timestamp=NULL,user_edited=0")
         .bind(&job.meeting_id).bind(summary.to_string()).execute(&mut **tx).await.map_err(|e|e.to_string())?;
     sqlx::query("DELETE FROM action_items WHERE meeting_id=? AND source='ai' AND edited=0 AND done=0").bind(&job.meeting_id).execute(&mut **tx).await.map_err(|e|e.to_string())?;
-    let mut seen:Vec<String>=sqlx::query_scalar("SELECT lower(trim(text)) FROM action_items WHERE meeting_id=?").bind(&job.meeting_id).fetch_all(&mut **tx).await.map_err(|e|e.to_string())?;
+    let kept:Vec<String>=sqlx::query_scalar("SELECT text FROM action_items WHERE meeting_id=?").bind(&job.meeting_id).fetch_all(&mut **tx).await.map_err(|e|e.to_string())?;
+    // SQLite lower() is ASCII-only. Use the ordinary task reconciliation key
+    // for both persisted curated rows and new evidence-backed proposals.
+    let mut seen:Vec<String>=kept.iter().map(|text|normalize_task_text(text)).collect();
     let mut position:i64=sqlx::query_scalar("SELECT COALESCE(MAX(position),-1)+1 FROM action_items WHERE meeting_id=?").bind(&job.meeting_id).fetch_one(&mut **tx).await.map_err(|e|e.to_string())?;
     for task in tasks {
-        let key=task.text.trim().to_lowercase();if seen.contains(&key){continue;}seen.push(key);
-        let person:Option<String>=if let Some(owner)=&task.owner{sqlx::query_scalar("SELECT id FROM people WHERE normalized_name=? ORDER BY id LIMIT 1").bind(owner.trim().to_lowercase()).fetch_optional(&mut **tx).await.map_err(|e|e.to_string())?}else{None};
+        let key=normalize_task_text(&task.text);if seen.contains(&key){continue;}seen.push(key);
+        let person=resolve_owner(tx,&job.meeting_id,task.owner.as_deref()).await.map_err(|e|e.to_string())?;
         let id=format!("action-{}",Uuid::new_v4());
         sqlx::query("INSERT INTO action_items(id,meeting_id,text,owner_label,person_id,due_text,done,source,edited,audio_time,transcript_id,position,created_at,updated_at) VALUES(?,?,?,?,?,?,0,'ai',0,?,?,?,datetime('now'),datetime('now'))")
             .bind(&id).bind(&job.meeting_id).bind(task.text).bind(task.owner).bind(person).bind(task.due).bind(task.time).bind(&task.row).bind(position).execute(&mut **tx).await.map_err(|e|e.to_string())?;

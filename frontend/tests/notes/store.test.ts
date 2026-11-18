@@ -187,3 +187,28 @@ test('projection refetch cannot replace dirty Notes during conversion, debounce 
   await store.loadNotes(target, true);
   expect(store.getNotesSnapshot(target).content).toEqual(edited);
 });
+
+
+test('committed revision notifications advance only on native read/ack, not pending or failed writes', async () => {
+  const target = 'meeting:committed-revision';
+  documents.set(target, { ...content('Original'), revision: 4 });
+  const revisions: Array<number | undefined> = [];
+  const stop = store.subscribeNotes(target, () => revisions.push(store.getNotesSnapshot(target).committedRevision));
+  try {
+    await store.loadNotes(target);
+    expect(store.getNotesSnapshot(target).committedRevision).toBe(4);
+    const before = revisions.length;
+    store.editNotes(target, content('Updated'), Promise.resolve('Updated'));
+    await settle();
+    let release!: () => void;
+    hold = new Promise(resolve => { release = resolve; });
+    const saving = store.flushNotes(target);
+    expect(store.getNotesSnapshot(target).committedRevision).toBe(4);
+    fail = true; hold = null; release(); await saving;
+    expect(store.getNotesSnapshot(target).state).toBe('error');
+    expect(revisions.slice(before).every(revision => revision === 4)).toBe(true);
+    fail = false; await store.flushNotes(target);
+    expect(store.getNotesSnapshot(target).committedRevision).toBe(5);
+    expect(revisions.at(-1)).toBe(5);
+  } finally { fail = false; hold = null; stop(); }
+});

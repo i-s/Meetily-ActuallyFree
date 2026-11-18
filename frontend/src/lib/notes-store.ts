@@ -4,6 +4,8 @@ export interface NotesContent { markdown: string; json: unknown[] | null }
 export interface NotesDocument extends NotesContent { revision: number; updatedAt?: string }
 export interface NotesSnapshot {
   loaded: boolean;
+  /** Last native revision read or successfully committed, never a draft revision. */
+  committedRevision?: number;
   content: NotesContent;
   state: 'loading' | 'saved' | 'pending' | 'saving' | 'error';
   error: string | null;
@@ -177,7 +179,7 @@ export function createNotesStore(options: { invoke?: typeof invoke; storage?: St
         // Recovery can read/reconvert the original immutable source and commit
         // it natively even when Storage cannot allocate a copy. Keep that source
         // intact, mount read-only, and require an explicit native-save action.
-        publish(entry, { loaded: true, state: entry.backupBlocked ? 'error' : selected ? 'pending' : 'saved', error: entry.backupBlocked ? entry.snapshot.error : null, warning: entry.backupBlocked ? entry.snapshot.warning : null, recoveryDrafts: undefined });
+        publish(entry, { loaded: true, committedRevision: stored?.revision ?? 0, state: entry.backupBlocked ? 'error' : selected ? 'pending' : 'saved', error: entry.backupBlocked ? entry.snapshot.error : null, warning: entry.backupBlocked ? entry.snapshot.warning : null, recoveryDrafts: undefined });
         if (selected && !entry.converting && !entry.backupBlocked) void flushNotes(target);
       } catch (e) {
         publish(entry, { state: 'error', error: message(e) });
@@ -257,7 +259,7 @@ export function createNotesStore(options: { invoke?: typeof invoke; storage?: St
               entry.journal = undefined;
             }
             entry.dirty = false;
-            publish(entry, { state: 'saved', error: null, warning: entry.backupBlocked ? `Notes saved natively. Browser recovery storage is unavailable; editing stays locked until Retry recovery backup succeeds.${deferredCleanup ? ' Original recovery records are retained until safe legacy cleanup is possible.' : ''}` : null });
+            publish(entry, { state: 'saved', committedRevision: revision, error: null, warning: entry.backupBlocked ? `Notes saved natively. Browser recovery storage is unavailable; editing stays locked until Retry recovery backup succeeds.${deferredCleanup ? ' Original recovery records are retained until safe legacy cleanup is possible.' : ''}` : null });
           } else journal(target, entry);
         } catch (e) {
           publish(entry, { state: 'error', error: message(e) });

@@ -35,11 +35,14 @@ regex="={v['regex']}"
 ''')
     (work / 'Cargo.lock').write_bytes((ROOT / 'Cargo.lock').read_bytes())
     modules = '\n'.join(f'#[path="{SRC}/post_call/{n}.rs"] pub mod {n};' for n in ('store', 'summary', 'priority', 'runner'))
+    action_source = (SRC / 'database/repositories/action_item.rs').read_text()
+    owner = action_source[action_source.index('pub(crate) async fn resolve_owner('):action_source.index('pub struct ActionItemsRepository;')]
+    (work / 'src/action_owner.rs').write_text('use sqlx::{Sqlite, Transaction}; use super::speaker_identity::{is_person_name, normalize_person_name}; pub(crate) use super::speaker_identity::normalize_person_name as normalize_task_text;\n' + owner)
     (work / 'src/lib.rs').write_text(f'''pub mod api {{{segment}}}
 {modules}
 pub mod config {{pub const DEFAULT_PARAKEET_MODEL:&str="synthetic";}}
 pub mod codex_cli {{#[path="{SRC}/codex_cli/vocabulary.rs"]pub mod vocabulary;}}
-pub mod database {{#[path="{SRC}/database/vocabulary_suggestions.rs"]pub mod vocabulary_suggestions;pub mod repositories {{#[path="{SRC}/database/repositories/vocabulary.rs"]pub mod vocabulary;}}}}
+pub mod database {{#[path="{SRC}/database/vocabulary_suggestions.rs"]pub mod vocabulary_suggestions;pub mod repositories {{#[path="{SRC}/database/repositories/speaker_identity.rs"] pub mod speaker_identity; #[path="{work}/src/action_owner.rs"] pub mod action_item; #[path="{SRC}/database/repositories/vocabulary.rs"]pub mod vocabulary;}}}}
 #[path="{SRC}/diarization/batch_control.rs"] pub mod batch_control;
 #[cfg(test)] #[path="{ROOT}/frontend/tests/native/post-call-fixture.rs"] mod test_schema;
 #[cfg(test)] #[path="{ROOT}/frontend/tests/native/post-call.rs"] mod tests;
