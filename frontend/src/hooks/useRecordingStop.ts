@@ -15,7 +15,6 @@ import {
 } from '@/lib/summary-language-preferences';
 import { endLiveSession, finalLiveTitle, readLiveNotes, writeLiveTitle } from '@/lib/live-session';
 import { announceChange, saveMeetingNotes } from '@/lib/workspace-api';
-import { endAutomatedRecording } from '@/lib/meeting-automation';
 
 type SummaryStatus = 'idle' | 'processing' | 'summarizing' | 'regenerating' | 'completed' | 'error';
 
@@ -83,7 +82,8 @@ export function useRecordingStop(
       return;
     }
     stopInProgressRef.current = true;
-    endAutomatedRecording();
+    // Native start settlement owns automation release. A delayed save callback
+    // for A must not revoke whichever owner/pending B exists when it runs.
 
     // Manual Stop saves the take, even when short or ASR has produced no text.
     // Discarding user audio requires an explicit user action, not a duration guess.

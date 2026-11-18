@@ -9,6 +9,9 @@ import { invoke } from "@tauri-apps/api/core"
 import { Radar, Workflow } from "lucide-react"
 import { toast } from "sonner"
 import { useLabs } from "@/hooks/useLabs"
+import { DiscordObservation } from "./DiscordObservation"
+import { automationUnavailableMessage, AUTOMATION_CHANGED_EVENT } from "@/lib/meeting-automation"
+import type { DiscordCallStatus } from "@/lib/discord-automation"
 import { ZoomObservationPanel } from './ZoomObservationPanel'
 import { setLabsFeature } from "@/lib/labs-features"
 
@@ -18,6 +21,8 @@ interface MeetingDetectionSettings {
   meeting_apps: string[];
   ignored_apps: string[];
   notify: boolean;
+  discord_automation: boolean;
+  zoom_automation: boolean;
 }
 
 /**
@@ -30,6 +35,23 @@ export function MeetingDetectionSettings() {
   const [ignoredInput, setIgnoredInput] = useState('');
   const { labs } = useLabs();
   const [automationBusy, setAutomationBusy] = useState(false);
+  const [automationUnavailable, setAutomationUnavailable] = useState<string | null>(null);
+  useEffect(() => {
+    const update = () => setAutomationUnavailable(automationUnavailableMessage());
+    update();
+    window.addEventListener(AUTOMATION_CHANGED_EVENT, update);
+    return () => window.removeEventListener(AUTOMATION_CHANGED_EVENT, update);
+  }, []);
+  const [discord, setDiscord] = useState<DiscordCallStatus | null>(null);
+
+  useEffect(() => {
+    let disposed = false;
+    const update = (status: DiscordCallStatus) => { if (!disposed) setDiscord(status); };
+    const subscription = listen<DiscordCallStatus>('discord-call-state', (event) => update(event.payload));
+    void subscription.then(() => invoke<DiscordCallStatus>('get_discord_automation_status')).then(update).catch(console.error);
+    return () => { disposed = true; void subscription.then((fn) => fn()); };
+  }, []);
+
   const [lifecycle, setLifecycle] = useState<LifecycleSnapshot | null>(null);
   useEffect(() => {
     let disposed = false;
@@ -157,7 +179,44 @@ export function MeetingDetectionSettings() {
         </div>
       ))}
 
+      <div className="rounded-xl border border-af-border p-4 text-sm">
+        <label className="flex items-center justify-between gap-4">Allow qualified Zoom automation
+          <Switch checked={md.zoom_automation ?? false} disabled={!md.enabled} aria-label="Allow qualified Zoom automation"
+            onCheckedChange={(value) => void saveMd({ ...md, zoom_automation: value })} />
+        </label>
+        <p>Separate opt-in; real Zoom signals remain unqualified. This switch never overrides qualification.</p>
+      </div>
       <ZoomObservationPanel enabled={md.enabled} />
+      <section className="rounded-2xl border border-af-border bg-af-panel-2/40 p-5" aria-label="Discord macOS signal adapter">
+        <div className="flex items-center justify-between gap-4">
+          <h3 className="text-[15px] font-semibold text-af-text">Discord macOS — qualification pending</h3>
+          <Switch checked={md.discord_automation ?? false} disabled={!md.enabled}
+            aria-label="Observe Discord macOS call signals"
+            onCheckedChange={(value) => void saveMd({ ...md, discord_automation: value })} />
+        </div>
+        <p className="mt-2 text-sm text-af-text-2">
+          Opt-in read-only Accessibility observation, every 3 seconds. Stable desktop client only.
+          Grant Meetily Accessibility access in macOS System Settings if you choose to observe.
+          No RPC scopes, user token, bot, microphone probing or audio capture is used for detection.
+        </p>
+        <p className="mt-2 text-sm text-af-text-2" role="status">
+          Signal: {discord?.state ?? 'unknown'} · {discord?.reason ?? 'status unavailable'}.
+          {' '}Automatic Discord recording is blocked until the signal is qualified on a physical Mac.
+        </p>
+        <p className="mt-2 text-sm text-af-text-3">
+          Guild voice, DM and group DM are each unqualified; this adapter cannot identify the call type.
+          Mute, silence, channel/device changes and hidden or unreadable controls do not prove leave.
+          Leaving with the client open has no qualified signal. Candidate client-exit tracking has a 45-second reconnect grace;
+          automatic Stop also requires integrated native ownership.
+          PTB, Canary, browser Discord, Stage and Windows are unsupported here.
+          Use manual Start, Pause, Resume and Stop. Manual Stop will not rearm the same detected session.
+        </p>
+        <DiscordObservation status={discord} automationOn={labs.meetingAutomation} />
+      </section>
+
+      {automationUnavailable && <p role="status" className="text-sm text-af-text-2">{automationUnavailable}</p>}
+
+
 
       <div className="flex items-start gap-4 rounded-2xl border border-af-border bg-af-panel-2/40 p-5">
         <span className="mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-af-accent/[0.12] text-af-accent">

@@ -7,11 +7,19 @@ fn request(source: &str, token: &str) -> starts::StartRequest {
         source: source.into(), session_id: format!("qualified-{source}-{token}"), token: token.into() }
 }
 async fn start(expected: starts::StartRequest) -> Result<ownership::RecordingLease, String> {
+    if expected.session_id.starts_with("qualified-zoom-") {
+        crate::meeting_detection::lifecycle::fixture(Some(expected.session_id.clone()), "active".into(), true);
+    } else if expected.session_id.starts_with("qualified-discord-") {
+        crate::discord_automation::fixture(crate::discord_automation::Status { enabled:true,qualified:true,state:"active".into(),session_id:Some(expected.session_id.clone()),transition:"start".into() });
+    }
     commands::start_recording_with_lifecycle(app(), None, None, None, Some(expected.session_id.clone()), Some(expected)).await
 }
 async fn reset() {
     let _lock = common::acquire_engine_lifecycle_lock().await;
     ownership::claim_stop(None);
+    crate::meeting_detection::OPT_IN.store(true, Ordering::SeqCst);
+    crate::meeting_detection::lifecycle::fixture(None, "unknown".into(), false);
+    crate::discord_automation::fixture(crate::discord_automation::Status { enabled:false,qualified:false,state:"unknown".into(),session_id:None,transition:"none".into() });
     ownership::set_meeting_automation_enabled(true);
     commands::IS_RECORDING.store(false, Ordering::SeqCst);
     commands::CAPTURES.store(0, Ordering::SeqCst);

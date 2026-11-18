@@ -1,5 +1,5 @@
 import type { NativeRecordingState, RecordingLease } from './native-recording';
-import { reconcileAutomatedRecording, releaseAutomatedStart, automatedStartInProgress, automatedRecording, endAutomatedRecording, markAutomatedStart, type AutomatedCall } from './meeting-automation';
+import { releaseAutomatedStart, automatedStartInProgress, markAutomatedStart, type AutomatedCall } from './meeting-automation';
 
 export interface LifecycleSource {
   source: string;
@@ -8,108 +8,77 @@ export interface LifecycleSource {
   presence: 'active' | 'inactive' | 'unknown';
   reason: string;
   qualified: boolean;
-  /** Retained through Unknown and stop grace; null only after confirmed exit. */
   session_id: string | null;
 }
 export interface LifecycleSnapshot {
   revision: number;
   enabled: boolean;
+  automation_enabled?: boolean;
   sources: LifecycleSource[];
 }
 let latest: LifecycleSnapshot = { revision: -1, enabled: false, sources: [] };
-const SEEN_KEY = 'meetingLifecycleConsumed';
-function consumed(): Map<string, string> {
-  try { return new Map(JSON.parse(sessionStorage.getItem(SEEN_KEY) || '[]')); }
-  catch { return new Map(); }
-}
-function consume(call: AutomatedCall) {
-  const calls = consumed(); calls.set(call.source!, call.sessionId!);
-  // One tombstone per source: a long Zoom call cannot be rearmed by many
-  // intervening Discord sessions evicting its manual-stop suppression.
-  try { sessionStorage.setItem(SEEN_KEY, JSON.stringify([...calls])); } catch { /* fail closed below */ }
-}
 export function lifecycleCallCanStart(call: AutomatedCall): boolean {
-  return !call.sessionId || (latest.enabled && latest.sources.some(s =>
-    s.source === call.source && s.session_id === call.sessionId && s.presence === 'active' && s.qualified));
+  return call.source === 'zoom' && latest.enabled && latest.automation_enabled === true && latest.sources.some(s =>
+    s.source === 'zoom' && s.session_id === call.sessionId && s.presence === 'active' && s.qualified);
 }
 export function lifecycleCallCurrent(call: AutomatedCall): boolean {
-  return !call.sessionId || (latest.enabled && latest.sources.some(s =>
-    s.source === call.source && s.session_id === call.sessionId));
+  return call.source === 'zoom' && latest.enabled && latest.sources.some(s => s.source === 'zoom' && s.session_id === call.sessionId);
 }
-
 export function lifecycleCallEnded(call: AutomatedCall): boolean {
-  return latest.enabled && latest.sources.some(s => s.source === call.source && (
+  return call.source === 'zoom' && latest.enabled && latest.sources.some(s => s.source === 'zoom' && s.qualified && (
     (s.presence === 'inactive' && s.session_id === null)
-    // A new native session can only exist after the old one confirmed exit.
     || (s.session_id !== null && s.session_id !== call.sessionId)
   ));
 }
 
-/** One recorder, independent sources, first accepted session wins. Busy calls
- * are consumed, not queued: ending Zoom must never stop a manual/Discord take.
- * Shared by the root event listener and recorder's asynchronous start boundary.
+/** Zoom adapter only. Discord owns its own status/qualification contract, while
+ * BOTH adapters use the one common reservation/tombstone store before any await.
+ * Actual Stop authority comes from native, even if a JS start reply was lost.
  */
 export function createLifecycleAutomation(deps: {
   enabled: () => boolean;
   state: () => Promise<NativeRecordingState>;
-  start: () => void;
+  start: (call: AutomatedCall) => void;
   stop: (expected: RecordingLease) => void;
   error: (error: unknown) => void;
   conflict: (app: string) => void;
 }) {
-  let disposed = false;
+  let disposed = false, processing = false, dirty = false;
   let acceptedRevision = -1;
-  let processing = false;
-  let dirty = false;
-  const seen = consumed();
+  let stopping: string | null = null;
   async function reconcile() {
     if (processing || disposed) return;
     processing = true;
     try {
       while (dirty && !disposed) {
         dirty = false;
-        const allowed = deps.enabled() && latest.enabled;
-        // Consume before the first asynchronous admission query. Another
-        // adapter cannot turn a busy session into a later surprise recording.
-        const candidates = allowed ? latest.sources.filter(source => source.qualified && source.session_id
-          && source.presence === 'active' && seen.get(source.source) !== source.session_id) : [];
-        for (const source of candidates) {
-          const call = { app: source.app, process: source.process, source: source.source, sessionId: source.session_id! };
-          seen.set(source.source, source.session_id!); consume(call);
+        const allowed = deps.enabled() && latest.enabled && latest.automation_enabled === true;
+        const reserved: AutomatedCall[] = [];
+        if (allowed) for (const source of latest.sources) {
+          if (source.source !== 'zoom' || !source.qualified || !source.session_id || source.presence !== 'active') continue;
+          const call = { app: source.app, process: source.process, source: source.source, sessionId: source.session_id };
+          if (markAutomatedStart(call)) {
+            const pending = automatedStartInProgress();
+            if (pending) reserved.push(pending);
+          }
         }
         const native = await deps.state();
-        if (disposed) continue;
+        if (disposed) { reserved.forEach(releaseAutomatedStart); continue; }
         const lease = native.recording_lease;
-        // Native authority survives reload/start completion without the caller's
-        // promise. Browser storage is a display/handoff mirror, never ownership.
-        if (native.is_recording && lease?.owner) {
+        if (native.is_recording && lease?.owner?.source === 'zoom') {
           const owner = lease.owner;
-          const pending = automatedStartInProgress();
-          if (pending?.source === owner.source && pending.sessionId === owner.session_id) releaseAutomatedStart(pending);
-          reconcileAutomatedRecording({ source: owner.source, sessionId: owner.session_id,
-            app: owner.app, process: owner.process });
           if (lifecycleCallEnded({ source: owner.source, sessionId: owner.session_id, app: owner.app, process: owner.process })
-            && !native.is_stopping && deps.enabled() && latest.enabled) deps.stop(lease);
-        } else {
-          const mirror = automatedRecording();
-          const legacyOwnsSameTake = native.is_recording && !mirror?.sessionId
-            && !!lease && mirror?.recordingLease?.generation === lease.generation;
-          if (!legacyOwnsSameTake && (native.is_recording || !automatedStartInProgress())) endAutomatedRecording();
-        }
-        for (const source of candidates) {
-          const call: AutomatedCall = { app: source.app, process: source.process, source: source.source, sessionId: source.session_id! };
-          const state = await deps.state();
-          if (disposed || !deps.enabled() || !lifecycleCallCanStart(call)) continue;
-          const owner = state.recording_lease?.owner;
-          if (owner && owner.source === call.source && owner.session_id === call.sessionId) continue;
-          if (state.is_recording || state.is_stopping || automatedRecording() || automatedStartInProgress()) {
-            deps.conflict(call.app); continue;
+            && !native.is_stopping && deps.enabled() && latest.automation_enabled === true) {
+            const key = JSON.stringify(lease);
+            if (stopping !== key) { stopping = key; deps.stop(lease); }
           }
-          // Storage is required for a routed handoff; otherwise don't capture.
-          if (!markAutomatedStart(call)) throw new Error('Meeting automation needs session storage. Start was not requested.');
-          deps.start();
-          // The shared reservation makes remaining simultaneous sources busy;
-          // they stay consumed rather than queued for an accidental handover.
+        } else stopping = null;
+        for (const call of reserved) {
+          if (!deps.enabled() || !lifecycleCallCanStart(call)) { releaseAutomatedStart(call); continue; }
+          if (native.is_recording || native.is_stopping) {
+            releaseAutomatedStart(call); deps.conflict(call.app); continue;
+          }
+          deps.start(call);
         }
       }
     } catch (error) { deps.error(error); }
@@ -118,11 +87,9 @@ export function createLifecycleAutomation(deps: {
   return {
     accept(snapshot: LifecycleSnapshot) {
       if (disposed || snapshot.revision < latest.revision || snapshot.revision === acceptedRevision) return;
-      acceptedRevision = snapshot.revision;
-      latest = snapshot;
-      dirty = true;
-      void reconcile();
+      acceptedRevision = snapshot.revision; latest = snapshot; dirty = true; void reconcile();
     },
+    recordingChanged() { dirty = true; void reconcile(); },
     dispose() { disposed = true; },
   };
 }

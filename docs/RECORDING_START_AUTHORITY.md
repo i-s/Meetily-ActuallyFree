@@ -1,5 +1,11 @@
 # Native recording start authority v1
 
+**Combined integration update (2026-11-18):** [#10/#11 integration](ISSUE10_11_INTEGRATION.md)
+now wires the shared hook/service/native authority and guarded Stop. Standalone
+branch limitations below are retained as historical evidence, not current wiring
+claims. Real-source qualification and physical/desktop gates remain open.
+
+
 Follow-up to issue #10 R1, based on fixed review snapshot `8997242`. This is a
 native recorder safety interface, not qualification of Zoom/Discord capture.
 All real adapter classes remain unqualified. #11 owns browser reservation expiry,

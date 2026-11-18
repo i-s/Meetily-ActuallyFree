@@ -20,6 +20,7 @@ pub mod recording_state;
 pub mod recording_mode;
 pub mod recording_ownership;
 pub mod recording_start_authority;
+pub mod recording_start_sources;
 pub mod pipeline;
 pub mod stream;
 pub mod recording_manager;

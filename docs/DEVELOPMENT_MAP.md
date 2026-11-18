@@ -18,6 +18,13 @@ and a model's anonymous speaker channels are also different concepts.
 
 ## 2. Recording data flow
 
+The [combined #10/#11 integration](ISSUE10_11_INTEGRATION.md) owns the current
+shared recorder path: one explicit intent/reservation/recovery protocol, native
+source-specific opt-in/qualification, epoch-ticket admission, guarded Stop and
+keep-recording. Read it alongside both preserved source/journal notes. It records
+actual cross-language coverage separately from serializer/standalone/physical gates.
+#14 remains separate.
+
 Zoom's source-specific AX candidate, composable lifecycle snapshots, session-bound
 start/Stop ownership, manual override and provisional timing are documented in
 [ISSUE10_ZOOM_AUTOMATION.md](ISSUE10_ZOOM_AUTOMATION.md). Read it before changing
@@ -28,14 +35,14 @@ available in Settings. Shared token reservations and native recording generation
 owners guard Stop atomically and restore ownership on WebView reload. The follow-up
 [native start authority v1](RECORDING_START_AUTHORITY.md) fences delayed start IPC
 with a process epoch/sequence and serialized terminal barriers; #11 owns browser
-expiry/phase integration, which is not implied by the native-only implementation. Scoped native
+expiry/phase protocol, now wired through the combined hook and terminal recovery. Scoped native
 provenance (identified Zoom contexts, ambiguous global Zoom inventory, and room)
 sets persisted `microphone_identity_unverified`; unrelated capture keeps its prior
 behavior. Flagged offline calls bypass BOTH mic-to-You and legacy voiceprint/user-
 cluster inference; shared source-label predicates keep Microphone refinable rather
 than a person. The [R2 follow-up](ISSUE10_R2_FOLLOWUP.md) adds explicit recorder
 launch intent, original-folder metadata validation and no-overlap/composite user
-label sanitization; it also records the pending #11 shared-hook integration boundary.
+label sanitization; its historical pending hook boundary is superseded by the combined note.
 Both source tracks/overlap stay intact; #6 acoustic identity remains
 pending and independent of lifecycle.
 
@@ -244,6 +251,28 @@ not an automatic recording adapter. The subsequent #10 candidate is separately
 mapped above and does not overturn #7's pending physical gate. Mute/preview and process I/O must not be
 promoted to call lifecycle without evidence; no target Mac measurements or
 verified mechanism are claimed.
+
+Issue #11's isolated read-only Discord macOS AX candidate, native state event,
+normal-recorder integration, manual-stop/session ownership and test coverage are
+mapped in [ISSUE11_DISCORD_AUTOMATION.md](ISSUE11_DISCORD_AUTOMATION.md).
+**Automatic Discord capture remains qualification-gated off**: guild voice, DM
+and group DM are individually unqualified, and leave with the client open has no
+validated signal. Process/mic activity and missing UI never authorize capture or
+prove leave. This adapter does not alter the concurrent Zoom event path.
+Its observation-only native journal, finite manual-truth markers, privacy-safe
+export and exact guild/DM/GDM comparison/promotion protocol are documented in
+[ISSUE11_DISCORD_OBSERVATION.md](ISSUE11_DISCORD_OBSERVATION.md). Reader availability,
+observation enablement, client absence, candidate Active and qualified call support
+are distinct; no diagnostic setting can unlock unqualified recording.
+R1's stale-observation gap reset, busy-call tombstones, common token reservation
+and required #10 native generation/guarded-Stop integration are recorded in
+[ISSUE11_REVIEW_FIXES.md](ISSUE11_REVIEW_FIXES.md). A standalone missing lease or
+missing guarded dispatcher cannot silently become an unguarded Discord Stop.
+R2's expirable preparation versus persisted native-start uncertainty, exact #10
+v1 expectedStart/settling-barrier transport, explicit automated launch intent,
+consumed-session capacity/recovery and race/serialization fixtures are mapped in
+[ISSUE11_START_RECOVERY.md](ISSUE11_START_RECOVERY.md). An expired JS token or idle
+snapshot cannot clear a dispatched start; missing native authority fails closed.
 
 Issue #5 artifact-only Actions build (pinned source/tree vs workflow SHA),
 sidecar ordering, locked dependencies, model provenance, same-account backup/

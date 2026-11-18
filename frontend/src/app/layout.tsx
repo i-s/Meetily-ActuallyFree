@@ -11,6 +11,9 @@ import { X } from 'lucide-react'
 import "sonner/dist/styles.css"
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { usePathname, useRouter } from 'next/navigation'
+import { createDiscordAutomation, type DiscordCallStatus } from '@/lib/discord-automation'
+import { recoverAutomatedStart } from '@/lib/recording-start-recovery'
+import { AUTOMATION_CHANGED_EVENT } from '@/lib/meeting-automation'
 import { launchRecording, requestRecordingStop } from '@/lib/recording-launch'
 import { listen, UnlistenFn } from '@tauri-apps/api/event'
 import { invoke } from '@tauri-apps/api/core'
@@ -167,7 +170,7 @@ export default function RootLayout({
   const acknowledgeRecordingNotice = useCallback(() => setRecordingNoticeAcknowledged(true), [])
   startRecordingAnywhere.current = (automated) => {
     if (!recordingNoticeAcknowledged) return
-    launchRecording((href) => router.push(href), { automated })
+    launchRecording((href) => router.push(href), automated ? { automated } : {})
   }
 
   // Import audio state
@@ -307,6 +310,20 @@ export default function RootLayout({
     };
   }, [startupResolved, startupError, pendingCrashReport]);
 
+  // One shared native settlement owner. Source workers never clear a dispatched
+  // ticket from an idle snapshot, and reload does not lose its exact tuple.
+  useEffect(() => {
+    if (!startupResolved || startupError || pendingCrashReport || isMinibar || !recordingNoticeAcknowledged) return;
+    const recover = () => { void recoverAutomatedStart().catch(error => console.error('Automation remains fenced:', error)); };
+    const subscriptions = ['recording-started', 'recording-stopped'].map(name => listen(name, recover));
+    window.addEventListener(AUTOMATION_CHANGED_EVENT, recover);
+    void Promise.all(subscriptions).then(recover);
+    return () => {
+      window.removeEventListener(AUTOMATION_CHANGED_EVENT, recover);
+      subscriptions.forEach(subscription => { void subscription.then(unlisten => unlisten()); });
+    };
+  }, [startupResolved, startupError, pendingCrashReport, isMinibar, recordingNoticeAcknowledged]);
+
   // Source lifecycle automation is separate from legacy running-app offers.
   // Only the main WebView owns recorder routing; the compact bar never starts
   // or stops a take. Native snapshots retain sessions across route changes.
@@ -321,16 +338,14 @@ export default function RootLayout({
     const lifecycle = createLifecycleAutomation({
       enabled: () => loadLabsPreferences().meetingAutomation && !showOnboarding,
       state: () => invoke('get_recording_state'),
-      start: () => {
-        const call = automatedStartInProgress();
-        if (call) startRecordingAnywhere.current(call);
-      },
+      start: (call) => startRecordingAnywhere.current(call),
       stop: (expected) => requestRecordingStop((href) => router.push(href), expected),
       error: (error) => toast.error('Meeting automation failed', { description: String(error) }),
       conflict: (app) => toast.info(`${app} call detected while the recorder is busy`, {
         description: 'The existing take keeps its owner. No second recording was started.',
       }),
     });
+    window.addEventListener(AUTOMATION_CHANGED_EVENT, lifecycle.recordingChanged);
     const unlistenLifecycle = listen<LifecycleSnapshot>('meeting-lifecycle', event => lifecycle.accept(event.payload));
     // Subscribe before fetching, and reject stale revisions if a probe races it.
     void unlistenLifecycle.then(() => invoke<LifecycleSnapshot>('get_meeting_lifecycle_snapshot'))
@@ -401,7 +416,7 @@ export default function RootLayout({
       void invoke<import('@/lib/native-recording').NativeRecordingState>('get_recording_state').then((state) => {
         if (!loadLabsPreferences().meetingAutomation) return;
         if (!state.is_recording) {
-          endAutomatedRecording();
+          endAutomatedRecording(call);
           return;
         }
         if (call.recordingLease && state.recording_lease?.generation === call.recordingLease.generation) {
@@ -415,10 +430,34 @@ export default function RootLayout({
       unlistenStart.then((fn) => fn());
       unlistenEnd.then((fn) => fn());
       lifecycle.dispose();
+      window.removeEventListener(AUTOMATION_CHANGED_EVENT, lifecycle.recordingChanged);
       window.removeEventListener(LABS_CHANGED_EVENT, syncAutomation);
       unlistenLifecycle.then((fn) => fn());
     };
   }, [showOnboarding, startupResolved, startupError, pendingCrashReport, isMinibar, router, recordingNoticeAcknowledged]);
+
+  // Discord has separate typed evidence/session events: do not translate AX
+  // Unknown into generic media inactivity, or couple this to the Zoom adapter.
+  useEffect(() => {
+    if (!startupResolved || startupError || pendingCrashReport || isMinibar || !recordingNoticeAcknowledged || showOnboarding) return;
+    const bridge = createDiscordAutomation({
+      allowed: () => loadLabsPreferences().meetingAutomation,
+      status: () => invoke<DiscordCallStatus>('get_discord_automation_status'),
+      recording: () => invoke<{ is_recording?: boolean }>('get_recording_state'),
+      start: (call) => startRecordingAnywhere.current(call),
+      stop: (expected) => requestRecordingStop((href) => router.push(href), expected),
+      error: (error) => console.error('Discord automation:', error),
+    });
+    const unlisten = listen<DiscordCallStatus>('discord-call-state', (event) => bridge.update(event.payload));
+    void unlisten.then(() => invoke<DiscordCallStatus>('get_discord_automation_status'))
+      .then((status) => bridge.update(status)).catch((error) => console.error('Discord status unavailable:', error));
+    window.addEventListener(AUTOMATION_CHANGED_EVENT, bridge.recordingChanged);
+    return () => {
+      bridge.dispose();
+      window.removeEventListener(AUTOMATION_CHANGED_EVENT, bridge.recordingChanged);
+      void unlisten.then((fn) => fn());
+    };
+  }, [startupResolved, startupError, pendingCrashReport, isMinibar, recordingNoticeAcknowledged, showOnboarding, router]);
 
   // Handle file drop for audio import
   const handleFileDrop = useCallback((paths: string[]) => {

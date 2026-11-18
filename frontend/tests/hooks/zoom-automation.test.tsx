@@ -18,12 +18,17 @@ let generation = 0;
 let replaceBeforeReply = false;
 let liveSessions = 0;
 let automationEnabled = true;
+let observed: any = { revision: 0, enabled: true, automation_enabled: true, sources: [] };
+const committed = new Map<string, RecordingLease>();
 let lastStopLease: RecordingLease | undefined;
 events.addEventListener('af-stop-recording', (event) => { stopRequests++; lastStopLease = (event as CustomEvent).detail; });
 mock.module('@tauri-apps/api/core', () => ({ invoke: async (name: string, args: any) => {
   calls.push({ name, args });
   if (name === 'check_transcription_runtime') await modelGate;
   if (name === 'parakeet_has_available_models' || name === 'parakeet_is_model_loaded') return true;
+  if (name === 'get_recording_start_capability') return { version: 1, epoch: 'mock-native', next_sequence: String(generation + 1) };
+  if (name === 'get_meeting_lifecycle_snapshot') return observed;
+  if (name === 'resolve_automated_recording_start' || name === 'cancel_automated_recording_start') return { version: 1, expected: args.expected, native_epoch: args.expected.epoch, terminal: true, no_future_commit: true, outcome: committed.has(args.expected.token) ? 'committed' : 'failed', committed_lease: committed.get(args.expected.token) ?? null, recording_lease: nativeLease, is_recording: !!nativeLease, is_stopping: false };
   if (name === 'get_recording_state') return { is_recording: !!nativeLease, recording_lease: nativeLease };
   if (name === 'start_recording_with_devices_and_meeting') {
     await startGate;
@@ -32,6 +37,7 @@ mock.module('@tauri-apps/api/core', () => ({ invoke: async (name: string, args: 
       source: 'zoom', session_id: args.lifecycleSession, app: 'Zoom', process: 'us.zoom.xos',
     } : null };
     const reply = nativeLease;
+    if (args.expectedStart) committed.set(args.expectedStart.token, reply);
     if (replaceBeforeReply) nativeLease = { generation: 'manual-B', owner: null };
     return reply;
   }
@@ -56,14 +62,14 @@ const { automatedRecording, endAutomatedRecording, automatedStartInProgress } = 
 let revision = 0;
 let handler: () => Promise<void>;
 function Recorder() { handler = useRecordingStart(false, noop).handleRecordingStart; return null; }
-const tick = async () => { for (let i = 0; i < 20; i++) await Promise.resolve(); };
+const tick = async () => { for (let i = 0; i < 100; i++) await Promise.resolve(); };
 function detector() {
   return createLifecycleAutomation({ enabled: () => true, state: async () => ({}),
     start: () => { const call = automatedStartInProgress(); if (call) launchRecording(noop, { automated: call }); }, stop: noop, error: e => { throw e; }, conflict: noop,
   });
 }
 function signal(c: ReturnType<typeof detector>, id: string | null) {
-  c.accept({ revision: ++revision, enabled: true, sources: [{ source: 'zoom', app: 'Zoom', process: 'us.zoom.xos', presence: id ? 'active' : 'inactive', reason: 'synthetic', session_id: id, qualified: true }] });
+  observed = { revision: ++revision, enabled: true, automation_enabled: true, sources: [{ source: 'zoom', app: 'Zoom', process: 'us.zoom.xos', presence: id ? 'active' : 'inactive', reason: 'synthetic', session_id: id, qualified: true }] }; c.accept(observed);
 }
 
 test('normal root-to-recorder event and real service carry the native call token; manual button has no owner', async () => {
@@ -74,10 +80,11 @@ test('normal root-to-recorder event and real service carry the native call token
   try {
     await act(async () => { signal(c, 'normal'); await tick(); });
     const command = calls.find(c => c.name === 'start_recording_with_devices_and_meeting');
-    expect(command?.args).toEqual({ micDeviceName: 'synthetic-mic', systemDeviceName: 'synthetic-system', meetingName: 'Synthetic call', lifecycleSession: 'normal' });
+    expect(command?.args.lifecycleSession).toBe('normal');
+    expect(command?.args.expectedStart).toMatchObject({ version: 1, epoch: 'mock-native', source: 'zoom', session_id: 'normal' });
     expect(automatedRecording()?.sessionId).toBe('normal');
-    expect(automatedStartInProgress()).toBeNull();
-    endAutomatedRecording(); calls.length = 0;
+    expect(automatedRecording()?.recordingLease).toEqual(nativeLease!);
+    endAutomatedRecording(); nativeLease = null; await (await import('../../src/lib/recording-start-recovery')).recoverAutomatedStart(); calls.length = 0;
     await act(async () => { await handler(); });
     expect(calls.find(c => c.name === 'start_recording_with_devices_and_meeting')?.args.lifecycleSession).toBeUndefined();
     expect(automatedRecording()).toBeNull();
@@ -107,7 +114,7 @@ test('leave racing native stream start requests normal save/Stop and errors rele
     await act(async () => { signal(c, null); release(); await tick(); });
     expect(stopRequests).toBe(1);
     expect(lastStopLease).toEqual(nativeLease!);
-    endAutomatedRecording(); startGate = undefined; failStart = true;
+    endAutomatedRecording(); nativeLease = null; await (await import('../../src/lib/recording-start-recovery')).recoverAutomatedStart(); startGate = undefined; failStart = true;
     await act(async () => { signal(c, 'failed-next'); await tick(); });
     expect(automatedStartInProgress()).toBeNull(); expect(automatedRecording()).toBeNull();
   } finally { failStart = false; startGate = undefined; c.dispose(); act(() => view!.unmount()); }
@@ -121,7 +128,7 @@ test('late automatic A reply cannot adopt or clear manually started B', async ()
     await act(async () => { signal(c, 'late-A'); await tick(); });
     expect(nativeLease as RecordingLease | null).toEqual({ generation: 'manual-B', owner: null });
     expect(liveSessions).toBe(0); expect(stopRequests).toBe(0);
-    expect(automatedRecording()).toBeNull(); expect(automatedStartInProgress()).toBeNull();
+    expect(automatedRecording()).toBeNull(); expect((await import('../../src/lib/meeting-automation')).automatedStartState().kind).toBe('native_unresolved');
   } finally { replaceBeforeReply = false; c.dispose(); act(() => view!.unmount()); }
 });
 

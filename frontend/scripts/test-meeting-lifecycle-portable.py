@@ -35,6 +35,7 @@ def main():
                            ("zoom_observation", DETECTION / "zoom_observation.rs")]:
             (work / f"src/{name}.rs").write_text(path.read_text().replace("#[tauri::command]", ""))
         (work / "src/lib.rs").write_text(f'''#![allow(dead_code)]
+fn zoom_automation_enabled()->bool {{ true }}
 static MONITOR_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 #[path="{DETECTION}/evidence.rs"] mod evidence;
 #[path="{DETECTION}/zoom.rs"] mod zoom;

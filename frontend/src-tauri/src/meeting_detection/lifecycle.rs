@@ -19,6 +19,7 @@ pub struct SourceState {
 pub struct Snapshot {
     revision: u64,
     enabled: bool,
+    automation_enabled: bool,
     sources: Vec<SourceState>,
 }
 struct State {
@@ -46,6 +47,7 @@ pub fn suspend(enabled: bool) -> Snapshot {
     state.tracker.suspend();
     state.monitor_generation = super::MONITOR_GENERATION.load(std::sync::atomic::Ordering::SeqCst);
     state.snapshot.enabled = enabled;
+    state.snapshot.automation_enabled = enabled && super::zoom_automation_enabled();
     state.snapshot.revision += 1;
     for source in &mut state.snapshot.sources {
         source.presence = "unknown".into();
@@ -112,6 +114,7 @@ impl State {
             self.snapshot.sources.push(source);
         }
         self.snapshot.enabled = true;
+        self.snapshot.automation_enabled = super::zoom_automation_enabled();
         self.snapshot.revision += 1;
         self.snapshot.clone()
     }
@@ -119,7 +122,9 @@ impl State {
 
 #[tauri::command]
 pub fn get_meeting_lifecycle_snapshot() -> Snapshot {
-    STATE.lock().unwrap().snapshot.clone()
+    let mut state = STATE.lock().unwrap();
+    state.snapshot.automation_enabled = state.snapshot.enabled && super::zoom_automation_enabled();
+    state.snapshot.clone()
 }
 
 pub fn validate_start(session: &str) -> Result<(), String> {

@@ -1,5 +1,11 @@
 # Issue #10 R2 follow-up: local fixes and integration boundary
 
+**Combined integration update (2026-11-18):** [#10/#11 integration](ISSUE10_11_INTEGRATION.md)
+now wires the shared hook/service/native authority and guarded Stop. Standalone
+branch limitations below are retained as historical evidence, not current wiring
+claims. Real-source qualification and physical/desktop gates remain open.
+
+
 Review base remains fixed at `8997242`. Native start-authority follow-up is the
 separate local commit `1c964ec`; its API, serialization and limits are in
 [RECORDING_START_AUTHORITY.md](RECORDING_START_AUTHORITY.md). This note covers the

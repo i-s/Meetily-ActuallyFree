@@ -229,8 +229,8 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
     // Check if already recording
     let current_recording_state = IS_RECORDING.load(Ordering::SeqCst);
     info!("ðŸ” IS_RECORDING state check: {}", current_recording_state);
-    if current_recording_state {
-        return Err("Recording already in progress".to_string());
+    if current_recording_state || IS_STOPPING.load(Ordering::SeqCst) {
+        return Err("Recording already in progress or stopping".to_string());
     }
 
     crate::onnx_runtime::ensure_available().map_err(|error| {
@@ -578,21 +578,11 @@ pub async fn start_recording_with_lifecycle<R: Runtime>(
             return Err("Recording start session binding mismatch".into());
         }
     }
-    if let Some(session) = &lifecycle_session {
-        crate::meeting_detection::lifecycle::validate_start(session)?;
-    }
-    // Freeze ownership before any awaited setup. A call can end while streams
-    // start; its owner must not vanish just because the tracker removes it.
-    let lifecycle_owner = match lifecycle_session.as_deref() {
-        Some(session) => Some(crate::meeting_detection::lifecycle::session_owner(session)
-            .ok_or("The automated call ended before recording initialization.")?),
-        None => None,
-    };
-    if let (Some(expected), Some(owner)) = (&expected_start, &lifecycle_owner) {
-        if expected.source != owner.source || expected.session_id != owner.session_id {
-            return Err("Recording start source/session binding mismatch".into());
-        }
-    }
+    // Resolve the selected source under lifecycle serialization, not through
+    // Zoom's session table for every adapter. Freeze owner across awaited setup.
+    let lifecycle_owner = expected_start.as_ref()
+        .map(|expected| super::recording_start_sources::validate(&expected.source, &expected.session_id))
+        .transpose()?;
     info!(
         "Starting recording with specific devices: mic={:?}, system={:?}, meeting={:?}",
         mic_device_name, system_device_name, meeting_name
@@ -601,8 +591,8 @@ pub async fn start_recording_with_lifecycle<R: Runtime>(
     // Check if already recording
     let current_recording_state = IS_RECORDING.load(Ordering::SeqCst);
     info!("ðŸ” IS_RECORDING state check: {}", current_recording_state);
-    if current_recording_state {
-        return Err("Recording already in progress".to_string());
+    if current_recording_state || IS_STOPPING.load(Ordering::SeqCst) {
+        return Err("Recording already in progress or stopping".to_string());
     }
 
     crate::onnx_runtime::ensure_available().map_err(|error| {
@@ -702,12 +692,10 @@ pub async fn start_recording_with_lifecycle<R: Runtime>(
             return Err(format!("Could not load recording source preferences: {e}"));
         }
     };
-    if let Some(session) = &lifecycle_session {
-        if crate::meeting_detection::lifecycle::session_source(session).as_deref() == Some("zoom") {
-            let executables: Vec<&str> = preferences.per_app_targets.iter().map(|target| target.executable.as_str()).collect();
-            super::recording_mode::validate_zoom_sources(preferences.in_person,
-                preferences.per_app_recording_enabled, &executables).map_err(str::to_string)?;
-        }
+    if let Some(owner) = &lifecycle_owner {
+        let executables: Vec<&str> = preferences.per_app_targets.iter().map(|target| target.executable.as_str()).collect();
+        super::recording_start_sources::validate_sources(&owner.source, preferences.in_person,
+            preferences.per_app_recording_enabled, &executables).map_err(str::to_string)?;
     }
     let auto_save = preferences.auto_save;
     manager.set_in_person(preferences.in_person);
@@ -740,10 +728,13 @@ pub async fn start_recording_with_lifecycle<R: Runtime>(
     let resolved_system_device_name = system_device.as_ref().map(|device| device.name.clone());
     // Model/device setup may outlive the detected call. Check again at the
     // capture boundary, under the existing recording lifecycle lock.
-    if let Some(session) = &lifecycle_session {
-        if let Err(error) = crate::meeting_detection::lifecycle::validate_start(session) {
-            crate::diarization::online::stop();
-            return Err(error);
+    if let Some(expected) = &expected_start {
+        match super::recording_start_sources::validate(&expected.source, &expected.session_id) {
+            Ok(owner) if Some(&owner) == lifecycle_owner.as_ref() => {},
+            _ => {
+                crate::diarization::online::stop();
+                return Err("Automated recording source/session is no longer qualified or enabled".into());
+            }
         }
     }
     let transcription_receiver = manager

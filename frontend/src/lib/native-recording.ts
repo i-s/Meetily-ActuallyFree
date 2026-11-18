@@ -1,15 +1,7 @@
 import { invoke } from '@tauri-apps/api/core';
 
-export interface LifecycleOwner {
-  source: string;
-  session_id: string;
-  app: string;
-  process: string;
-}
-export interface RecordingLease {
-  generation: string;
-  owner: LifecycleOwner | null;
-}
+export type { LifecycleOwner, RecordingLease } from './recording-start-authority';
+import type { RecordingLease } from './recording-start-authority';
 export interface NativeRecordingState {
   is_recording?: boolean;
   is_stopping?: boolean;

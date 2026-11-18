@@ -1,5 +1,11 @@
 # Issue #10 — Zoom lifecycle: observation, qualification and guarded recorder
 
+**Combined integration update (2026-11-18):** [#10/#11 integration](ISSUE10_11_INTEGRATION.md)
+now wires the shared hook/service/native authority and guarded Stop. Standalone
+branch limitations below are retained as historical evidence, not current wiring
+claims. Real-source qualification and physical/desktop gates remain open.
+
+
 Live issue read 2026-11-18: **[[macOS 06/16] Автостарт и автостоп Zoom](https://github.com/i-s/Meetily-ActuallyFree/issues/10)**, open, zero comments. Accepted software base `4269de67c6747b2f5fce72596826c05dadbb3e1c`; independent Opus R1 follow-up base `7d3ff8aeac1caddb73a8e72b8dcd0b0b66065110`.
 
 **Real Zoom classes are observation-only. None is qualified to authorize capture.** The automatic recording implementation is exercised with explicitly synthetic qualified fixtures, not enabled by old saved Labs/detection preferences. There is no production qualification override. Manual recording remains available as manual recording, **not** as a substitute for issue #10's required verified automation. Issue acceptance, leave-open reliability, latency bounds and #6 acoustic separation remain unresolved.

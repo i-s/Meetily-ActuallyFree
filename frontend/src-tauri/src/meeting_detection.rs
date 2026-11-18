@@ -7,13 +7,14 @@ pub mod zoom_observation;
 pub(crate) mod zoom;
 
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use tauri::{AppHandle, Emitter, Runtime};
 
 /// Global run flag for the monitor loop. Setting this to `false` makes the
 /// currently-running loop exit on its next tick.
 static MONITOR_GENERATION: AtomicU64 = AtomicU64::new(0);
+static MONITOR_PAUSED: AtomicBool = AtomicBool::new(false);
 /// Current settings, shared with the running loop so changes apply live.
 static SETTINGS: Mutex<Option<MeetingDetectionSettings>> = Mutex::new(None);
 
@@ -31,6 +32,12 @@ pub struct MeetingDetectionSettings {
     /// Also raise a native OS notification (handled on the frontend) in
     /// addition to the in-app prompt.
     pub notify: bool,
+    /// Unqualified read-only macOS AX candidate. Separate explicit opt-in.
+    #[serde(default)]
+    pub discord_automation: bool,
+    /// Explicit Zoom capture opt-in; observation alone never authorizes capture.
+    #[serde(default)]
+    pub zoom_automation: bool,
 }
 
 impl Default for MeetingDetectionSettings {
@@ -41,6 +48,8 @@ impl Default for MeetingDetectionSettings {
             meeting_apps: default_meeting_apps(),
             ignored_apps: Vec::new(),
             notify: true,
+            discord_automation: false,
+            zoom_automation: false,
         }
     }
 }
@@ -117,6 +126,20 @@ fn save_settings_to_disk(settings: &MeetingDetectionSettings) -> Result<(), Stri
     }
     let json = serde_json::to_vec_pretty(settings).map_err(|e| e.to_string())?;
     std::fs::write(&path, json).map_err(|e| e.to_string())
+}
+
+/// The Discord worker has its own lifetime; changing generic/Zoom detection
+/// settings must not mint a new Discord call or override a manual Stop.
+pub(crate) fn zoom_automation_enabled() -> bool {
+    !MONITOR_PAUSED.load(Ordering::SeqCst) && SETTINGS.lock().unwrap().as_ref()
+        .is_some_and(|settings| settings.enabled && settings.zoom_automation)
+}
+
+pub(crate) fn discord_automation_enabled() -> bool {
+    if MONITOR_PAUSED.load(Ordering::SeqCst) { return false; }
+    let guard = SETTINGS.lock().unwrap();
+    guard.as_ref().is_some_and(|s| s.enabled && s.discord_automation &&
+        !s.ignored_apps.iter().any(|k| !k.trim().is_empty() && "discord".contains(&k.trim().to_lowercase())))
 }
 
 /// Payload emitted when a meeting app is detected.
@@ -340,6 +363,7 @@ fn browser_title_is_meeting(title: &str) -> bool {
 /// -> ["webexmta"] — while rejecting keywords buried mid-word like the Steam
 /// service.
 fn process_matches_keyword(process_name: &str, keyword: &str) -> bool {
+    if process_name.to_lowercase().contains("discord") { return false; }
     process_name
         .split(|c: char| !c.is_ascii_alphanumeric())
         .any(|token| !token.is_empty() && token.starts_with(keyword))
@@ -348,6 +372,13 @@ fn process_matches_keyword(process_name: &str, keyword: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{is_self_process, process_matches_keyword};
+
+    #[test]
+    fn discord_never_uses_generic_process_or_media_fallback() {
+        assert!(!process_matches_keyword("Discord", "discord"));
+        assert!(!process_matches_keyword("Discord Helper", "disc"));
+        assert!(!process_matches_keyword("Discord.exe", "discord"));
+    }
 
     #[test]
     fn never_treats_meetily_as_a_meeting() {
@@ -386,6 +417,7 @@ mod tests {
 
 /// Start (or restart) the background monitor with the given settings.
 fn start_monitor<R: Runtime>(app: &AppHandle<R>) {
+    MONITOR_PAUSED.store(false, Ordering::SeqCst);
     // A generation token prevents an old sleeping loop from reviving after a restart.
     let generation = MONITOR_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
 
@@ -546,6 +578,7 @@ pub async fn start_meeting_detection<R: Runtime>(app: AppHandle<R>) -> Result<()
 /// Manually stop the monitor.
 #[tauri::command]
 pub async fn stop_meeting_detection<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
+    MONITOR_PAUSED.store(true, Ordering::SeqCst);
     MONITOR_GENERATION.fetch_add(1, Ordering::SeqCst);
     crate::audio::recording_ownership::set_meeting_automation_enabled(false);
     let _ = app.emit("meeting-lifecycle", lifecycle::suspend(false));

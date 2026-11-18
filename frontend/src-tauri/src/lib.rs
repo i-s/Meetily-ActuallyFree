@@ -59,6 +59,7 @@ pub mod groq;
 pub mod openrouter;
 pub mod live_assistant;
 pub mod meeting_detection;
+mod discord_automation;
 pub mod minibar;
 pub mod parakeet_engine;
 pub mod paths;
@@ -545,6 +546,7 @@ pub fn run() {
             // Meeting detection: load persisted settings and start the monitor
             // if the user enabled it (default off).
             crate::meeting_detection::initialize(&_app.handle());
+            crate::discord_automation::initialize(&_app.handle());
 
             // Free Whisper/Parakeet VRAM a couple minutes after last STT use.
             audio::common::start_stt_idle_unloader();
@@ -829,6 +831,12 @@ pub fn run() {
             meeting_detection::zoom_observation::clear_zoom_observation,
             meeting_detection::lifecycle::get_meeting_lifecycle_snapshot,
             meeting_detection::get_meeting_detection_settings,
+            discord_automation::get_discord_automation_status,
+            discord_automation::start_discord_observation,
+            discord_automation::mark_discord_observation,
+            discord_automation::stop_discord_observation,
+            discord_automation::get_discord_observation,
+            discord_automation::clear_discord_observation,
             meeting_detection::set_meeting_detection_settings,
             meeting_detection::start_meeting_detection,
             meeting_detection::stop_meeting_detection,
