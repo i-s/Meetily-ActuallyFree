@@ -176,7 +176,17 @@ verifier requires `notes` to be a string. This was caught during v0.2.18 draft
 preparation; the manifest/checksums were regenerated and reverified without
 changing the signed executable payloads.
 
-## 6. Tests, qualification, and historical notes
+## 6. Issue #6 audio evidence preparation
+
+Issue #6's portable, read-only source-track observations, transcript evidence schema,
+synthetic tests, and the physical Mac acceptance protocol are documented in
+[ISSUE6_AUDIO_PROBE.md](ISSUE6_AUDIO_PROBE.md). The probe must not be treated as an
+AEC, ASR, or hardware result: it preserves source provenance and flags evidence for
+manual review. The example fixture is explicitly `physical_acceptance: not_run`.
+The final batched Mac run depends on issue #5 and the one final DMG; no DMG build or
+physical operation is part of this preparation.
+
+## 7. Tests, qualification, and historical notes
 
 Issue #5 artifact-only Actions build (pinned source/tree vs workflow SHA),
 sidecar ordering, locked dependencies, model provenance, same-account backup/
