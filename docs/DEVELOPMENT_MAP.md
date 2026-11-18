@@ -137,6 +137,19 @@ R2 preserves deleted/conflicted contact-mapping evidence during restore: only
 absent evidence permits ordinary normalized contact reconstruction. See the
 feature note for exact/normalized controls, meeting isolation and rollback tests.
 
+Issue #12's live/library Notes editor, session-keyed autosave, transactional
+save/recovery association, independent data ownership, revisioned read interfaces
+for #13/#15/#18, portable coverage and deferred physical Mac gates are documented
+in [ISSUE12_NOTES.md](ISSUE12_NOTES.md). Read it before changing Notes or copying
+live data during Stop. A Notes draft is not speech, a title is not a session key,
+and a JS completion callback is not the owner of its native association.
+
+Combined #12/#14 editor preparation, stable `meeting:<id>` Notes ownership,
+independent revisions and real-component/SQLite qualification are documented in
+[ISSUE12_14_INTEGRATION.md](ISSUE12_14_INTEGRATION.md). Selection and correction
+drain Notes conversion/store readback and summary saving before native mutation;
+transcript projection refresh never replaces Notes or consents to recovery writes.
+
 Summary-generated title ownership, placeholder rejection and completion refresh
 are documented in [SUMMARY_GENERATED_TITLES.md](SUMMARY_GENERATED_TITLES.md).
 

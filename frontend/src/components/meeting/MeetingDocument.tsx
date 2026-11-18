@@ -38,13 +38,12 @@ import { ActionItemsList } from '@/components/actions/ActionItemsList';
 import { ChatThread } from '@/components/chat/ChatThread';
 import { LanguagePickerPopover } from '@/components/LanguagePickerPopover';
 import { ModelSettingsModal, type ModelConfig } from '@/components/ModelSettingsModal';
+import { MeetingNotesEditor } from '@/components/meeting/MeetingNotesEditor';
 import { useAutosave, saveStateLabel, type SaveState } from '@/hooks/useAutosave';
 import {
   askMeeting,
-  getMeetingNotes,
   listActionItems,
   onWorkspaceChange,
-  saveMeetingNotes,
   type ActionItem,
 } from '@/lib/workspace-api';
 import { syncMeetingActionItems, type TranscriptLine } from '@/lib/action-item-sync';
@@ -165,25 +164,6 @@ function NotesTab({
   onRegenerateRequestHandled,
 }: MeetingDocumentProps) {
   // ---- Notes ---------------------------------------------------------------
-  const [notes, setNotes] = useState<{ loaded: boolean; json: unknown[] | null; markdown: string | null }>({
-    loaded: false,
-    json: null,
-    markdown: null,
-  });
-  useEffect(() => {
-    let cancelled = false;
-    setNotes({ loaded: false, json: null, markdown: null });
-    void getMeetingNotes(meetingId)
-      .then((stored) => !cancelled && setNotes({ loaded: true, json: stored?.json ?? null, markdown: stored?.markdown ?? null }))
-      .catch(() => !cancelled && setNotes({ loaded: true, json: null, markdown: null }));
-    return () => {
-      cancelled = true;
-    };
-  }, [meetingId]);
-  const notesSaver = useAutosave<NotesContent>((content) =>
-    saveMeetingNotes(meetingId, content.markdown.trim() ? content.markdown : null, content.markdown.trim() ? content.json : null),
-  );
-
   // ---- Action items --------------------------------------------------------
   const [items, setItems] = useState<ActionItem[]>([]);
   const [itemsLoaded, setItemsLoaded] = useState(false);
@@ -263,9 +243,9 @@ function NotesTab({
   }, []);
   useEffect(() => registerTranscriptPreparation?.(async () => {
     await Promise.all([notesConversion.current(), summaryConversion.current()]);
-    const saved = await Promise.all([notesSaver.flush(), summarySaver.flush()]);
-    if (saved.some((ok) => !ok)) throw new Error('Save pending notes and summary edits before changing transcript versions. Retry after storage recovers.');
-  }), [registerTranscriptPreparation, notesSaver.flush, summarySaver.flush]);
+    const saved = await summarySaver.flush();
+    if (!saved) throw new Error('Save pending notes and summary edits before changing transcript versions. Retry after storage recovers.');
+  }), [registerTranscriptPreparation, summarySaver.flush]);
 
   const generating = summaryStatus === 'processing' || summaryStatus === 'summarizing' || summaryStatus === 'regenerating';
   const hasSummary = !!aiSummary && !!markdown.trim();
@@ -329,22 +309,8 @@ function NotesTab({
       <div className="mx-auto max-w-3xl space-y-8 px-10 pb-16 pt-6">
         {/* Notes */}
         <section>
-          <SectionTitle icon={NotebookPen} aside={<SaveIndicator state={notesSaver.state} />}>
-            Your notes
-          </SectionTitle>
-          {notes.loaded ? (
-            <NotesEditor
-              key={`notes-${meetingId}`}
-              editable={!transcriptChanging}
-              registerFlush={registerNotesFlush}
-              initialBlocks={notes.json}
-              initialMarkdown={notes.markdown}
-              placeholder="Write your own notes. They stay yours: summaries never overwrite them."
-              onChange={notesSaver.schedule}
-            />
-          ) : (
-            <Skeleton className="h-16 w-full" />
-          )}
+          <SectionTitle icon={NotebookPen}>Your notes</SectionTitle>
+          <MeetingNotesEditor key={meetingId} target={`meeting:${meetingId}`} editable={!transcriptChanging} registerFlush={registerNotesFlush} />
         </section>
 
         {/* Action items */}

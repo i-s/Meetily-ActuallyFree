@@ -59,7 +59,10 @@ impl TranscriptsRepository {
         .bind(now)
         .bind(&folder_path)
         .bind(title_is_manual)
-        .bind(recovery_id.is_some())
+        // Native recording folders are unique per session. Deduplicate normal
+        // save retries as well as recovery (e.g. commit succeeded, IPC reply was
+        // lost), so Notes cannot be stranded on an earlier duplicate meeting.
+        .bind(folder_path.is_some())
         .bind(&folder_path)
         .bind(&folder_path)
         .execute(&mut *transaction)
@@ -87,7 +90,8 @@ impl TranscriptsRepository {
                 sqlx::query_scalar::<_, String>("SELECT id FROM meetings WHERE folder_path = ? ORDER BY created_at, id LIMIT 1")
                     .bind(folder).fetch_optional(&mut *transaction).await?
             } else { None };
-            let existing_id = existing_id.ok_or_else(|| SqlxError::Protocol("Recovery save did not create or find a meeting".into()))?;
+            let existing_id = existing_id.ok_or_else(|| SqlxError::Protocol("Session save did not create or find a meeting".into()))?;
+            super::notes_document::attach(&mut transaction, folder_path.as_deref(), &existing_id).await?;
             transaction.commit().await?;
             return Ok(existing_id);
         }
@@ -143,6 +147,7 @@ impl TranscriptsRepository {
         .await?;
 
         crate::database::transcript_versions::ensure(&mut transaction, &meeting_id).await.map_err(SqlxError::Protocol)?;
+        super::notes_document::attach(&mut transaction, folder_path.as_deref(), &meeting_id).await?;
 
         // Commit the transaction
         transaction.commit().await?;
@@ -409,7 +414,23 @@ mod issue9_recovery_tests {
         sqlx::raw_sql("CREATE TABLE meetings (id TEXT PRIMARY KEY, title TEXT, created_at TEXT, updated_at TEXT, folder_path TEXT, title_is_manual INTEGER); CREATE TABLE transcripts (id TEXT PRIMARY KEY, meeting_id TEXT, transcript TEXT, timestamp TEXT, audio_start_time REAL, audio_end_time REAL, duration REAL, speaker TEXT); CREATE TABLE people (id TEXT PRIMARY KEY, display_name TEXT NOT NULL, normalized_name TEXT NOT NULL UNIQUE, notes TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL); CREATE TABLE person_speakers (person_id TEXT NOT NULL, meeting_id TEXT NOT NULL, speaker_label TEXT NOT NULL, UNIQUE(meeting_id, speaker_label));").execute(&pool).await.unwrap();
         sqlx::raw_sql(include_str!("../../../migrations/20261118001400_transcript_versions.sql")).execute(&pool).await.unwrap();
         sqlx::raw_sql(include_str!("../../../migrations/20261118001401_transcript_version_references.sql")).execute(&pool).await.unwrap();
+        super::super::notes_document::tests::create_notes_schema(&pool).await;
         pool
+    }
+    #[tokio::test]
+    async fn issue12_notes_follow_normal_save_and_idempotent_recovery() {
+        let pool = pool().await;
+        let notes = super::super::notes_document::write(&pool, "recording:/synthetic/notes", "Private thought, not speech", None, 0).await.unwrap();
+        assert_eq!(notes, 1);
+        let id = TranscriptsRepository::save_transcript(&pool, "Meeting", &[], Some("/synthetic/notes".into()), None).await.unwrap();
+        let retry = TranscriptsRepository::save_transcript(&pool, "Retry", &[], Some("/synthetic/notes".into()), None).await.unwrap();
+        assert_eq!(id, retry);
+        let recovered = TranscriptsRepository::save_recovered_transcript(&pool, "Recovered", &[], Some("/synthetic/notes".into()), None, "notes-recovery").await.unwrap();
+        assert_eq!(id, recovered);
+        let stored = super::super::notes_document::read(&pool, &format!("meeting:{id}")).await.unwrap().unwrap();
+        assert_eq!(stored.markdown.as_deref(), Some("Private thought, not speech"));
+        let speech: i64 = sqlx::query_scalar("SELECT count(*) FROM transcripts").fetch_one(&pool).await.unwrap();
+        assert_eq!(speech, 0);
     }
     #[tokio::test]
     async fn db_commit_then_reply_or_indexeddb_failure_is_idempotent_across_retry() {
