@@ -158,3 +158,33 @@ windows editing simultaneously can conflict and require review. An invalid or
 two competing recovery journals are retained and explicitly reported rather than
 silently discarded. Plain Markdown is not used while exact JSON reconversion is
 pending. Large documents have no invented size acceptance/performance claim.
+
+## #14 R1 integration seam: projection refresh versus Notes ownership
+
+#14 owns removing its destructive full-page reload after transcript version
+selection/correction and refreshing only the transcript/summary projection. No
+#14 control or reload implementation is changed on this branch. A projection
+refresh must retain the same meeting Notes target and must not key the Notes
+editor by transcript version, correction revision, or summary contents.
+
+`loadNotes(target, true)` deliberately returns the existing dirty snapshot during
+Markdown conversion, debounce and native-save-in-flight phases. ASR/version/
+summary updates cannot supply initial Notes or replace this document. The editor
+and store remain independent of the displayed transcript and summary. New tests
+exercise all three dirty phases and a shared library editor whose surrounding
+transcript/version/summary projections change immediately after typing, before
+its debounce. Exact Markdown/JSON remain journaled, save correctly, and reopen
+unchanged. These two added regressions passed: store file 11/11 and shared-editor
+entrypoint file 2/2. They test #12's seam, not #14's actual selector/corrector.
+
+**Combined regression still required after integration:** in the normal saved
+meeting UI, type distinctive RU/EN Notes (including a list and exact formatting),
+then select another transcript version within **<800 ms**, without waiting for a
+Notes save. Repeat using transcript correction within <800 ms. Verify the editor
+and unsaved/error state remain, exact Notes Markdown/JSON reach the correct
+meeting, and transcript/summary refetches do not overwrite them. Close/restart
+the app and reopen that meeting from the library; verify exact Notes again.
+Repeat with an in-flight Notes conversion/write and a storage failure followed
+by Retry. Use #14's real entrypoints in the combined regression, not a fabricated
+projection wrapper. App-restart physical execution remains the final combined
+Mac build gate; existing SQLite disk close/reopen evidence is not a substitute.

@@ -147,3 +147,35 @@ test('interrupted alias-journal migration can resume without discarding a newer 
   expect(documents.get('meeting:alias-copy').markdown).toBe('latest');
   expect(storage.has(`af-notes-v1:${alias}`)).toBe(false);
 });
+
+test('projection refetch cannot replace dirty Notes during conversion, debounce or a native save', async () => {
+  const target = 'meeting:projection-refetch';
+  const original = content('Previously saved Notes');
+  const edited = content('Моя мысль, not speech — exact\n- follow up API');
+  documents.set(target, { ...original, revision: 1 });
+  await store.loadNotes(target);
+  let converted!: (markdown: string) => void;
+  store.editNotes(target, edited, new Promise(resolve => { converted = resolve; }));
+  // A correction/version switch refetches projections immediately, before
+  // conversion or the 400ms Notes debounce can complete.
+  await store.loadNotes(target, true);
+  expect(store.getNotesSnapshot(target).content).toEqual(edited);
+  expect(documents.get(target).markdown).toBe(original.markdown);
+  expect(JSON.parse(storage.get(`af-notes-v1:${target}`)!).content).toEqual(edited);
+  converted(edited.markdown); await settle();
+  await store.loadNotes(target, true);
+  expect(store.getNotesSnapshot(target).content).toEqual(edited);
+  expect(store.getNotesSnapshot(target).state).toBe('pending');
+  let release!: () => void;
+  hold = new Promise(resolve => { release = resolve; });
+  const saving = store.flushNotes(target);
+  await store.loadNotes(target, true);
+  expect(store.getNotesSnapshot(target).content).toEqual(edited);
+  expect(store.getNotesSnapshot(target).state).toBe('saving');
+  hold = null; release(); await saving;
+  expect(documents.get(target).markdown).toBe(edited.markdown);
+  expect(documents.get(target).json).toEqual(edited.json);
+  expect(store.getNotesSnapshot(target).state).toBe('saved');
+  await store.loadNotes(target, true);
+  expect(store.getNotesSnapshot(target).content).toEqual(edited);
+});

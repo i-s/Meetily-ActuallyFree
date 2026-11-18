@@ -60,6 +60,9 @@ export function subscribeNotes(target: string, listener: () => void) {
 }
 export function loadNotes(target: string, refresh = false): Promise<void> {
   const entry = entryFor(target);
+  // Transcript/version/summary refetches may ask for a refresh. The Notes
+  // document owns its dirty draft (including conversion and in-flight writes),
+  // not the projection being refreshed; never replace it with committed text.
   if (entry.snapshot.loaded && (!refresh || entry.dirty || entry.saving)) return Promise.resolve();
   if (entry.loading) return entry.loading;
   publish(entry, { loaded: false, state: 'loading', error: null });

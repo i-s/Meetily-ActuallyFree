@@ -70,3 +70,35 @@ test('normal live Notes entrypoint survives incoming phrases and navigation, exp
   await act(async () => { root.unmount(); });
   expect(saved.markdown).toBe('Edited in library');
 });
+
+test('library projection-only updates keep the dirty Notes editor mounted before debounce', async () => {
+  // This is #12's shared-editor seam, not #14's version-selector implementation.
+  // The combined branch must drive the actual selection/correction controls.
+  function Projection({ version, transcript, summary }: { version: string; transcript: string; summary: string }) {
+    return <div>
+      <div data-version={version}>{transcript}</div>
+      <div>{summary}</div>
+      <MeetingNotesEditor key="same-meeting" target="meeting:projection-ui" />
+    </div>;
+  }
+  const exact = 'Notes RU/EN: не обещание\n- API follow-up';
+  let root!: ReactTestRenderer;
+  await act(async () => { root = create(<Projection version="live" transcript="old phrase" summary="old summary" />); });
+  const mounts = editorMounts;
+  await act(async () => { root.root.findByType('textarea').props.onChange({ target: { value: exact } }); });
+  // No sleep or timer advancement: both projection replacements occur in the
+  // same turn as typing, inside the debounce window rather than after a save.
+  await act(async () => { root.update(<Projection version="refined" transcript="refined phrase" summary="refetched summary" />); });
+  await act(async () => { root.update(<Projection version="refined" transcript="corrected phrase" summary="summary refreshed again" />); });
+  expect(editorMounts).toBe(mounts);
+  const journal = JSON.parse(storage.get('af-notes-v1:meeting:projection-ui')!);
+  expect(journal.content.markdown).toBe(exact);
+  expect(journal.content.json).toEqual([{ type: 'paragraph', content: exact }]);
+  await act(async () => { await flushNotes('meeting:projection-ui'); });
+  expect(saved.markdown).toBe(exact);
+  expect(saved.json).toEqual(journal.content.json);
+  await act(async () => { root.unmount(); });
+  await act(async () => { root = create(<Projection version="refined" transcript="corrected phrase" summary="reopened summary" />); });
+  expect(root.root.findByType('textarea').props.defaultValue).toBe(exact);
+  await act(async () => { root.unmount(); });
+});
