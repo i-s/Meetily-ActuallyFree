@@ -52,6 +52,7 @@ import { useWorkspace } from '@/contexts/WorkspaceContext';
 import { THEMES, useAppTheme } from '@/lib/app-theme';
 import { formatShortDate, parseDate } from '@/lib/dates';
 import { stamp } from '@/lib/live-context';
+import { searchResultLink } from '@/lib/library-api';
 import { displayTitle } from '@/lib/meeting-titles';
 import { launchRecording, requestRecordingStop } from '@/lib/recording-launch';
 import type { GlobalSearchResult } from '@/types';
@@ -75,6 +76,7 @@ const RESULT_GROUPS: Array<{ kind: ResultKind; heading: string }> = [
   { kind: 'meeting', heading: 'Meetings' },
   { kind: 'action', heading: 'Action items' },
   { kind: 'transcript', heading: 'Said in a meeting' },
+  { kind: 'notes', heading: 'Your Notes — not recognized speech' },
   { kind: 'summary', heading: 'In a summary' },
 ];
 
@@ -87,12 +89,6 @@ const matches = (command: Command, query: string) => {
     .every((word) => haystack.includes(word));
 };
 
-function meetingLink(meetingId: string, options: { transcriptId?: string; time?: number | null } = {}) {
-  const params = new URLSearchParams({ id: meetingId });
-  if (options.transcriptId) params.set('t', options.transcriptId);
-  if (options.time != null) params.set('ts', String(Math.floor(options.time)));
-  return `/meeting-details?${params.toString()}`;
-}
 
 export default function GlobalSearchDialog() {
   const router = useRouter();
@@ -131,12 +127,13 @@ export default function GlobalSearchDialog() {
     requestIdRef.current += 1;
     const requestId = requestIdRef.current;
     const trimmed = query.trim();
-    if (!open || trimmed.length < 2) {
+    if (!open || trimmed.length < 1) {
       setResults([]);
       setLoading(false);
       setError(null);
       return;
     }
+    setResults([]);
     setLoading(true);
     setError(null);
     const timer = window.setTimeout(async () => {
@@ -152,7 +149,7 @@ export default function GlobalSearchDialog() {
         if (requestId === requestIdRef.current) setLoading(false);
       }
     }, 220);
-    return () => window.clearTimeout(timer);
+    return () => { window.clearTimeout(timer); requestIdRef.current += 1; };
   }, [open, query]);
 
   const close = () => {
@@ -253,16 +250,8 @@ export default function GlobalSearchDialog() {
         return go(`/person?id=${encodeURIComponent(result.personId ?? result.id)}`);
       case 'group':
         return go(`/groups?id=${encodeURIComponent(result.groupId ?? result.id)}`);
-      case 'transcript':
-        return result.meetingId
-          ? go(meetingLink(result.meetingId, { transcriptId: result.transcriptId ?? result.id, time: result.audioStartTime }))
-          : undefined;
-      case 'action':
-        return result.meetingId ? go(meetingLink(result.meetingId, { time: result.audioStartTime })) : undefined;
-      default: {
-        const meetingId = result.meetingId ?? result.id;
-        return go(meetingLink(meetingId));
-      }
+      default:
+        return go(searchResultLink(result));
     }
   };
 
@@ -299,7 +288,7 @@ export default function GlobalSearchDialog() {
       );
     }
     const icon =
-      result.kind === 'transcript' ? <MessageSquareText /> : result.kind === 'summary' ? <FileText /> : result.kind === 'action' ? <CircleCheck /> : <CalendarDays />;
+      result.kind === 'transcript' ? <MessageSquareText /> : result.kind === 'summary' || result.kind === 'notes' ? <FileText /> : result.kind === 'action' ? <CircleCheck /> : <CalendarDays />;
     const meta = [
       result.kind === 'transcript' || result.kind === 'action' ? result.speaker : null,
       result.audioStartTime != null && (result.kind === 'transcript' || result.kind === 'action') ? stamp(result.audioStartTime) : null,
@@ -328,7 +317,7 @@ export default function GlobalSearchDialog() {
   };
 
   const nothingFound =
-    trimmed.length >= 2 &&
+    trimmed.length >= 1 &&
     !loading &&
     !error &&
     results.length === 0 &&
@@ -386,7 +375,7 @@ export default function GlobalSearchDialog() {
             {recent.map((meeting) => {
               const date = parseDate(meeting.created_at);
               return (
-                <CommandItem key={`recent-${meeting.id}`} value={`recent-${meeting.id}`} onSelect={() => go(meetingLink(meeting.id))}>
+                <CommandItem key={`recent-${meeting.id}`} value={`recent-${meeting.id}`} onSelect={() => go(searchResultLink({ kind: 'meeting', id: meeting.id }))}>
                   <CalendarDays className="text-af-text-3" />
                   <span className="min-w-0 flex-1 truncate">{displayTitle(meeting.title, meeting.created_at)}</span>
                   {date && <CommandShortcut>{formatShortDate(date)}</CommandShortcut>}
@@ -402,7 +391,7 @@ export default function GlobalSearchDialog() {
         {!trimmed && (
           <p className="flex items-center gap-2 px-3 pb-2 pt-3 text-[11px] text-af-text-4">
             <Search className="h-3 w-3" />
-            Search finds names, meeting titles, anything said in a transcript, summaries and action items.
+            Search finds names, meeting titles, anything said in a transcript, your Notes (not speech), summaries and action items. Search never adds past meetings to live Q&A.
           </p>
         )}
       </CommandList>

@@ -251,7 +251,20 @@ Live system-meter warnings are documented in
 See [PR39_INTEGRATION.md](PR39_INTEGRATION.md) for capture-readiness, setup
 gating, quiet-speech and meeting-scoped speaker-edit recovery corrections.
 
-### Home meeting library
+### Current meeting library, search and export
+
+Issue #18's ordinary `/meetings` library, saved-material states, RU/EN text/Notes
+search, navigation generations, late-page transcript focus and shared source-labelled
+Markdown export are owned by [ISSUE18_LIBRARY.md](ISSUE18_LIBRARY.md). Read it before
+changing global/library search or either meeting export entrypoint. It documents
+the transactional selected-transcript/summary/Notes snapshot, safe picker destination,
+legacy rich Notes handling, portable/mounted tests, read-only #14 compatibility and
+remaining Mac qualification. Search results never expand live Q&A context.
+
+### Historical home meeting library
+
+The following records the earlier `/home` implementation, not this accepted
+checkout's current `/meetings` route and workspace schema.
 
 `components/Sidebar/index.tsx` renders the text-only **Meetily · Actually Free**
 wordmark, with the original blue/soft-blue colors on one line. It opens About;

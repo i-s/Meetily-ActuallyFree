@@ -53,6 +53,9 @@ import { ExportMeetingsDialog } from '@/components/meetings/ExportMeetingsDialog
 import { dateSection, formatDuration, parseDate } from '@/lib/dates';
 import { displayTitle } from '@/lib/meeting-titles';
 import { deleteMeetings, moveMeetingsToGroup, renameMeeting } from '@/lib/meeting-actions';
+import { useLibrarySearch, useLibraryMaterials } from '@/hooks/useLibrary';
+import { searchResultLink, type LibraryMaterial } from '@/lib/library-api';
+import type { GlobalSearchResult } from '@/types';
 import { onWorkspaceChange } from '@/lib/workspace-api';
 import type { PersonProfile } from '@/types';
 
@@ -73,11 +76,15 @@ function totalDuration(meetings: CurrentMeeting[]): string {
 
 export default function MeetingsPage() {
   const router = useRouter();
-  const { meetings, setCurrentMeeting, currentMeeting } = useSidebar();
+  const { meetings, setCurrentMeeting, currentMeeting, refetchMeetings, meetingsError } = useSidebar();
   const { groups, groupById, people } = useWorkspace();
   const { openImportDialog } = useImportDialog();
 
   const [query, setQuery] = useState('');
+  const search = useLibrarySearch(query);
+  const library = useLibraryMaterials();
+  const hits = useMemo(() => new Map(search.hits.map(hit => [hit.meetingId ?? hit.id, hit])), [search.hits]);
+  useEffect(() => { void refetchMeetings(); }, [refetchMeetings]);
   const [groupFilter, setGroupFilter] = useState<string>(ALL_GROUPS);
   const [personFilter, setPersonFilter] = useState<string | null>(null);
   // Meetings where the chosen contact is a named speaker; null while loading.
@@ -157,7 +164,7 @@ export default function MeetingsPage() {
       if (needle) {
         const title = displayTitle(meeting.title, meeting.created_at).toLowerCase();
         const group = groupById(meeting.group_id)?.name.toLowerCase() ?? '';
-        if (!title.includes(needle) && !group.includes(needle)) return false;
+        if (!title.includes(needle) && !group.includes(needle) && !hits.has(meeting.id)) return false;
       }
       return true;
     });
@@ -166,7 +173,7 @@ export default function MeetingsPage() {
       const order = (a.created_at ?? '').localeCompare(b.created_at ?? '');
       return sort === 'oldest' ? order : -order;
     });
-  }, [meetings, query, groupFilter, personFilter, personMeetings, range, sort, groupById]);
+  }, [meetings, query, groupFilter, personFilter, personMeetings, range, sort, groupById, hits]);
 
   const sections = useMemo(() => {
     if (sort === 'longest') return [{ title: 'Longest first', meetings: filtered }];
@@ -226,7 +233,8 @@ export default function MeetingsPage() {
 
   const open = (meeting: CurrentMeeting) => {
     setCurrentMeeting({ id: meeting.id, title: meeting.title });
-    router.push(`/meeting-details?id=${encodeURIComponent(meeting.id)}`);
+    const hit = hits.get(meeting.id);
+    router.push(hit ? searchResultLink(hit) : `/meeting-details?id=${encodeURIComponent(meeting.id)}`);
   };
 
   const clearFilters = () => {
@@ -269,7 +277,7 @@ export default function MeetingsPage() {
             <Input
               value={query}
               onChange={(event) => setQuery(event.target.value)}
-              placeholder="Filter by title or group"
+              placeholder="Search titles, transcripts and Notes"
               className="pl-9"
               aria-label="Filter meetings"
             />
@@ -326,6 +334,13 @@ export default function MeetingsPage() {
         </div>
 
         <div className="mt-5">
+          <p className="mb-3 text-xs text-af-text-4">Local search only. Your Notes are not recognized speech. Opening a result does not add past meetings to live Q&A.</p>
+          {search.loading && <p role="status">Searching saved text…</p>}
+          {search.hits.length >= 200 && <p role="status">Showing the first 200 matching meetings. Refine your search for older results.</p>}
+          {(search.error || library.error || meetingsError) && <div role="alert" className="mb-3 text-sm text-af-danger">
+            {search.error || library.error || meetingsError}
+            <Button variant="outline" size="sm" onClick={() => { library.retry(); search.retry(); void refetchMeetings(); }}>Retry library</Button>
+          </div>}
           {meetings.length === 0 ? (
             <EmptyState
               icon={<Library />}
@@ -385,6 +400,8 @@ export default function MeetingsPage() {
                       <LibraryRow
                         key={meeting.id}
                         meeting={meeting}
+                        material={library.error ? undefined : library.materials.get(meeting.id)}
+                        hit={hits.get(meeting.id)}
                         selected={selected.has(meeting.id)}
                         selecting={selecting}
                         renaming={renaming === meeting.id}
@@ -472,6 +489,8 @@ export default function MeetingsPage() {
 
 function LibraryRow({
   meeting,
+  material,
+  hit,
   selected,
   selecting,
   renaming,
@@ -484,6 +503,8 @@ function LibraryRow({
   onDelete,
 }: {
   meeting: CurrentMeeting;
+  material?: LibraryMaterial;
+  hit?: GlobalSearchResult;
   selected: boolean;
   selecting: boolean;
   renaming: boolean;
@@ -553,6 +574,10 @@ function LibraryRow({
             {title}
           </p>
         )}
+        <p className="text-[11px] text-af-text-4">
+          {material ? [material.transcriptCount ? `Transcript (${material.transcriptCount})` : 'No transcript', material.hasNotes ? 'Your Notes' : 'No Notes', material.hasSummary ? 'Summary available' : `No summary${material.summaryStatus ? ` (${material.summaryStatus})` : ''}`, material.audioAvailable ? 'Audio available' : 'Audio unavailable'].join(' · ') : 'Checking saved materials…'}
+        </p>
+        {hit && hit.kind !== 'meeting' && <p className="line-clamp-2 text-xs text-af-text-3"><strong>{hit.kind === 'notes' ? 'Your Notes (not speech)' : hit.kind === 'transcript' ? 'Transcript' : 'Summary'}:</strong> {hit.snippet}</p>}
         <p className="truncate text-[11px] text-af-text-4 sm:hidden">
           {[group?.name, date?.toLocaleDateString(undefined, { month: 'short', day: 'numeric' }), formatDuration(meeting.duration_seconds)]
             .filter(Boolean)

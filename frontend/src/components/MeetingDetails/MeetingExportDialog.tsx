@@ -14,6 +14,8 @@ import {
 import type { MeetingExportContent, MeetingExportFormat } from '@/hooks/meeting-details/useCopyOperations';
 
 const contentOptions: Array<{ value: MeetingExportContent; label: string; description: string }> = [
+  { value: 'all', label: 'Complete meeting', description: 'Transcript, your Notes and available summary, separately labelled' },
+  { value: 'notes', label: 'Your Notes', description: 'Your own saved thoughts, not recognized speech' },
   { value: 'transcript', label: 'Transcript', description: 'Everything said, with timestamps' },
   { value: 'summary', label: 'Summary', description: 'The current AI meeting summary' },
   { value: 'both', label: 'Transcript + Summary', description: 'A complete meeting record' },
@@ -47,27 +49,29 @@ export function MeetingExportDialog({
   onExport: (content: MeetingExportContent, format: MeetingExportFormat) => Promise<boolean>;
 }) {
   const [step, setStep] = useState<'content' | 'format'>('content');
-  const [content, setContent] = useState<MeetingExportContent>('both');
+  const [content, setContent] = useState<MeetingExportContent>('all');
   const [exporting, setExporting] = useState(false);
 
   useEffect(() => {
     if (!open) return;
     setStep('content');
-    setContent(hasTranscript && hasSummary ? 'both' : hasTranscript ? 'transcript' : 'summary');
+    setContent('all');
     setExporting(false);
-  }, [open, hasTranscript, hasSummary]);
+  }, [open]);
 
   const isAvailable = (value: MeetingExportContent) => {
     if (value === 'transcript') return hasTranscript;
     if (value === 'summary') return hasSummary;
-    return hasTranscript && hasSummary;
+    if (value === 'both') return hasTranscript && hasSummary;
+    return true;
   };
 
   const exportAs = async (format: MeetingExportFormat) => {
     setExporting(true);
-    const succeeded = await onExport(content, format);
-    setExporting(false);
-    if (succeeded) onOpenChange(false);
+    try {
+      const succeeded = await onExport(content, format);
+      if (succeeded) onOpenChange(false);
+    } finally { setExporting(false); }
   };
 
   return (
@@ -77,7 +81,7 @@ export function MeetingExportDialog({
           <DialogTitle>{step === 'content' ? 'What do you want to export?' : 'How should it be exported?'}</DialogTitle>
           <DialogDescription>
             {step === 'content'
-              ? 'Transcript + Summary is selected by default for a complete meeting record.'
+              ? 'Complete meeting includes saved Notes, selected transcript and available summary. Missing materials are marked explicitly. Later edits are not included in the captured snapshot.'
               : `Choose a format for the ${content === 'both' ? 'transcript and summary' : content}.`}
           </DialogDescription>
         </DialogHeader>

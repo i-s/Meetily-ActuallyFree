@@ -56,6 +56,7 @@ type SummaryStatus = 'idle' | 'processing' | 'summarizing' | 'regenerating' | 'c
 
 export interface MeetingDocumentProps {
   meetingId: string;
+  focusNotes?: boolean;
   aiSummary: any;
   summaryUserEdited: boolean;
   onSummaryChange: (summary: any, source: 'user' | 'system') => void;
@@ -102,6 +103,7 @@ function SaveIndicator({ state }: { state: SaveState }) {
 
 export function MeetingDocument(props: MeetingDocumentProps) {
   const [tab, setTab] = useState<'notes' | 'ask'>('notes');
+  useEffect(() => { if (props.focusNotes) setTab('notes'); }, [props.meetingId, props.focusNotes]);
   return (
     <Tabs value={tab} onValueChange={(value) => setTab(value as 'notes' | 'ask')} className="flex h-full min-h-0 flex-col">
       <div className="flex h-12 shrink-0 items-center justify-between gap-3 border-b border-af-border px-4">
@@ -137,6 +139,7 @@ export function MeetingDocument(props: MeetingDocumentProps) {
 
 function NotesTab({
   meetingId,
+  focusNotes,
   aiSummary,
   summaryUserEdited,
   onSummaryChange,
@@ -159,7 +162,13 @@ function NotesTab({
   regenerateRequest,
   onRegenerateRequestHandled,
 }: MeetingDocumentProps) {
-  // ---- Notes ---------------------------------------------------------------
+  const notesSection = useRef<HTMLElement>(null);
+  useEffect(() => {
+    if (!focusNotes) return;
+    const section = notesSection.current;
+    section?.scrollIntoView({ block: 'start' });
+    section?.focus({ preventScroll: true });
+  }, [meetingId, focusNotes]);
   // ---- Action items --------------------------------------------------------
   const [items, setItems] = useState<ActionItem[]>([]);
   const [itemsLoaded, setItemsLoaded] = useState(false);
@@ -288,8 +297,8 @@ function NotesTab({
     <div className="min-h-0 flex-1 overflow-y-auto">
       <div className="mx-auto max-w-3xl space-y-8 px-10 pb-16 pt-6">
         {/* Notes */}
-        <section>
-          <SectionTitle icon={NotebookPen}>Your notes</SectionTitle>
+        <section ref={notesSection} id="user-notes" tabIndex={-1}>
+          <SectionTitle icon={NotebookPen}>Your notes — not recognized speech</SectionTitle>
           <MeetingNotesEditor key={meetingId} target={`meeting:${meetingId}`} />
         </section>
 

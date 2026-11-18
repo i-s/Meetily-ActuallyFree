@@ -38,6 +38,7 @@ interface SidebarContextType {
   toggleRail: () => void;
   previewSidebar: (width: number) => void;
   meetings: CurrentMeeting[];
+  meetingsError: string | null;
   setMeetings: (meetings: CurrentMeeting[]) => void;
   isMeetingActive: boolean;
   setIsMeetingActive: (active: boolean) => void;
@@ -87,6 +88,8 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
   const sidebarWidth = dragWidth ?? displayedSidebarWidth(preferredWidth, windowWidth);
   const isCollapsed = sidebarWidth <= SIDEBAR_MIN + 8;
   const [meetings, setMeetings] = useState<CurrentMeeting[]>([]);
+  const [meetingsError, setMeetingsError] = useState<string | null>(null);
+  const meetingsGeneration = useRef(0);
   const [sidebarItems, setSidebarItems] = useState<SidebarItem[]>([]);
   const [isMeetingActive, setIsMeetingActive] = useState(false);
   const [serverAddress, setServerAddress] = useState('');
@@ -109,6 +112,7 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
   // Extract fetchMeetings as a reusable function
   const fetchMeetings = React.useCallback(async () => {
     if (serverAddress) {
+      const run = ++meetingsGeneration.current;
       try {
         const meetings = await invoke('api_get_meetings') as Array<{
           id: string;
@@ -124,11 +128,14 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
           duration_seconds: meeting.duration_seconds,
           group_id: meeting.group_id ?? null,
         }));
+        if (run !== meetingsGeneration.current) return;
+        setMeetingsError(null);
         setMeetings(transformedMeetings);
         Analytics.trackBackendConnection(true);
       } catch (error) {
         console.error('Error fetching meetings:', error);
-        setMeetings([]);
+        if (run !== meetingsGeneration.current) return;
+        setMeetingsError(error instanceof Error ? error.message : String(error));
         Analytics.trackBackendConnection(false, error instanceof Error ? error.message : 'Unknown error');
       }
     }
@@ -377,6 +384,7 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
       toggleRail,
       previewSidebar,
       meetings,
+      meetingsError,
       setMeetings,
       isMeetingActive,
       setIsMeetingActive,

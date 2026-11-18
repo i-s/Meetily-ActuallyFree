@@ -69,6 +69,7 @@ export default function PageContent({
   onLoadMore,
   focusTranscriptId,
   focusTime,
+  focusNotes,
 }: {
   meeting: any;
   summaryData: Summary | null;
@@ -87,6 +88,7 @@ export default function PageContent({
   onLoadMore?: () => void;
   focusTranscriptId?: string | null;
   focusTime?: number | null;
+  focusNotes?: boolean;
 }) {
   const { setCurrentMeeting } = useSidebar();
   const { modelConfig, setModelConfig } = useConfig();
@@ -323,19 +325,20 @@ export default function PageContent({
     }
     return match;
   }, [focusTranscriptId, focusTime, transcriptSegments]);
-  const focusAttempts = useRef(0);
   useEffect(() => {
     if (!onLoadMore || (!focusTranscriptId && focusTime == null)) return;
     const last = transcriptSegments[transcriptSegments.length - 1];
     const present = focusTranscriptId
       ? transcriptSegments.some((segment) => segment.id === focusTranscriptId)
       : !!last && (last.endTime ?? last.timestamp) >= (focusTime ?? 0);
-    if (present || !hasMore || isLoadingMore || focusAttempts.current > 40) return;
-    focusAttempts.current += 1;
+    if (present || !hasMore || isLoadingMore) return;
     onLoadMore();
   }, [focusTranscriptId, focusTime, transcriptSegments, hasMore, isLoadingMore, onLoadMore]);
 
   const focusedAudio = useRef(false);
+  useEffect(() => {
+    focusedAudio.current = false;
+  }, [meeting.id, focusTranscriptId, focusTime]);
   useEffect(() => {
     if (focusedAudio.current || focusTime == null || audio.status !== 'ready') return;
     focusedAudio.current = true;
@@ -433,6 +436,7 @@ export default function PageContent({
         className={cn('flex min-h-0 min-w-0 flex-1 overflow-hidden', stacked ? 'flex-col' : 'flex-row', draggingSplit && 'select-none')}
       >
         <section className="flex min-h-0 min-w-0 flex-1 flex-col" aria-label="Transcript">
+          {focusTranscriptId && !hasMore && !isLoadingMore && !transcriptSegments.some(segment => segment.id === focusTranscriptId) && <p role="status" className="px-4 py-2 text-xs text-af-text-3">This search result is no longer in the selected transcript. Search again to find the current text.</p>}
           <div className="min-h-0 flex-1">
             <VirtualizedTranscriptView
               segments={transcriptSegments}
@@ -482,6 +486,7 @@ export default function PageContent({
           aria-label="Notes and summary"
         >
           <MeetingDocument
+            focusNotes={focusNotes}
             meetingId={meeting.id}
             aiSummary={meetingData.aiSummary}
             summaryUserEdited={summaryUserEdited}
@@ -539,6 +544,7 @@ export default function PageContent({
         onDelete={templates.deleteCustomTemplate}
       />
       <MeetingExportDialog
+        key={meeting.id}
         open={exportOpen}
         onOpenChange={setExportOpen}
         hasTranscript={hasTranscript}

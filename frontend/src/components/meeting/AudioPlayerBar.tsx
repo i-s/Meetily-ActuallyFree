@@ -146,7 +146,7 @@ export function AudioPlayerBar({
       <div className="flex h-14 items-center gap-2 border-t border-af-border px-4 text-xs text-af-text-3">
         <VolumeX className="h-3.5 w-3.5 shrink-0" />
         <span className="min-w-0 flex-1 truncate">
-          {status === 'error' ? 'The recording could not be played.' : 'No audio was saved for this meeting.'}
+          {status === 'error' ? 'The recording could not be played.' : 'Audio unavailable — the recording is absent or was removed. Saved text is still available.'}
         </span>
         {textSwitch}
       </div>

@@ -220,122 +220,21 @@ impl PeopleRepository {
             });
         }
 
-        let meetings = sqlx::query_as::<_, (String, String, String)>(
-            "SELECT id, title, created_at FROM meetings \
-             WHERE lower(title) LIKE ? ESCAPE '\\' \
-             ORDER BY created_at DESC LIMIT ?",
-        )
-        .bind(&like_query)
-        .bind(limit)
-        .fetch_all(pool)
-        .await?;
-
-        for (id, title, created_at) in meetings {
+        for hit in super::library::search(pool, query, limit as usize, false).await? {
             ranked.push(RankedResult {
-                score: match_quality(&title.to_lowercase(), &normalized_query),
-                sort_time: created_at.clone(),
-                result: GlobalSearchResult {
-                    kind: "meeting".to_string(),
-                    id: id.clone(),
-                    meeting_id: Some(id),
-                    person_id: None,
-                    transcript_id: None,
-                    title: title.clone(),
-                    snippet: title,
-                    timestamp: Some(created_at),
-                    speaker: None,
-                    audio_start_time: None,
-                    meeting_count: None,
-                    group_id: None,
-                    color: None,
+                score: match hit.kind.as_str() {
+                    "meeting" => match_quality(&hit.title.to_lowercase(), &normalized_query),
+                    "notes" => 19,
+                    "transcript" if hit.speaker.as_deref().is_some_and(|value| value.to_lowercase().contains(&normalized_query)) => 5,
+                    "transcript" => 20,
+                    _ => 25,
                 },
-            });
-        }
-
-        let transcripts = sqlx::query_as::<
-            _,
-            (
-                String,
-                String,
-                String,
-                String,
-                String,
-                Option<String>,
-                Option<f64>,
-            ),
-        >(
-            "SELECT t.id, m.id, m.title, t.transcript, t.timestamp, t.speaker, t.audio_start_time \
-             FROM transcripts t JOIN meetings m ON m.id = t.meeting_id \
-             WHERE lower(t.transcript) LIKE ? ESCAPE '\\' \
-                OR lower(COALESCE(t.speaker, '')) LIKE ? ESCAPE '\\' \
-             ORDER BY m.created_at DESC, t.audio_start_time ASC LIMIT ?",
-        )
-        .bind(&like_query)
-        .bind(&like_query)
-        .bind(limit)
-        .fetch_all(pool)
-        .await?;
-
-        for (id, meeting_id, title, text, timestamp, speaker, audio_start_time) in transcripts {
-            let speaker_match = speaker
-                .as_deref()
-                .map(|value| value.to_lowercase().contains(&normalized_query))
-                .unwrap_or(false);
-            ranked.push(RankedResult {
-                score: if speaker_match { 5 } else { 20 },
-                sort_time: timestamp.clone(),
+                sort_time: hit.timestamp.clone(),
                 result: GlobalSearchResult {
-                    kind: "transcript".to_string(),
-                    id: id.clone(),
-                    meeting_id: Some(meeting_id),
-                    person_id: None,
-                    transcript_id: Some(id),
-                    title,
-                    snippet: snippet_around(&text, query, 180),
-                    timestamp: Some(timestamp),
-                    speaker,
-                    audio_start_time,
-                    meeting_count: None,
-                    group_id: None,
-                    color: None,
-                },
-            });
-        }
-
-        // Summary JSON contains caches and editor structure, so only parsed,
-        // user-visible text is searched. Never use a LIKE against the raw blob.
-        let summaries = sqlx::query_as::<_, (String, String, String, String)>(
-            "SELECT m.id, m.title, m.created_at, s.result \
-             FROM summary_processes s JOIN meetings m ON m.id = s.meeting_id \
-             WHERE s.result IS NOT NULL ORDER BY m.created_at DESC",
-        )
-        .fetch_all(pool)
-        .await?;
-
-        for (meeting_id, title, created_at, raw) in summaries {
-            let Some(visible) = visible_summary_text(&raw) else {
-                continue;
-            };
-            if !visible.to_lowercase().contains(&normalized_query) {
-                continue;
-            }
-            ranked.push(RankedResult {
-                score: 25,
-                sort_time: created_at.clone(),
-                result: GlobalSearchResult {
-                    kind: "summary".to_string(),
-                    id: format!("summary-{}", meeting_id),
-                    meeting_id: Some(meeting_id),
-                    person_id: None,
-                    transcript_id: None,
-                    title,
-                    snippet: snippet_around(&visible, query, 220),
-                    timestamp: Some(created_at),
-                    speaker: None,
-                    audio_start_time: None,
-                    meeting_count: None,
-                    group_id: None,
-                    color: None,
+                    kind: hit.kind, id: hit.id, meeting_id: Some(hit.meeting_id),
+                    person_id: None, transcript_id: hit.transcript_id, title: hit.title,
+                    snippet: hit.snippet, timestamp: Some(hit.timestamp), speaker: hit.speaker,
+                    audio_start_time: hit.audio_start_time, meeting_count: None, group_id: None, color: None,
                 },
             });
         }
@@ -1528,7 +1427,7 @@ fn match_quality(value: &str, query: &str) -> i32 {
     }
 }
 
-fn snippet_around(text: &str, query: &str, max_chars: usize) -> String {
+pub(crate) fn snippet_around(text: &str, query: &str, max_chars: usize) -> String {
     let chars: Vec<char> = text.chars().collect();
     if chars.len() <= max_chars {
         return text.to_string();
