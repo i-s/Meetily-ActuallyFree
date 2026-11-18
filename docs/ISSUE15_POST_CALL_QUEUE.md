@@ -6,6 +6,12 @@ read on 2026-11-18; there were no comments.
 
 ## Integration provenance
 
+**Coordinated convergence update:** accepted identity/recording-authority and
+vocabulary-suggestion histories are now locally integrated; see
+[ISSUE15_COORDINATED_CONVERGENCE.md](ISSUE15_COORDINATED_CONVERGENCE.md) for merge
+parents, resolved boundaries and current combined checks. Earlier seam descriptions
+below document the standalone baseline, not a claim that convergence is pending.
+
 - Runtime base: `226ff989997e49a404ab8b684e6168f453f31c4f` (#12 Notes + #14 versions).
 - Reviewed #13 product source: `7f017db`; integrated tip
   `e40f6298424ad706e7e91ad434e7d69be6aba8e2` includes its docs-only qualification update.

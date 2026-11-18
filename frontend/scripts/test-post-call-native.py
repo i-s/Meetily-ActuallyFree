@@ -14,7 +14,7 @@ import sys
 ROOT = Path(__file__).resolve().parents[2]
 SRC = ROOT / 'frontend/src-tauri/src'
 lock = tomllib.loads((ROOT / 'Cargo.lock').read_text())
-names = ('sqlx', 'chrono', 'tokio', 'tokio-util', 'uuid', 'serde', 'serde_json', 'tempfile', 'anyhow', 'log')
+names = ('sqlx', 'chrono', 'tokio', 'tokio-util', 'uuid', 'serde', 'serde_json', 'tempfile', 'anyhow', 'regex', 'log')
 v = {n: next(p['version'] for p in lock['package'] if p['name'] == n) for n in names}
 api = (SRC / 'api/api.rs').read_text()
 start = api.index('pub struct TranscriptSegment {')
@@ -45,6 +45,7 @@ uuid={{version="={v['uuid']}",features=["v4"]}}
 serde={{version="={v['serde']}",features=["derive"]}}
 serde_json="={v['serde_json']}"
 tempfile="={v['tempfile']}"
+regex="={v['regex']}"
 ''')
     (work / 'Cargo.lock').write_bytes((ROOT / 'Cargo.lock').read_bytes())
     post = (SRC / 'post_call/mod.rs').read_text().replace('#[tauri::command]', '')
@@ -71,6 +72,7 @@ pub mod api{{{segment}}}
 pub mod config{{pub const DEFAULT_PARAKEET_MODEL:&str="synthetic";}}
 pub mod state{{pub struct AppState{{pub db_manager:DbManager}}pub struct DbManager(pub sqlx::SqlitePool);impl DbManager{{pub fn pool(&self)->&sqlx::SqlitePool{{&self.0}}}}}}
 pub mod database{{
+ #[path="{SRC}/database/vocabulary_suggestions.rs"]pub mod vocabulary_suggestions;
  #[path="{SRC}/database/transcript_versions.rs"]pub mod transcript_versions;
  pub mod repositories{{
   #[path="{SRC}/database/repositories/speaker_identity.rs"]pub mod speaker_identity;

@@ -6,3 +6,5 @@ pub mod setup;
 
 pub mod transcript_versions;
 pub mod transcript_version_commands;
+
+pub mod vocabulary_suggestions;

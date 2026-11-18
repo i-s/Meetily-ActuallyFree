@@ -9,7 +9,7 @@ import sys
 ROOT = Path(__file__).resolve().parents[2]
 SRC = ROOT / 'frontend/src-tauri/src'
 lock = tomllib.loads((ROOT / 'Cargo.lock').read_text())
-names = ('sqlx', 'chrono', 'tokio', 'tokio-util', 'uuid', 'serde', 'serde_json', 'tempfile', 'anyhow')
+names = ('sqlx', 'chrono', 'tokio', 'tokio-util', 'uuid', 'serde', 'serde_json', 'tempfile', 'anyhow', 'regex')
 v = {n: next(p['version'] for p in lock['package'] if p['name'] == n) for n in names}
 api = (SRC / 'api/api.rs').read_text()
 start = api.index('pub struct TranscriptSegment {')
@@ -31,6 +31,7 @@ uuid={{version="={v['uuid']}",features=["v4"]}}
 serde={{version="={v['serde']}",features=["derive"]}}
 serde_json="={v['serde_json']}"
 tempfile="={v['tempfile']}"
+regex="={v['regex']}"
 ''')
     (work / 'Cargo.lock').write_bytes((ROOT / 'Cargo.lock').read_bytes())
     modules = '\n'.join(f'#[path="{SRC}/post_call/{n}.rs"] pub mod {n};' for n in ('store', 'summary', 'priority', 'runner'))
@@ -38,7 +39,7 @@ tempfile="={v['tempfile']}"
 {modules}
 pub mod config {{pub const DEFAULT_PARAKEET_MODEL:&str="synthetic";}}
 pub mod codex_cli {{#[path="{SRC}/codex_cli/vocabulary.rs"]pub mod vocabulary;}}
-pub mod database {{pub mod repositories {{#[path="{SRC}/database/repositories/vocabulary.rs"]pub mod vocabulary;}}}}
+pub mod database {{#[path="{SRC}/database/vocabulary_suggestions.rs"]pub mod vocabulary_suggestions;pub mod repositories {{#[path="{SRC}/database/repositories/vocabulary.rs"]pub mod vocabulary;}}}}
 #[path="{SRC}/diarization/batch_control.rs"] pub mod batch_control;
 #[cfg(test)] #[path="{ROOT}/frontend/tests/native/post-call-fixture.rs"] mod test_schema;
 #[cfg(test)] #[path="{ROOT}/frontend/tests/native/post-call.rs"] mod tests;

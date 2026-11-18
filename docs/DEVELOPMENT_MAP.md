@@ -152,6 +152,10 @@ source labels rather than guessing a speaker or switching engines.
 
 ## 3. Post-call processing and model selection
 
+Accepted #15 + #10/#11/#12/#14 + #16/#17 local convergence, shared entrypoint
+resolutions, lightweight adapter boundaries/results and open heavy/physical gates
+are recorded in [ISSUE15_COORDINATED_CONVERGENCE.md](ISSUE15_COORDINATED_CONVERGENCE.md).
+
 Issue #15's native automatic save/recovery queue, recording-first resource admission,
 checkpoint reuse, subscription-only saved-meeting Codex operation, immutable revision-
 bound summaries, visible stages/defer/retry/history, synthetic qualification and
@@ -198,6 +202,16 @@ local-ASR hints; Codex must use the proof-bearing `approved_global` snapshot.
 Ordinary corrections and declined confirmation never learn terms. Parakeet has
 no hints; Whisper uses a 224-token prefix, not the whole storage character limit.
 Synthetic persistence/dispatch tests do not qualify real ASR/model accuracy.
+
+Issue #17's requested local RU/EN spelling suggestions, bounded read-only selected
+projection, same-transaction source/version/revision approval guard, transient
+rejection and ordinary meeting controls are documented in
+[ISSUE17_VOCABULARY_SUGGESTIONS.md](ISSUE17_VOCABULARY_SUGGESTIONS.md). Read it before
+changing suggestion generation or accepting inferred terms. No AI/provider or
+queue is used; scan/decline/close never write. Only explicit acceptance enters
+#16's existing vocabulary transaction. Generic #14 snapshots, Notes and approval
+migrations remain unchanged; physical usability/real-transcript usefulness are
+separate pending gates.
 
 Issue #12's live/library Notes editor, session-keyed autosave, transactional
 save/recovery association, independent data ownership, revisioned read interfaces

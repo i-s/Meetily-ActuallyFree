@@ -17,7 +17,7 @@ mod transcript_versions;
 
 #[path = "../../../frontend/src-tauri/src/database/repositories/speaker_identity.rs"]
 pub mod speaker_identity;
-mod database { pub mod repositories { pub use crate::speaker_identity; } }
+mod database { pub(crate) use crate::vocabulary_suggestions; pub mod repositories { pub use crate::speaker_identity; #[cfg(test)] pub(crate) use crate::vocabulary; } }
 
 mod config { pub const DEFAULT_PARAKEET_MODEL: &str = "synthetic"; }
 #[path = "../../../frontend/src-tauri/src/database/repositories/vocabulary.rs"]
@@ -198,3 +198,9 @@ mod commands {
 
 #[cfg(test)]
 mod approval_migration;
+
+#[cfg(test)]
+mod suggestions;
+
+#[path = "../../../frontend/src-tauri/src/database/vocabulary_suggestions.rs"]
+mod vocabulary_suggestions;
