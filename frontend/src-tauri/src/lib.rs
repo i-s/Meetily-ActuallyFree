@@ -107,6 +107,8 @@ struct RecordingArgs {
     save_path: String,
     #[serde(default)]
     expected: Option<audio::recording_ownership::RecordingLease>,
+    #[serde(default)]
+    manual_generation: Option<String>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -193,6 +195,7 @@ async fn stop_recording<R: Runtime>(app: AppHandle<R>, args: RecordingArgs) -> R
         audio::recording_commands::RecordingArgs {
             save_path: args.save_path.clone(),
             expected: args.expected.clone(),
+            manual_generation: args.manual_generation.clone(),
         },
     )
     .await

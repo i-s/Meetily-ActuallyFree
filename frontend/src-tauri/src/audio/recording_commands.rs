@@ -127,7 +127,7 @@ fn install_fatal_error_callback<R: Runtime>(
                 let _ = stop_recording_inner(
                     app_for_stop,
                     RecordingArgs {
-                        save_path: String::new(), expected: None,
+                        save_path: String::new(), expected: None, manual_generation: None,
                     },
                     true,
                 )
@@ -189,6 +189,8 @@ pub struct RecordingArgs {
     pub save_path: String,
     #[serde(default)]
     pub expected: Option<super::recording_ownership::RecordingLease>,
+    #[serde(default)]
+    pub manual_generation: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -595,6 +597,9 @@ pub async fn start_recording_with_lifecycle<R: Runtime>(
         return Err("Recording already in progress or stopping".to_string());
     }
 
+    // Admission owns Stop revocation before any capture/setup await. Commit
+    // transfers that history; it never reconstructs trust from republished A.
+    let stop_admission = lifecycle_owner.clone().map(super::recording_ownership::admit).transpose()?;
     crate::onnx_runtime::ensure_available().map_err(|error| {
         map_recording_start_error(&app, crate::onnx_runtime::InitializationError(error).into())
     })?;
@@ -755,7 +760,10 @@ pub async fn start_recording_with_lifecycle<R: Runtime>(
 
     // Set recording flag and reset speech detection flag
     info!("ðŸ” Setting IS_RECORDING to true and resetting SPEECH_DETECTED_EMITTED");
-    let recording_lease = super::recording_ownership::begin(lifecycle_owner);
+    let recording_lease = match stop_admission {
+        Some(admission) => admission.commit(),
+        None => super::recording_ownership::begin(None),
+    };
     IS_RECORDING.store(true, Ordering::SeqCst);
     if let Some(claim) = start_claim { claim.commit(recording_lease.clone()); }
 
@@ -903,7 +911,7 @@ async fn stop_recording_inner<R: Runtime>(
     // Engine lifecycle lock is held by EVERY caller. This short authority
     // claim linearizes the exact generation/owner, source-specific confirmed
     // exit, permission/qualification revocation and native disable/release. Reject before any event/UI/save effect.
-    if !super::recording_ownership::claim_stop(args.expected.as_ref()) {
+    if !super::recording_ownership::claim_stop_request(args.expected.as_ref(), args.manual_generation.as_deref()) {
         log::info!("Rejected stale or disabled automated recording stop");
         return Ok(StopOutcome::AlreadyStopped);
     }

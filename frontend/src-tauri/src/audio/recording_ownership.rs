@@ -29,6 +29,36 @@ pub struct RecordingLease {
     pub generation: String,
     pub owner: Option<LifecycleOwner>,
 }
+struct AdmittedStop {
+    id: u64,
+    owner: LifecycleOwner,
+    revoked: bool,
+    exit_confirmed: bool,
+}
+
+/// Owns the provisional Stop authority from before capture awaits until commit
+/// or destruction. Failure/cancellation releases only this admission's state.
+pub struct StartAdmission { id: u64 }
+impl StartAdmission {
+    pub fn commit(self) -> RecordingLease {
+        let mut authority = AUTHORITY.lock().unwrap();
+        let pending = authority.admitted.take().filter(|pending| pending.id == self.id)
+            .expect("start admission must remain owned until commit");
+        let lease = authority.begin(Some(pending.owner));
+        authority.stop_revoked = pending.revoked;
+        authority.exit_confirmed = pending.exit_confirmed && !pending.revoked;
+        lease
+    }
+}
+impl Drop for StartAdmission {
+    fn drop(&mut self) {
+        let mut authority = AUTHORITY.lock().unwrap();
+        if authority.admitted.as_ref().is_some_and(|pending| pending.id == self.id) {
+            authority.admitted = None;
+        }
+    }
+}
+
 pub struct Authority {
     epoch: String,
     sequence: u64,
@@ -37,12 +67,15 @@ pub struct Authority {
     sources: BTreeMap<String, SourceAuthority>,
     stop_revoked: bool,
     exit_confirmed: bool,
+    admission_sequence: u64,
+    admitted: Option<AdmittedStop>,
 }
 impl Default for Authority {
     fn default() -> Self {
         Self { epoch: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default().as_nanos().to_string(), sequence: 0, current: None, automation_enabled: false,
-            sources: BTreeMap::new(), stop_revoked: false, exit_confirmed: false }
+            sources: BTreeMap::new(), stop_revoked: false, exit_confirmed: false,
+            admission_sequence: 0, admitted: None }
     }
 }
 impl Authority {
@@ -74,6 +107,10 @@ impl Authority {
                 self.stop_revoked = true;
                 self.exit_confirmed = false;
             }
+            if let Some(pending) = self.admitted.as_mut().filter(|pending| pending.owner.source == source) {
+                pending.revoked = true;
+                pending.exit_confirmed = false;
+            }
         }
     }
     fn observe_source(&mut self, source: &str, enabled: bool, qualified: bool, presence: SourcePresence<'_>) {
@@ -91,28 +128,31 @@ impl Authority {
             state.active_session = None;
             state.ended_session = None;
         }
-        let Some(owner) = self.current.as_ref().and_then(|lease| lease.owner.as_ref()).filter(|owner| owner.source == source) else { return; };
-        if !enabled || !qualified {
-            self.stop_revoked = true;
-            self.exit_confirmed = false;
-            return;
+        if let Some(owner) = self.current.as_ref().and_then(|lease| lease.owner.as_ref()).filter(|owner| owner.source == source) {
+            (self.stop_revoked, self.exit_confirmed) = Self::observe_stop(owner, self.stop_revoked,
+                self.exit_confirmed, enabled, qualified, presence);
         }
+        if let Some(pending) = self.admitted.as_mut().filter(|pending| pending.owner.source == source) {
+            (pending.revoked, pending.exit_confirmed) = Self::observe_stop(&pending.owner, pending.revoked,
+                pending.exit_confirmed, enabled, qualified, presence);
+        }
+    }
+    fn observe_stop(owner: &LifecycleOwner, mut revoked: bool, mut exit: bool,
+        enabled: bool, qualified: bool, presence: SourcePresence<'_>) -> (bool, bool) {
+        if !enabled || !qualified { return (true, false); }
         match presence {
-            SourcePresence::End(session) if session == owner.session_id => {
-                self.exit_confirmed = !self.stop_revoked;
-            },
+            SourcePresence::End(session) if session == owner.session_id => exit = !revoked,
             SourcePresence::Active(session) | SourcePresence::End(session) => {
-                if self.exit_confirmed || session != owner.session_id { self.stop_revoked = true; }
-                self.exit_confirmed = false;
+                if exit || session != owner.session_id { revoked = true; }
+                exit = false;
             },
             SourcePresence::Unknown => {
-                // Once a confirmed exit was withdrawn, a delayed publication
-                // of that old End must not revive its queued Stop authority.
-                if self.exit_confirmed { self.stop_revoked = true; }
-                self.exit_confirmed = false;
+                if exit { revoked = true; }
+                exit = false;
             },
-            SourcePresence::Inactive => {}, // only retains a previously confirmed owner End
+            SourcePresence::Inactive => {},
         }
+        (revoked, exit)
     }
     /// An automated stop needs the exact lease AND native owner-specific exit
     /// authority. Manual Stop deliberately supplies no guard and bypasses it.
@@ -133,8 +173,31 @@ impl Authority {
 }
 static AUTHORITY: LazyLock<Mutex<Authority>> = LazyLock::new(|| Mutex::new(Authority::default()));
 pub fn begin(owner: Option<LifecycleOwner>) -> RecordingLease { AUTHORITY.lock().unwrap().begin(owner) }
+pub fn admit(owner: LifecycleOwner) -> Result<StartAdmission, String> {
+    let mut authority = AUTHORITY.lock().unwrap();
+    if authority.admitted.is_some() || !authority.automation_enabled
+        || !authority.sources.get(&owner.source).is_some_and(|source| source.enabled && source.qualified
+            && source.active_session.as_deref() == Some(owner.session_id.as_str())) {
+        return Err("Automated capture admission is no longer qualified or permitted".into());
+    }
+    authority.admission_sequence = authority.admission_sequence.checked_add(1).ok_or("Start admission exhausted")?;
+    let id = authority.admission_sequence;
+    authority.admitted = Some(AdmittedStop { id, owner, revoked: false, exit_confirmed: false });
+    Ok(StartAdmission { id })
+}
 pub fn current() -> Option<RecordingLease> { AUTHORITY.lock().unwrap().current.clone() }
 pub fn claim_stop(expected: Option<&RecordingLease>) -> bool { AUTHORITY.lock().unwrap().claim_stop(expected) }
+/// Routed manual intent is generation-bound but independent of source/Labs
+/// permission. Check both modes under one authority lock; never downgrade one.
+pub fn claim_stop_request(expected: Option<&RecordingLease>, manual_generation: Option<&str>) -> bool {
+    let mut authority = AUTHORITY.lock().unwrap();
+    if let Some(generation) = manual_generation {
+        if expected.is_some() || authority.current.as_ref().map(|lease| lease.generation.as_str()) != Some(generation) {
+            return false;
+        }
+    }
+    authority.claim_stop(expected)
+}
 pub fn automation_enabled() -> bool { AUTHORITY.lock().unwrap().automation_enabled }
 /// Callers publish settings/evidence while holding their settings/state locks;
 /// claim_stop never reads those locks in reverse while holding this mutex.
@@ -148,7 +211,10 @@ pub fn set_meeting_automation_enabled(enabled: bool) {
     // Not loaded from old browser settings. Every native process starts false.
     let mut authority = AUTHORITY.lock().unwrap();
     authority.automation_enabled = enabled;
-    if !enabled { authority.stop_revoked = true; authority.exit_confirmed = false; }
+    if !enabled {
+        authority.stop_revoked = true; authority.exit_confirmed = false;
+        if let Some(pending) = authority.admitted.as_mut() { pending.revoked = true; pending.exit_confirmed = false; }
+    }
 }
 #[tauri::command]
 pub fn release_automated_recording(expected: RecordingLease) -> bool {

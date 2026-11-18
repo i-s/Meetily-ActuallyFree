@@ -21,6 +21,7 @@ const toast = Object.assign((message: string) => messages.push(message), { error
 mock.module('sonner', () => ({ toast }));
 mock.module('@tauri-apps/api/core', () => ({ invoke: async (name: string) => {
   if (name === 'get_discord_automation_status') return status;
+  if (name === 'get_recording_state') return { is_recording: !!nativeLease, is_stopping: false, recording_lease: nativeLease };
   if (name === 'check_transcription_runtime' || name === 'parakeet_init') return;
   if (name === 'parakeet_has_available_models') return true;
   if (name === 'parakeet_is_model_loaded') { afterModelReady(); return true; }
@@ -40,9 +41,13 @@ mock.module('@/lib/recordingNotification', () => ({ showRecordingNotification: a
 const { useRecordingStart } = await import('../../src/hooks/useRecordingStart');
 const { createDiscordAutomation } = await import('../../src/lib/discord-automation');
 const { automatedRecording, endAutomatedRecording, markAutomatedStart, automatedStartInProgress } = await import('../../src/lib/meeting-automation');
-const { launchRecording, requestRecordingStop, STOP_RECORDING_EVENT } = await import('../../src/lib/recording-launch');
+const { launchRecording, requestRecordingStop, takeRecordingStopRequest, completeRecordingStopRequest, STOP_RECORDING_EVENT } = await import('../../src/lib/recording-launch');
 let stopRequests = 0;
-window.addEventListener(STOP_RECORDING_EVENT, () => { stopRequests++; endAutomatedRecording(); });
+window.addEventListener(STOP_RECORDING_EVENT, () => {
+  const request = takeRecordingStopRequest();
+  if (!request) return; // Resolving/duplicate wakeups are not Stop actions.
+  stopRequests++; completeRecordingStopRequest(request); endAutomatedRecording();
+});
 let manualStart: () => Promise<void>;
 function Recorder() { manualStart = useRecordingStart(false, noop).handleRecordingStart; return null; }
 
@@ -67,7 +72,7 @@ test('Discord event bridge drives ordinary launcher and real useRecordingStart; 
     await act(async () => { status = { ...status, state: 'inactive', transition: 'end' }; controller.update(status); await settle(); });
     expect(stopRequests).toBe(0); // No native lease on the assigned base: auto-Stop is blocked.
     expect(automatedRecording()?.source).toBe('discord');
-    await act(async () => requestRecordingStop(() => {})); // Explicit manual Stop remains ordinary.
+    await act(async () => { requestRecordingStop(() => {}); }); // Explicit manual Stop remains ordinary.
     expect(stopRequests).toBe(1);
     expect(automatedRecording()).toBeNull();
     endAutomatedRecording(); // Same ownership revocation used by manual Stop / Don't stop it.

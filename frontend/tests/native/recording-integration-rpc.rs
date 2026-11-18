@@ -33,6 +33,12 @@ async fn command(name:&str,args:Value)->Result<Value,String>{
         "set_meeting_automation_enabled"=>{ownership::set_meeting_automation_enabled(args["enabled"].as_bool().unwrap());Ok(Value::Null)},
         "get_meeting_lifecycle_snapshot"=>Ok(serde_json::to_value(meeting_detection::lifecycle::get_meeting_lifecycle_snapshot()).unwrap()),
         "get_discord_automation_status"=>Ok(serde_json::to_value(discord_automation::get_discord_automation_status()).unwrap()),
+        "get_meeting_detection_settings"=>Ok(serde_json::to_value(meeting_detection::get_meeting_detection_settings().await?).unwrap()),
+        "set_meeting_detection_settings"=>{
+            let settings=serde_json::from_value(args["settings"].clone()).map_err(|e|e.to_string())?;
+            meeting_detection::set_meeting_detection_settings(app(),settings).await?;Ok(Value::Null)
+        },
+        "fixture_monitor_counts"=>Ok(json!({"spawns":meetily_start_authority::MONITOR_SPAWNS.load(Ordering::SeqCst),"events":meetily_start_authority::EVENTS.lock().unwrap().len()})),
         "fixture_source"=>{
             let session=args["session_id"].as_str().map(str::to_owned);
             let state=args["state"].as_str().unwrap_or("unknown").to_owned();
@@ -52,6 +58,7 @@ async fn command(name:&str,args:Value)->Result<Value,String>{
             commands::IS_RECORDING.store(false,Ordering::SeqCst);commands::IS_STOPPING.store(false,Ordering::SeqCst);
             commands::HOLD.store(false,Ordering::SeqCst);commands::HOLD_COMMIT.store(false,Ordering::SeqCst);commands::FAIL.store(false,Ordering::SeqCst);
             commands::CAPTURES.store(0,Ordering::SeqCst);commands::SAVES.store(0,Ordering::SeqCst);
+            meeting_detection::start_meeting_detection(app()).await?;
             Ok(Value::Null)
         },
         "fixture_engine_hold"=>{

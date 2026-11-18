@@ -163,3 +163,35 @@ async fn qualification_binding_and_missing_authority_never_reach_capture() {
     commands::start_recording_with_lifecycle(app(), None, None, None, None, None).await.unwrap();
     assert_eq!(commands::CAPTURES.load(Ordering::SeqCst), 1);
 }
+
+
+#[tokio::test]
+async fn failed_and_abandoned_admission_does_not_revoke_the_next_session() {
+    for source in ["zoom", "discord"] {
+        for abandoned in [false, true] {
+            reset().await;
+            let a = request(source, if abandoned { "abandoned-admission" } else { "failed-admission" });
+            if abandoned {
+                commands::HOLD.store(true, Ordering::SeqCst);
+                let running = tokio::spawn(start(a));
+                commands::ENTERED.acquire().await.unwrap().forget();
+                ownership::set_meeting_automation_enabled(false);
+                ownership::set_meeting_automation_enabled(true);
+                running.abort(); assert!(running.await.unwrap_err().is_cancelled());
+                commands::HOLD.store(false, Ordering::SeqCst);
+            } else {
+                commands::FAIL.store(true, Ordering::SeqCst);
+                assert!(start(a).await.is_err());
+                commands::FAIL.store(false, Ordering::SeqCst);
+            }
+            let b = request(source, "clean-next-session");
+            let lease = start(b.clone()).await.unwrap();
+            if source == "zoom" {
+                crate::meeting_detection::lifecycle::fixture(None, "inactive".into(), true);
+            } else {
+                crate::discord_automation::fixture(crate::discord_automation::Status { enabled:true,qualified:true,state:"inactive".into(),session_id:Some(b.session_id),transition:"end".into() });
+            }
+            assert_eq!(commands::stop_recording(app(), commands::RecordingArgs { save_path:String::new(),expected:Some(lease),manual_generation:None }).await.unwrap(), commands::StopOutcome::Completed);
+        }
+    }
+}

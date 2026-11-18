@@ -260,3 +260,104 @@ misrepresented as integrated capture. Both journals still require the single fin
 combined Mac build qualification. No DMG, push, PR, Actions, release, issue closure,
 Mac/private-data operation or subagent occurred. #14 original-session policy/version
 integration remains separate. Independent integration review is the next step.
+
+## Combined R2: admission continuity, live Settings and distinct manual Stop
+
+This section supersedes R1's lease-publication reconstruction and first-wins Stop
+slot. It does not change either source's qualification policy or import #12/#14.
+
+### Native startup authority
+
+`recording_commands::start_recording_with_lifecycle` creates a native
+`recording_ownership::StartAdmission` after source validation/busy rejection and
+before awaited model/device/capture setup. The engine lifecycle lock owns the
+operation; the short recording authority mutex serializes provisional and committed
+Stop authority against settings/evidence publication. Source/global disable,
+qualification loss and competing sessions update the admitted owner's sticky
+revocation, even if qualified Active A is republished before lease publication.
+`StartAdmission::commit` transfers those flags and confirmed owner End into the
+new lease instead of reconstructing trust from the latest snapshot. A valid End
+during startup still authorizes the normal guarded Stop. RAII destruction on failed
+or cancelled startup clears only that admission, not a later session's state.
+
+### Settings command and monitor lifecycle
+
+`set_meeting_detection_settings -> apply_automation_settings` still revokes source
+permission before publishing settings. It now restarts the monitor only when
+initializing, enabling or resuming it. A healthy monitor reads current settings on
+each poll, so changing Discord-only/Zoom-only, notifications or interval settings
+does not call `start_monitor -> lifecycle::suspend(true)` for an unrelated take.
+An interval edit takes effect on the worker's next poll (it does not interrupt an
+already sleeping interval). Genuine source disable remains sticky; global disable,
+explicit monitor stop/restart and qualification loss retain their revocation paths.
+Re-enabling is not a grant to the old take.
+
+The generated bridge now compiles the production Settings command bodies, the
+complete `start_monitor` function and lifecycle publication. Disk I/O, scanning and
+worker scheduling are synthetic adapters; spawn/event counters establish whether
+the real command path restarts/suspends, not whether a physical poll ran. Qualified
+source snapshots remain test-only. The inverse-source and source/global off/on
+controls verify that avoiding a spurious restart does not bypass real revocation.
+
+### Routed manual intent and final native claim
+
+`recording-launch.ts` stores a version-2 queue bounded to 16 pending intents and 64
+completed IDs. An automated request keeps its full expected lease. A distinct
+explicit manual action gets its own UUID, resolves `get_recording_state` once and
+freezes that native generation before waiting for Controls state sync or directory
+lookup. Resolving and ready manual states are separate; an unresolved binding lost
+with the WebView is dropped, never rebound to whatever records next. Same-ID/event
+and guarded-lease deliveries deduplicate; stale guarded A does not consume distinct
+manual B. A new explicit action after failed transport gets a new ID.
+
+Mounted Controls drain only when synchronized recording state is ready; queued
+records remain durable through false initial state and remount. Claims are
+module-owned across remount and completed after each attempt. Native
+`RecordingArgs.manual_generation` is forwarded through the ordinary Stop command
+and checked against the current lease under the same authority mutex as automated
+Stop. It bypasses source/Labs permission, not generation matching. Supplying both
+guard modes rejects. Successful A followed by a queued manual intent for A cannot
+stop C, nor can a delayed manual B after directory/state reply delay stop C. Direct
+manual button/tray/minibar behavior remains unchanged. Missing/malformed automated
+leases never become manual Stop. Capacity or storage failure drops the request
+rather than delivering an unbound Stop; unlike R1, no transient event fallback is
+promised when durable queue storage fails.
+
+### R2 verification evidence and limits
+
+- Native startup/Settings red run: **41 pass, 6 fail**, **426 assertions**. Both
+  sources reproduced source/global off/on resurrection during admitted capture and
+  unrelated Settings command revocation. Intermediate corrected bridge: **57 pass,
+  0 fail**, 492 assertions.
+- Focused stale-A/manual-B Controls red run: **3 pass, 1 fail**; B remained recording.
+  Replaying **044a43a** Controls and launcher against the native bridge also failed
+  that exact mounted/remount regression (**0 pass, 1 fail**, 4 assertions; other
+  tests filtered), with only one prior save instead of the expected two. These are
+  runtime wrong-result repros, not import/compiler failures.
+- Final expanded mounted hook/Controls/service -> production Rust authorization:
+  **60 pass, 0 fail**, **513 assertions**, including startup End, both source
+  permissions, native-lock ordering, stale/successful A, distinct/same manual IDs,
+  explicit retry, false sync/remount and late state/directory replies versus C.
+- Focused Controls: **4 pass, 0 fail**, 26 assertions. Initial full isolated suite
+  found an obsolete entrypoint fixture counting queue wakeups as Stop effects;
+  it now consumes bound intents and supplies native state. Its focused rerun:
+  **2 pass, 0 fail**, 28 assertions. Final full isolated rerun: **43/43 files,
+  219 tests passed** (the native bridge is skipped there and run separately).
+  Standalone TypeScript passed. Portable native Stop **15**, start/source/settings
+  **35**, lifecycle/provenance **38** passed; the R2 execution plan records commands
+  and the author self-review.
+
+Logs are local `/tmp/issue1011-r2-{native-red,manual-red,old-controls-red,combined-final,
+manual-green,entrypoints-final,frontend-final,stop-final,start-final,lifecycle-final,
+tsc}.log`. `test-meeting-native-integration.py` builds the small generated native
+fixture and runs the bridge; `test-isolated.mjs` runs frontend files separately.
+The optional `MEETILY_STOP_REVIEW_BASELINE` test input loads old Controls/launcher
+copies for the manual regression without changing production files.
+
+No heavy/Next/full desktop build, DMG, Actions, push, delegates or Mac operations
+were run. No actual Tauri IPC/desktop ABI, capture hardware, model/acoustic accuracy,
+installed app or physical Zoom/Discord reliability is established. Native post-claim
+capture/save effects remain synthetic generated-file/count adapters; no private
+recordings or model fixtures were used. Both real source classes remain
+`qualified:false`; physical UNKNOWN and #6 acoustic qualification remain open.
+Author self-review is not an independent review. #12/#14 at `226ff98` stay separate.

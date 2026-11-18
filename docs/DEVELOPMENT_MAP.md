@@ -25,7 +25,10 @@ keep-recording. Read it alongside both preserved source/journal notes. It record
 actual cross-language coverage separately from serializer/standalone/physical gates.
 #14 remains separate. The combined note's R1 section covers source-specific native
 Stop revocation/confirmed-exit authority and durable routed Stop through Controls'
-initial state sync, including queued native-lock and remount regressions.
+initial state sync, including queued native-lock and remount regressions. Its R2
+section supersedes startup reconstruction/first-wins routing with provisional native
+admission continuity, non-restarting live Settings and distinct generation-bound
+manual Stop intents; it records the actual Settings command-path fixture limits.
 
 Zoom's source-specific AX candidate, composable lifecycle snapshots, session-bound
 start/Stop ownership, manual override and provisional timing are documented in

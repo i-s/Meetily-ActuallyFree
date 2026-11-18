@@ -18,11 +18,13 @@ let fallbackStops = 0;
 const noop = () => {};
 mock.module('@tauri-apps/api/core', () => ({ invoke: async (name: string, args: any) => {
   calls.push({ name, args });
+  if (name === 'get_recording_state') return { is_recording: !!current, is_stopping: false, recording_lease: current };
   if (name === 'get_audio_devices') return [];
   if (name === 'get_recording_preferences') return {};
   if (name === 'get_database_directory') { await dataGate; return '/synthetic'; }
   if (name === 'stop_recording') {
     if (failStopOnce) { failStopOnce = false; throw new Error('Synthetic Stop transport failure'); }
+    if (args.args.manual_generation && args.args.manual_generation !== current?.generation) return false;
     if (args.args.expected && (!enabled || JSON.stringify(args.args.expected) !== JSON.stringify(current))) return false;
     current = null; return true;
   }
@@ -92,8 +94,20 @@ test('explicit manual routed Stop can be retried after a transport failure witho
   await act(async () => { view = create(<RecordingControls {...props} />); });
   try {
     await act(async () => { requestRecordingStop(noop); await flush(); });
-    expect(current).toEqual(a); expect(successes).toBe(0); expect(fallbackStops).toBe(1);
+    expect(current).toEqual(a); expect(successes).toBe(0); expect(fallbackStops).toBe(0);
     await act(async () => { requestRecordingStop(noop); await flush(); });
-    expect(current).toBeNull(); expect(successes).toBe(1); expect(fallbackStops).toBe(1);
+    expect(current).toBeNull(); expect(successes).toBe(1); expect(fallbackStops).toBe(0);
+  } finally { act(() => view.unmount()); }
+});
+
+
+test('R2 explicit manual B is not dropped behind stale guarded A before initial sync', async () => {
+  reset(); current = b; window.location.pathname = '/library';
+  requestRecordingStop(noop, a); requestRecordingStop(noop); window.location.pathname = '/';
+  let view!: ReturnType<typeof create>;
+  await act(async () => { view = create(<RecordingControls {...props} isRecording={false} />); await flush(); });
+  try {
+    await act(async () => { view.update(<RecordingControls {...props} />); await flush(); });
+    expect(current).toBeNull(); expect(successes).toBe(1); expect(stopInitiated).toBe(1);
   } finally { act(() => view.unmount()); }
 });

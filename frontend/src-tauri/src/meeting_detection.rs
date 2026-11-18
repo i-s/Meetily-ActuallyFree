@@ -156,8 +156,11 @@ pub(crate) fn publish_automation_observation(source: &str, qualified: bool,
         source_automation_enabled(settings.as_ref(), source), qualified, presence);
 }
 
-fn apply_automation_settings(settings: &MeetingDetectionSettings) {
+fn apply_automation_settings(settings: &MeetingDetectionSettings) -> bool {
     let mut guard = SETTINGS.lock().unwrap();
+    let restart = settings.enabled && (MONITOR_PAUSED.load(Ordering::SeqCst)
+        || MONITOR_GENERATION.load(Ordering::SeqCst) == 0
+        || !guard.as_ref().is_some_and(|previous| previous.enabled));
     // Revoke before publishing settings, at the same authority mutex used
     // by Stop claim. Re-enable cannot restore the current take's authority.
     for source in ["zoom", "discord"] {
@@ -165,6 +168,7 @@ fn apply_automation_settings(settings: &MeetingDetectionSettings) {
             source_automation_enabled(Some(settings), source));
     }
     *guard = Some(settings.clone());
+    restart
 }
 
 /// Payload emitted when a meeting app is detected.
@@ -574,11 +578,13 @@ pub async fn set_meeting_detection_settings<R: Runtime>(
     settings.interval_secs = settings.interval_secs.clamp(3, 3600);
 
     save_settings_to_disk(&settings)?;
-    apply_automation_settings(&settings);
+    let restart = apply_automation_settings(&settings);
 
-    // Apply immediately: (re)start or stop the monitor.
+    // The worker reads live settings each poll. Restarting for Discord-only,
+    // notification or interval changes would suspend/revoke an unrelated Zoom
+    // take. Actual enable/resume and explicit restart still suspend normally.
     if settings.enabled {
-        start_monitor(&app);
+        if restart { start_monitor(&app); }
     } else {
         MONITOR_GENERATION.fetch_add(1, Ordering::SeqCst);
         crate::audio::recording_ownership::set_meeting_automation_enabled(false);

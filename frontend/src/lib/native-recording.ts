@@ -11,9 +11,10 @@ export interface NativeRecordingState {
 /** A rejected automated stop has NO frontend stop/postprocessing effects. The
  * native engine lock performs the decisive comparison, not this WebView check.
  */
-export async function stopRecordingRequest(savePath: string, expected?: RecordingLease): Promise<boolean> {
+export async function stopRecordingRequest(savePath: string, expected?: RecordingLease, manualGeneration?: string): Promise<boolean> {
   return invoke<boolean>('stop_recording', { args: {
     save_path: savePath,
     ...(expected ? { expected } : {}),
+    ...(manualGeneration ? { manual_generation: manualGeneration } : {}),
   } });
 }

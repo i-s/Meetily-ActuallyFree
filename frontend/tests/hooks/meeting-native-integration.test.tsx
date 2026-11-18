@@ -35,6 +35,11 @@ let replyGate: Promise<void> | undefined;
 let committedSignal: (() => void) | undefined;
 let stopGate: Promise<void> | undefined;
 let modelGate: Promise<void> | undefined;
+let databaseGate: Promise<void> | undefined;
+let databaseEntered: (() => void) | undefined;
+let stateGate: Promise<void> | undefined;
+let stateCaptured: (() => void) | undefined;
+let failManualStopOnce = false;
 let lives = 0, stopped = 0, successes = 0, stopInitiated = 0;
 let notices: { text: string; options: any }[] = [];
 const calls: { name: string; args: any }[] = [];
@@ -44,12 +49,14 @@ async function invokeNative(name: string, args: any = {}) {
   if (name === 'check_transcription_runtime') { await modelGate; return; }
   if (name === 'parakeet_has_available_models' || name === 'parakeet_is_model_loaded') return true;
   if (name === 'parakeet_init') return;
-  if (name === 'get_database_directory') return data;
+  if (name === 'get_database_directory') { databaseEntered?.(); await databaseGate; return data; }
   if (name === 'get_audio_devices') return [];
   if (name === 'get_recording_preferences') return {};
+  if (name === 'stop_recording' && args.args?.manual_generation && failManualStopOnce) { failManualStopOnce = false; throw new Error('Synthetic manual Stop transport failure'); }
   if (name === 'stop_recording') await stopGate;
   const gate = name === 'start_recording_with_devices_and_meeting' ? replyGate : undefined;
   const value = await rpc(name, args);
+  if (name === 'get_recording_state') { stateCaptured?.(); await stateGate; }
   if (name === 'start_recording_with_devices_and_meeting') { committedSignal?.(); await gate; }
   if (name === 'start_recording_with_devices_and_meeting' && loseReply) throw new Error('Synthetic lost IPC response after native commit');
   return value;
@@ -79,8 +86,13 @@ mock.module('@/components/groups/GroupBits', () => ({ GroupPicker: () => null })
 mock.module('@/components/ui/tooltip', () => ({ Hint: ({ children }: any) => children }));
 const toast = Object.assign((text: string, options: any) => { notices.push({ text, options }); }, { error: noop, info: noop });
 mock.module('sonner', () => ({ toast }));
+const stopReviewBaseline = process.env.MEETILY_STOP_REVIEW_BASELINE;
+if (stopReviewBaseline) {
+  const launchBaseline = await import(`${stopReviewBaseline}/recording-launch.ts`);
+  mock.module('@/lib/recording-launch', () => launchBaseline);
+}
 const { useRecordingStart } = await import('../../src/hooks/useRecordingStart');
-const { RecordingControls } = await import('../../src/components/RecordingControls');
+const { RecordingControls } = stopReviewBaseline ? await import(`${stopReviewBaseline}/RecordingControls.tsx`) : await import('../../src/components/RecordingControls');
 const automation = await import('../../src/lib/meeting-automation');
 const { recoverAutomatedStart } = await import('../../src/lib/recording-start-recovery');
 const { launchRecording, requestRecordingStop } = await import('../../src/lib/recording-launch');
@@ -144,7 +156,8 @@ describe.skipIf(!binary)('combined mounted hook/service -> Rust production autho
   beforeEach(async () => {
     await rpc('fixture_reset');
     store.clear(); calls.length = 0; lives = stopped = successes = stopInitiated = 0; notices = [];
-    enabled = true; loseReply = false; stopGate = modelGate = replyGate = undefined; committedSignal = undefined; window.location.pathname = '/';
+    enabled = true; loseReply = failManualStopOnce = false; stopGate = modelGate = replyGate = databaseGate = stateGate = undefined;
+    databaseEntered = stateCaptured = undefined; committedSignal = undefined; window.location.pathname = '/';
     await fixture('zoom', null, 'unknown', false); await fixture('discord', null, 'unknown', false);
   });
 
@@ -415,7 +428,7 @@ describe.skipIf(!binary)('combined mounted hook/service -> Rust production autho
     view = await mount(false);
     await act(async () => {
       requestRecordingStop(noop, lease);
-      events.dispatchEvent(new CustomEvent('af-stop-recording', { detail: { kind: 'manual' } }));
+      events.dispatchEvent(new CustomEvent('af-stop-recording', { detail: lease }));
     });
     await drain(); expect((await rpc('fixture_counts')).saves).toBe(0);
     await act(async () => { view.update(<RecordingSurface recording={true} />); }); await drain();
@@ -444,6 +457,168 @@ describe.skipIf(!binary)('combined mounted hook/service -> Rust production autho
     expect((await rpc('fixture_counts')).saves).toBe(1); expect(successes).toBe(1); expect(stopInitiated).toBe(1);
     expect(calls.filter(c => c.name === 'stop_recording').at(-1)?.args.args.expected).toBeUndefined();
     act(() => view.unmount());
+  });
+
+  for (const source of ['zoom', 'discord'] as const) {
+    for (const revocation of ['source', 'labs', 'qualification', 'competing'] as const) {
+      test(`R2 ${source}: ${revocation} off/on during admitted capture cannot resurrect Stop at lease commit`, async () => {
+        const view = await mount();
+        try {
+          await fixture(source, 'admitted-revoked'); await rpc('fixture_hold_commit');
+          const reserved = reserve(source, 'admitted-revoked');
+          await act(async () => { launchRecording(noop, { automated: reserved }); });
+          await rpc('fixture_entered');
+          if (revocation === 'source') await fixture(source, 'admitted-revoked', 'active', true, false);
+          else if (revocation === 'labs') await rpc('set_meeting_automation_enabled', { enabled: false });
+          else if (revocation === 'qualification') await fixture(source, 'admitted-revoked', 'active', false);
+          else await fixture(source, 'competing-startup-session', 'active');
+          await rpc('set_meeting_automation_enabled', { enabled: true });
+          await fixture(source, 'admitted-revoked', 'active'); // same A republished before commit
+          await rpc('fixture_release'); await drain();
+          const lease = (await recordingService.getRecordingState()).recording_lease!;
+          await fixture(source, source === 'zoom' ? null : 'admitted-revoked', 'inactive');
+          await act(async () => { requestRecordingStop(noop, lease); }); await drain();
+          expect((await rpc('fixture_counts')).saves).toBe(0);
+          expect((await recordingService.getRecordingState()).recording_lease).toEqual(lease);
+          expect(successes).toBe(0); await stopManual();
+        } finally { act(() => view.unmount()); }
+      });
+    }
+    test(`R2 ${source}: unrelated Settings command does not revoke Stop or restart a running monitor`, async () => {
+      const view = await mount();
+      try {
+        const { lease } = await start(source, 'settings-owner');
+        const before = await rpc('fixture_monitor_counts');
+        const settings = await rpc('get_meeting_detection_settings');
+        const other = source === 'zoom' ? 'discord_automation' : 'zoom_automation';
+        await rpc('set_meeting_detection_settings', { settings: { ...settings, [other]: false, notify: !settings.notify, interval_secs: 31 } });
+        const after = await rpc('fixture_monitor_counts');
+        await fixture(source, source === 'zoom' ? null : 'settings-owner', 'inactive');
+        await act(async () => { requestRecordingStop(noop, lease); }); await drain();
+        expect((await rpc('fixture_counts')).saves).toBe(1);
+        expect(after.spawns).toBe(before.spawns);
+      } finally { act(() => view.unmount()); }
+    });
+  }
+
+  for (const source of ['zoom', 'discord'] as const) {
+    for (const setting of ['source', 'global'] as const) {
+      test(`R2 ${source}: real Settings ${setting} disable/reenable remains revoked, later End cannot restore it`, async () => {
+        const view = await mount();
+        try {
+          const { lease } = await start(source, `settings-${setting}`);
+          const settings = await rpc('get_meeting_detection_settings');
+          const key = setting === 'global' ? 'enabled' : source === 'zoom' ? 'zoom_automation' : 'discord_automation';
+          await rpc('set_meeting_detection_settings', { settings: { ...settings, [key]: false } });
+          await rpc('set_meeting_detection_settings', { settings });
+          await rpc('set_meeting_automation_enabled', { enabled: true });
+          await fixture(source, `settings-${setting}`, 'active');
+          await fixture(source, source === 'zoom' ? null : `settings-${setting}`, 'inactive');
+          await act(async () => { requestRecordingStop(noop, lease); }); await drain();
+          expect((await rpc('fixture_counts')).saves).toBe(0); expect(successes).toBe(0);
+          expect((await recordingService.getRecordingState()).recording_lease).toEqual(lease);
+          await stopManual();
+        } finally { act(() => view.unmount()); }
+      });
+    }
+  }
+
+  test('R2 distinct manual B survives queued stale guarded A, initial false and remount', async () => {
+    let view = await mount();
+    try {
+      const { lease: a } = await start('zoom', 'manual-collision-A');
+      await stopManual(); await act(async () => { await manualStart(); }); await drain();
+      const b = (await recordingService.getRecordingState()).recording_lease!;
+      act(() => view.unmount()); window.location.pathname = '/library'; requestRecordingStop(noop, a);
+      requestRecordingStop(noop); window.location.pathname = '/';
+      view = await mount(false); await drain(); act(() => view.unmount()); view = await mount(false); await drain();
+      expect((await recordingService.getRecordingState()).recording_lease).toEqual(b);
+      await act(async () => { view.update(<RecordingSurface recording={true} />); }); await drain();
+      expect((await rpc('fixture_counts')).saves).toBe(2);
+      expect((await recordingService.getRecordingState()).is_recording).toBe(false);
+      expect(calls.filter(c => c.name === 'stop_recording').some(c => JSON.stringify(c.args.args.expected) === JSON.stringify(a))).toBe(true);
+      expect(successes).toBe(1); expect(stopInitiated).toBe(1);
+    } finally { act(() => view.unmount()); }
+  });
+
+  test('R2 successful guarded A completes once and distinct manual intent cannot stop next C after remount', async () => {
+    let view = await mount();
+    try {
+      const { lease: a } = await start('discord', 'manual-after-success-A');
+      await fixture('discord', 'manual-after-success-A', 'inactive');
+      act(() => view.unmount()); window.location.pathname = '/library'; requestRecordingStop(noop, a); requestRecordingStop(noop); window.location.pathname = '/';
+      view = await mount(false); await drain();
+      await act(async () => { view.update(<RecordingSurface recording={true} />); }); await drain();
+      expect((await rpc('fixture_counts')).saves).toBe(1);
+      await recoverAutomatedStart(); await act(async () => { await manualStart(); }); await drain();
+      const c = (await recordingService.getRecordingState()).recording_lease;
+      act(() => view.unmount()); view = await mount(true); await drain();
+      expect((await recordingService.getRecordingState()).recording_lease).toEqual(c);
+      expect((await rpc('fixture_counts')).saves).toBe(1);
+    } finally { act(() => view.unmount()); }
+  });
+
+  test('R2 same manual intent deduplicates across storage/events but distinct IDs survive; retry remains explicit', async () => {
+    const view = await mount(false);
+    try {
+      await act(async () => { await manualStart(); }); await drain();
+      const generation = (await recordingService.getRecordingState()).recording_lease!.generation;
+      const first = requestRecordingStop(noop)!; await drain();
+      const intent = JSON.parse(store.get('af-stop-requested')!).requests.find((r: any) => r.id === first);
+      await act(async () => {
+        events.dispatchEvent(new CustomEvent('af-stop-recording', { detail: intent }));
+        events.dispatchEvent(new CustomEvent('af-stop-recording', { detail: intent }));
+      });
+      expect(JSON.parse(store.get('af-stop-requested')!).requests.filter((r: any) => r.id === first)).toHaveLength(1);
+      failManualStopOnce = true;
+      await act(async () => { view.update(<RecordingSurface recording={true} />); }); await drain();
+      expect((await rpc('fixture_counts')).saves).toBe(0);
+      const retry = requestRecordingStop(noop); expect(retry).not.toBe(first); await drain();
+      expect((await rpc('fixture_counts')).saves).toBe(1); expect(successes).toBe(1); expect(stopInitiated).toBe(1);
+      expect(calls.filter(c => c.name === 'stop_recording').every(c => c.args.args.manual_generation === generation)).toBe(true);
+      await act(async () => { events.dispatchEvent(new CustomEvent('af-stop-recording', { detail: intent })); }); await drain();
+      expect((await rpc('fixture_counts')).saves).toBe(1);
+    } finally { act(() => view.unmount()); }
+  });
+
+  test('R2 delayed manual binding reply stays B across remount, never reacquires C', async () => {
+    let view = await mount(false);
+    try {
+      await act(async () => { await manualStart(); }); await drain();
+      const b = (await recordingService.getRecordingState()).recording_lease!;
+      let deliver!: () => void; stateGate = new Promise(resolve => { deliver = resolve; });
+      const captured = new Promise<void>(resolve => { stateCaptured = resolve; });
+      requestRecordingStop(noop); await captured; stateCaptured = undefined; stateGate = undefined;
+      await rpc('stop_recording', { args: { save_path: `${data}/external-B.wav` } });
+      const c = await rpc('start_recording_with_devices_and_meeting');
+      act(() => view.unmount()); view = await mount(false);
+      deliver(); await drain();
+      await act(async () => { view.update(<RecordingSurface recording={true} />); }); await drain();
+      expect((await recordingService.getRecordingState()).recording_lease).toEqual(c);
+      expect((await rpc('fixture_counts')).saves).toBe(1); expect(successes).toBe(0); expect(stopInitiated).toBe(0);
+      expect(calls.filter(c => c.name === 'stop_recording').at(-1)?.args.args.manual_generation).toBe(b.generation);
+    } finally { act(() => view.unmount()); }
+  });
+
+  test('R2 stale A plus manual B delayed at directory cannot stop next C', async () => {
+    let view = await mount();
+    try {
+      const { lease: a } = await start('zoom', 'late-manual-A');
+      await stopManual(); await act(async () => { await manualStart(); }); await drain();
+      const b = (await recordingService.getRecordingState()).recording_lease!;
+      act(() => view.unmount()); window.location.pathname = '/library'; requestRecordingStop(noop, a); requestRecordingStop(noop); window.location.pathname = '/';
+      view = await mount(false); await drain();
+      let release!: () => void; databaseGate = new Promise(resolve => { release = resolve; });
+      const entered = new Promise<void>(resolve => { databaseEntered = resolve; });
+      await act(async () => { view.update(<RecordingSurface recording={true} />); }); await entered; databaseEntered = undefined;
+      await rpc('stop_recording', { args: { save_path: `${data}/external-late-B.wav` } });
+      const c = await rpc('start_recording_with_devices_and_meeting');
+      databaseGate = undefined; release(); await drain();
+      expect((await recordingService.getRecordingState()).recording_lease).toEqual(c);
+      expect((await rpc('fixture_counts')).saves).toBe(2); expect(successes).toBe(0); expect(stopInitiated).toBe(0);
+      expect(calls.filter(c => c.name === 'stop_recording').at(-1)?.args.args.manual_generation).toBe(b.generation);
+      expect(calls.filter(c => c.name === 'stop_recording').some(c => JSON.stringify(c.args.args.expected) === JSON.stringify(a))).toBe(true);
+    } finally { act(() => view.unmount()); }
   });
 
   test('future barrier error retains fence; stopping/busy receipt never unlocks; valid cancellation eventually admits B', async () => {

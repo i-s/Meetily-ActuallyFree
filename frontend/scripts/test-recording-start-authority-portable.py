@@ -21,7 +21,7 @@ def prepare(work):
     start = source[source.index('pub async fn start_recording_with_lifecycle<R: Runtime>'):]
     prefix = start[:start.index('    crate::onnx_runtime::ensure_available()')]
     boundary = start[start.index('    // Model/device setup may outlive'):start.index('    let transcription_receiver = manager')]
-    commit = start[start.index('    let recording_lease = super::recording_ownership::begin(lifecycle_owner);'):start.index('    // Live speaker identification:')]
+    commit = start[start.index('    let recording_lease = match stop_admission'):start.index('    // Live speaker identification:')]
     barriers = source[source.index('pub async fn resolve_automated_recording_start('):source.index('/// Stop recording with optimized graceful shutdown')].replace('#[tauri::command]', '')
     types = source[source.index('#[derive(Debug, Deserialize)]\npub struct RecordingArgs'):source.index('#[derive(Debug, Serialize, Clone)]\npub struct TranscriptionStatus')]
     stop = source[source.index('pub async fn stop_recording<R: Runtime>'):source.index('    if IS_STOPPING\n        .compare_exchange')]
@@ -86,6 +86,10 @@ pub fn get_discord_automation_status()->Status{STATUS.lock().unwrap().clone().un
 ''' + owner)
     detection = (ROOT / 'frontend/src-tauri/src/meeting_detection.rs').read_text()
     permissions = detection[detection.index('fn source_automation_enabled('):detection.index('/// Payload emitted')]
+    settings_types = detection[detection.index('#[derive(Clone, Debug, Serialize, Deserialize)]'):detection.index('/// Map a matched keyword')]
+    monitor = detection[detection.index('fn start_monitor<R: Runtime>'):detection.index('/// Called once at app startup')]
+    payloads = detection[detection.index('/// Payload emitted'):detection.index('/// True for our own process')]
+    settings_commands = detection[detection.index('pub async fn get_meeting_detection_settings()'):].replace('#[tauri::command]', '')
     manager = '''
 struct Manager;
 impl Manager {
@@ -138,8 +142,17 @@ pub static RELEASE:tokio::sync::Semaphore=tokio::sync::Semaphore::const_new(0);
 }
 ''' + snapshot)
     (work / 'src/lib.rs').write_text(f'''#![allow(dead_code,unused_variables)]
-pub trait Runtime {{}} impl Runtime for () {{}}
+extern crate self as tauri;
+pub trait Runtime:Send+Sync+'static {{}} impl Runtime for () {{}}
 pub struct AppHandle<R:Runtime>(pub std::marker::PhantomData<R>);
+impl<R:Runtime> Clone for AppHandle<R>{{fn clone(&self)->Self{{Self(std::marker::PhantomData)}}}}
+pub static MONITOR_SPAWNS:std::sync::atomic::AtomicU64=std::sync::atomic::AtomicU64::new(0);
+pub static EVENTS:std::sync::Mutex<Vec<serde_json::Value>>=std::sync::Mutex::new(Vec::new());
+pub trait Emitter {{fn emit<S:serde::Serialize+Clone>(&self,name:&str,value:S)->Result<(),String>{{
+ EVENTS.lock().unwrap().push(serde_json::json!({{"name":name,"payload":value}}));Ok(())
+}}}}
+impl<R:Runtime> Emitter for AppHandle<R>{{}}
+pub mod async_runtime {{pub fn spawn<F:std::future::Future+Send+'static>(_:F){{super::MONITOR_SPAWNS.fetch_add(1,std::sync::atomic::Ordering::SeqCst);}}}}
 pub mod audio {{
  #[path="{work}/src/recording_ownership.rs"] pub mod recording_ownership;
  #[path="{work}/src/recording_start_authority.rs"] pub mod recording_start_authority;
@@ -155,9 +168,10 @@ pub mod audio {{
 mod diarization{{pub mod online{{pub fn stop(){{}}}}}}
 pub mod meeting_detection {{
  use std::sync::atomic::{{AtomicBool,Ordering}};
- #[derive(Clone)]
- pub struct MeetingDetectionSettings {{enabled:bool,zoom_automation:bool,discord_automation:bool,meeting_apps:Vec<String>,ignored_apps:Vec<String>}}
- static SETTINGS:std::sync::LazyLock<std::sync::Mutex<Option<MeetingDetectionSettings>>>=std::sync::LazyLock::new(||std::sync::Mutex::new(Some(MeetingDetectionSettings{{enabled:true,zoom_automation:true,discord_automation:true,meeting_apps:vec!["zoom".into()],ignored_apps:vec![]}})));
+ use serde::{{Serialize,Deserialize}};
+ use crate::{{AppHandle,Emitter,Runtime}};
+ {settings_types}
+ static SETTINGS:std::sync::LazyLock<std::sync::Mutex<Option<MeetingDetectionSettings>>>=std::sync::LazyLock::new(||std::sync::Mutex::new(Some(MeetingDetectionSettings{{enabled:true,zoom_automation:true,discord_automation:true,..MeetingDetectionSettings::default()}})));
  static MONITOR_PAUSED:AtomicBool=AtomicBool::new(false);
  // Fixture transport feeds the actual production settings publication body.
  pub struct OptIn;
@@ -169,6 +183,12 @@ pub mod meeting_detection {{
   apply_automation_settings(&settings);
  }}
  {permissions}
+ {payloads}
+ fn save_settings_to_disk(_settings:&MeetingDetectionSettings)->Result<(),String>{{Ok(())}}
+ fn load_settings_from_disk()->MeetingDetectionSettings{{MeetingDetectionSettings::default()}}
+ fn scan_for_meeting_app(_settings:&MeetingDetectionSettings)->Option<(String,String,bool)>{{None}}
+ {monitor}
+ {settings_commands}
  static MONITOR_GENERATION:std::sync::atomic::AtomicU64=std::sync::atomic::AtomicU64::new(0);
  #[path="{ROOT}/frontend/src-tauri/src/meeting_detection/evidence.rs"] pub mod evidence;
  #[path="{work}/src/zoom_observation.rs"] pub mod zoom_observation;
