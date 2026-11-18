@@ -12,3 +12,5 @@ pub mod vocabulary;
 pub mod library;
 
 pub(crate) mod speaker_identity;
+
+pub mod action_sync;

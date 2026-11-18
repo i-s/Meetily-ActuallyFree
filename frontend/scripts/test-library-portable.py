@@ -59,12 +59,14 @@ def main():
         helpers = person[person.index('fn escape_like'):person.index('pub(crate) fn snippet_around')]
         identity = person if 'pub(crate) fn normalize_person_name' in person else (REPO / 'speaker_identity.rs').read_text()
         normalize = identity[identity.index('pub(crate) fn normalize_person_name'):identity.index('pub(crate) fn is_person_name')]
-        (work / 'src/person.rs').write_text('use sqlx::SqlitePool; use std::cmp::Ordering; use crate::state::AppState; const DEFAULT_SEARCH_LIMIT:i64=40; const MAX_SEARCH_LIMIT:i64=100;\n' + dto + ranking + 'impl PeopleRepository {\n' + search + '}\n' + global_command + normalize + helpers + visible + '\n' + snippet)
-        for name in ('meeting_notes', 'notes_document'):
+        (work / 'src/person.rs').write_text('use sqlx::SqlitePool; use std::cmp::Ordering; use crate::state::AppState; const DEFAULT_SEARCH_LIMIT:i64=40; const MAX_SEARCH_LIMIT:i64=100;\n' + dto + ranking + 'impl PeopleRepository {\n' + search + '}\n' + global_command + normalize + helpers + visible + '\n' + snippet + ('\npub(crate) use super::speaker_identity::is_person_name;\n' if with_versions else ''))
+        for name in ('meeting_notes', 'notes_document', *(['action_item', 'action_sync'] if with_versions else [])):
             notes_source = (REPO / f'{name}.rs').read_text().replace('#[tauri::command]', '')
             notes_source = notes_source.replace("tauri::State<'_, crate::state::AppState>", '&crate::state::AppState')
             notes_source = notes_source.replace('../../../migrations/', str(ROOT / 'frontend/src-tauri/migrations') + '/')
             (work / 'src' / f'{name}.rs').write_text(notes_source)
+        version_alias = 'pub(crate) use crate::transcript_versions;' if with_versions else ''
+        action_modules = f'#[path="{work}/src/action_item.rs"] pub mod action_item;\n#[path="{work}/src/action_sync.rs"] pub mod action_sync;' if with_versions else ''
         commands = (ROOT / 'frontend/src-tauri/src/database/library_commands.rs').read_text().replace('#[tauri::command]\n', '')
         commands = commands.replace("tauri::State<'_, AppState>", '&AppState').replace('use super::repositories::library;', 'use crate::database::repositories::library;')
         (work / 'src/commands.rs').write_text(commands)
@@ -88,16 +90,18 @@ tokio={{version="={versions['tokio']}",features=["macros", "rt-multi-thread", "s
         (work / 'src/lib.rs').write_text(f'''
 {extra_modules}
 mod state {{ pub struct Db(pub sqlx::SqlitePool); impl Db {{ pub fn pool(&self)->&sqlx::SqlitePool{{&self.0}} }} pub struct AppState{{pub db_manager:Db}} }}
-mod database {{ pub mod repositories {{
+mod database {{ {version_alias} pub mod repositories {{
 #[path="{work}/src/person.rs"] pub mod person;
 #[path="{REPO}/library.rs"] pub mod library;
 #[path="{work}/src/meeting_notes.rs"] pub mod meeting_notes;
 #[path="{work}/src/notes_document.rs"] pub mod notes_document;
 {identity_module}
+{action_modules}
 }} }}
 #[path="{work}/src/commands.rs"] mod commands;
 #[path="{work}/src/migrations.rs"] mod migrations;
 #[cfg(test)] #[path="{ROOT}/frontend/tests/native/library.rs"] mod tests;
+#[cfg(all(test, feature="versions"))] #[path="{ROOT}/frontend/tests/native/action-sync.rs"] mod action_sync_tests;
 ''')
         # Reuse the workspace lock versions; Cargo removes unused entries and
         # adds only this fixture's root. The second invocation is locked.

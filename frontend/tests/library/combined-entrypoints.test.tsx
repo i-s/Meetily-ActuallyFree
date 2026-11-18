@@ -30,6 +30,8 @@ let savedSummary='Stored summary', archivedSummary='', mutations=0, failNotes=fa
 let holdNotes=false, holdSummary=false, holdWrite=false, failNotesConversion=false;
 const conversions:Array<{kind:string;resolve:(value:string)=>void}> = [];
 let releaseWrite:(()=>void)|undefined;
+let actionWait:Promise<void>|null=null, actionReplyWait:Promise<void>|null=null, actionStarted=false, summaryToken=0, summaryExists=true;
+let actionRows:any[]=[];
 const documents=new Map<string,any>();
 const calls:Array<[string,any]>=[];
 const rows=()=>[{id:selectedRowId,text:selectedText,speaker:'You',audio_start_time:1,audio_end_time:2}];
@@ -50,11 +52,21 @@ const transport=async(name:string,args:any):Promise<any>=>{
  if(name==='list_transcript_versions')return {selected_id:version?'new':'live',revision:7+version,audio_available:true,versions:[{id:'new',kind:'refined',status:'ready',created_at:'2026-11-18',settings_json:'{"recording_metadata":{"in_person":false},"source_map":{"new-line":"microphone"}}'}]};
  if(name==='get_transcript_version')return [{id:'new-line',text:'Selected text',speaker:'You'}];
  if(name==='get_selected_transcript')return {version_id:version?'new':'live',revision:7+version,settings_json:'{"source_map":{"new-line":"microphone"}}',segments:rows()};
+ if(name==='api_action_sync_context')return !summaryExists?null:{meetingId:args.meetingId,versionId:version?'new':'live',revision:7+version,summaryToken:String(summaryToken),summary:{markdown:savedSummary},transcripts:rows()};
+ if(name==='api_sync_ai_action_items'||name==='api_commit_action_sync'){
+  actionStarted=true;if(actionWait)await actionWait;
+  if(name==='api_commit_action_sync'){
+   if(args.context.revision!==7+version||args.context.summaryToken!==String(summaryToken))return null;
+   if(args.summary){savedSummary=args.summary.markdown;summaryToken++;}
+  }
+  if(actionReplyWait)await actionReplyWait;
+  return [];
+ }
  if(name==='api_get_meeting_summary_language')return {language:null,storage:'metadata'};
- if(name==='api_save_meeting_summary'){if(failSummary)throw new Error('Summary storage unavailable');savedSummary=args.summary.markdown;return;}
+ if(name==='api_save_meeting_summary'){if(failSummary)throw new Error('Summary storage unavailable');if(summaryExists){savedSummary=args.summary.markdown;summaryToken++;}return;}
  if(name==='select_transcript_version'||name==='correct_transcript_text'){
   if(pendingSummary)throw new Error('Wait for or cancel summary generation before selecting a transcript version');
-  archivedSummary=savedSummary;savedSummary='';version++;mutations++;if(name==='select_transcript_version'){selectedText='Selected text';selectedRowId='new-line';}else selectedText=args.text;return;
+  archivedSummary=savedSummary;savedSummary='';summaryExists=false;summaryToken++;version++;mutations++;if(name==='select_transcript_version'){selectedText='Selected text';selectedRowId='new-line';}else selectedText=args.text;return;
  }
  if(name==='api_export_meeting_snapshot'){
   const notes=structuredClone(documents.get(`meeting:${args.meetingId}`)??{markdown:'',json:null,revision:0});
@@ -86,8 +98,7 @@ mock.module('@/contexts/ConfigContext',()=>({useConfig:()=>({modelConfig:{model:
 mock.module('@/contexts/WorkspaceContext',()=>({useWorkspace:()=>({people:[],groups:[],groupById:()=>null})}));
 mock.module('@/contexts/ImportDialogContext',()=>({useImportDialog:()=>({openImportDialog(){}})}));
 let navigated='';mock.module('next/navigation',()=>({useRouter:()=>({push:(href:string)=>{navigated=href;}})}));
-mock.module('@/lib/workspace-api',()=>({getMeetingGroup:async()=>null,setMeetingGroup:async()=>{},announceChange(){},listActionItems:async()=>[],onWorkspaceChange:()=>()=>{},askMeeting:async()=>{}}));
-mock.module('@/lib/action-item-sync',()=>({syncMeetingActionItems:async()=>({})}));
+mock.module('@/lib/workspace-api',()=>({getMeetingGroup:async()=>null,setMeetingGroup:async()=>{},announceChange(){},listActionItems:async()=>structuredClone(actionRows),onWorkspaceChange:()=>()=>{},askMeeting:async()=>{},syncAiActionItems:(meetingId:string,items:any,sourceFingerprint:string)=>transport('api_sync_ai_action_items',{meetingId,items,sourceFingerprint}),listUnsyncedActionMeetings:async()=>[]}));
 mock.module('@/hooks/meeting-details/useSummaryGeneration',()=>({useSummaryGeneration:()=>({summaryStatus:'idle',summaryError:null,getSummaryStatusMessage:()=>'',handleGenerateSummary:async()=>{},handleRegenerateSummary:async()=>{},handleStopGeneration(){}})}));
 mock.module('@/hooks/meeting-details/useTemplates',()=>({useTemplates:()=>({selectedTemplate:'standard',availableTemplates:[]})}));
 mock.module('@/hooks/meeting-details/useMeetingOperations',()=>({useMeetingOperations:()=>({})}));
@@ -102,7 +113,7 @@ mock.module('@/components/MeetingDetails/PostCallProcessingDialog',()=>({PostCal
 mock.module('@/components/MeetingDetails/TemplateEditorModal',()=>({TemplateEditorModal:empty}));
 mock.module('@/components/people/PersonCard',()=>({PersonCard:empty}));
 mock.module('@/components/people/SpeakerIdentityDialog',()=>({SpeakerIdentityDialog:empty}));
-mock.module('@/components/actions/ActionItemsList',()=>({ActionItemsList:empty}));
+mock.module('@/components/actions/ActionItemsList',()=>({ActionItemsList:({items,onItemsChange}:any)=><pre aria-label="Action rows" onClick={()=>onItemsChange(actionRows)}>{JSON.stringify(items)}</pre>}));
 mock.module('@/components/chat/ChatThread',()=>({ChatThread:empty}));
 mock.module('@/components/LanguagePickerPopover',()=>({LanguagePickerPopover:empty}));
 mock.module('@/components/ModelSettingsModal',()=>({ModelSettingsModal:empty}));
@@ -144,9 +155,11 @@ const {default:MeetingsPage}=await import('../../src/app/meetings/page');
 const {default:PageContent}=await import('../../src/app/meeting-details/page-content');
 const {createNotesStore,flushNotes,getNotesSnapshot,notesForContext}=await import('../../src/lib/notes-store');
 let root:ReactTestRenderer|undefined;
+let navigateView:(id:string,summary:string)=>void;
 function Page(){
  const [meeting,setMeeting]=useState({id:active,title:'Meeting',created_at:'2026-11-18',transcripts:rows()});
  const [summary,setSummary]=useState<any>({markdown:savedSummary});
+ navigateView=(id,markdown)=>{setMeeting({id,title:'Meeting',created_at:'2026-11-18',transcripts:rows()});setSummary({markdown});};
  return <PageContent meeting={meeting} summaryData={summary} onSummaryInvalidated={()=>setSummary(null)} onRefetchTranscripts={async()=>{setMeeting({...meeting,transcripts:rows()});}}/>;
 }
 const button=(text:string)=>root!.root.findAllByType('button').find(n=>typeof n.props.children==='string'&&n.props.children.includes(text))!;
@@ -155,7 +168,7 @@ const ready=async()=>{await act(async()=>{for(const fn of [...timers.values()])f
 async function mount(seed=true){active=`combined-${++seq}`;if(seed)documents.set(`meeting:${active}`,{markdown:'Stored notes',json:null,revision:1,source:'user_notes'});await act(async()=>{root=create(<Page/>);});await ready();await act(async()=>{await flushNotes(`meeting:${active}`);});}
 async function review(operation:string){await act(async()=>button(operation==='select'?'Review snapshot':'Correct selected text').props.onClick());}
 const mutate=(operation:string)=>button(operation==='select'?'Save current corrections':'Save text correction').props.onClick();
-afterEach(async()=>{holdNotes=false;holdSummary=false;holdWrite=false;failNotes=false;failSummary=false;pendingSummary=false;failNotesConversion=false;releaseWrite?.();for(const p of conversions.splice(0))p.resolve(richMarkdown);await act(async()=>root?.unmount());root=undefined;timers.clear();storeTimers.clear();storage.clear();documents.clear();calls.length=0;reloads=0;mutations=0;version=0;selectedText='Live text';selectedRowId='old-line';written.length=0;toasts.length=0;outputPath='/synthetic/user-selected.custom';writeError=false;pickerWait=null;navigated='';quota=false;savedSummary='Stored summary';archivedSummary='';releaseWrite=undefined;clock=0;});
+afterEach(async()=>{holdNotes=false;holdSummary=false;holdWrite=false;failNotes=false;failSummary=false;pendingSummary=false;failNotesConversion=false;releaseWrite?.();for(const p of conversions.splice(0))p.resolve(richMarkdown);await act(async()=>root?.unmount());root=undefined;timers.clear();storeTimers.clear();storage.clear();documents.clear();calls.length=0;reloads=0;mutations=0;version=0;selectedText='Live text';selectedRowId='old-line';written.length=0;toasts.length=0;outputPath='/synthetic/user-selected.custom';writeError=false;pickerWait=null;navigated='';quota=false;savedSummary='Stored summary';archivedSummary='';releaseWrite=undefined;clock=0;actionWait=null;actionReplyWait=null;actionStarted=false;summaryToken=0;summaryExists=true;actionRows=[];});
 
 const visible=(node:any):string=>typeof node==='string'?node:Array.isArray(node)?node.map(visible).join(''):(node?.children??[]).map(visible).join('');
 const exactButton=(label:string,last=false)=>{const found=root!.root.findAllByType('button').filter(node=>visible(node)===label);return last?found.at(-1)!:found[0]!;};
@@ -226,3 +239,117 @@ test('combined detail siblings have distinct keys while retaining meeting-owned 
  try{await mount();expect(errors.filter(args=>String(args[0]).includes('same key'))).toEqual([]);}
  finally{error.mockRestore();}
 });
+
+
+for(const operation of ['select','correct'])test(`delayed real action extraction cannot restore summary after external ${operation}`,async()=>{
+ savedSummary='## Overview\nOld summary\n\n## Action items\n- Send API report';
+ let release!:()=>void;actionWait=new Promise<void>(resolve=>{release=resolve;});
+ await mount();expect(actionStarted).toBe(true);
+ // Another WebView can change the projection while this one's native call waits.
+ await act(async()=>{await transport(operation==='select'?'select_transcript_version':'correct_transcript_text',{text:'Corrected API'});const selector=root!.root.findAll(node=>typeof node.type==='function'&&node.type.name==='TranscriptVersions')[0];await selector.props.onChanged();});
+ await act(async()=>{release();});
+ expect(savedSummary).toBe('');
+ expect(root!.root.findAllByProps({'aria-label':'Summary editor'})).toHaveLength(0);
+ const {captureMeetingExport}=await import('../../src/lib/meeting-export');
+ expect((await captureMeetingExport(active)).summary).toBeNull();
+},60000);
+
+test('delayed real extraction cannot overwrite a new same-version summary or unsaved editor draft',async()=>{
+ savedSummary='## Overview\nOld summary\n\n## Action items\n- Send API report';
+ let release!:()=>void;actionWait=new Promise<void>(resolve=>{release=resolve;});
+ await mount();expect(actionStarted).toBe(true);
+ await act(async()=>editor('Summary editor').props.onChange({target:{value:'New unsaved draft'}}));
+ savedSummary='New generated summary';summaryToken++;
+ await act(async()=>{release();});
+ expect(savedSummary).toBe('New generated summary');
+ expect(editor('Summary editor').props.value).toContain('New unsaved draft');
+},60000);
+
+for(const operation of ['select','correct'])test(`local ${operation} drains pending real extraction before archiving summary`,async()=>{
+ savedSummary='## Overview\nOld summary\n\n## Action items\n- Send API report';
+ let release!:()=>void;actionWait=new Promise<void>(resolve=>{release=resolve;});
+ await mount();expect(actionStarted).toBe(true);
+ await act(async()=>editor('Notes editor').props.onChange({target:{blocks:rich}}));
+ const identity=editor('Notes editor').props['data-engine'];
+ await review(operation);if(operation==='correct')await act(async()=>editor('Corrected transcript text').props.onChange({target:{value:'Corrected API'}}));
+ let work!:Promise<void>;await act(async()=>{work=mutate(operation);});
+ expect(mutations).toBe(0);
+ await act(async()=>{release();await work;});
+ expect(mutations).toBe(1);expect(archivedSummary).toBe('## Overview\nOld summary');expect(savedSummary).toBe('');
+ expect(editor('Notes editor').props['data-engine']).toBe(identity);expect(documents.get(`meeting:${active}`).json).toEqual(rich);
+ expect(root!.root.findAllByProps({'aria-label':'Summary editor'})).toHaveLength(0);
+},60000);
+
+test('same-version real extraction updates summary UI and export on ordinary success',async()=>{
+ savedSummary='## Overview\nOld summary\n\n## Action items\n- Send API report';
+ let release!:()=>void;actionWait=new Promise<void>(resolve=>{release=resolve;});
+ await mount();expect(actionStarted).toBe(true);
+ await act(async()=>{release();});await ready();
+ expect(savedSummary).toBe('## Overview\nOld summary');
+ expect(editor('Summary editor').props.value).not.toContain('Action items');
+ const {captureMeetingExport}=await import('../../src/lib/meeting-export');
+ expect(JSON.parse((await captureMeetingExport(active)).summary!).markdown).toBe(savedSummary);
+},60000);
+
+test('successful extraction cannot replace a newer rich draft still awaiting Markdown conversion',async()=>{
+ savedSummary='## Overview\nOld summary\n\n## Action items\n- Send API report';
+ let release!:()=>void;actionWait=new Promise<void>(resolve=>{release=resolve;});
+ await mount();expect(actionStarted).toBe(true);
+ const identity=editor('Summary editor').props['data-engine'];holdSummary=true;
+ await act(async()=>editor('Summary editor').props.onChange({target:{blocks:rich}}));
+ await act(async()=>{release();root!.update(<Page/>);});
+ expect(savedSummary).toBe('## Overview\nOld summary');
+ expect(editor('Summary editor').props['data-engine']).toBe(identity);
+ expect(editor('Summary editor').props.value).toContain('API follow-up');
+ holdSummary=false;await act(async()=>{for(const item of conversions.splice(0))item.resolve(richMarkdown);});
+ expect(editor('Summary editor').props['data-engine']).toBe(identity);
+},60000);
+
+
+for(const operation of ['select','correct'])test(`committed extraction reply cannot restore UI after external ${operation} callback`,async()=>{
+ savedSummary='## Overview\nOld summary\n\n## Action items\n- Send API report';
+ let release!:()=>void;actionReplyWait=new Promise<void>(resolve=>{release=resolve;});
+ await mount();expect(actionStarted).toBe(true);expect(savedSummary).toBe('## Overview\nOld summary');
+ // SQL already committed legitimately; only its JS reply is delayed. Exercise
+ // the actual page invalidation callback without remounting the document.
+ await act(async()=>{
+  await transport(operation==='select'?'select_transcript_version':'correct_transcript_text',{text:'Corrected API'});
+  const selector=root!.root.findAll(node=>typeof node.type==='function'&&node.type.name==='TranscriptVersions')[0];
+  await selector.props.onChanged();
+ });
+ expect(root!.root.findAllByProps({'aria-label':'Summary editor'})).toHaveLength(0);
+ await act(async()=>{release();});
+ expect(root!.root.findAllByProps({'aria-label':'Summary editor'})).toHaveLength(0);expect(savedSummary).toBe('');
+ const {captureMeetingExport}=await import('../../src/lib/meeting-export');expect((await captureMeetingExport(active)).summary).toBeNull();
+},60000);
+
+
+test('delayed extraction reply does not roll back newer task edits or anchors in the UI',async()=>{
+ savedSummary='## Overview\nOld summary\n\n## Action items\n- Send API report';
+ let release!:()=>void;actionReplyWait=new Promise<void>(resolve=>{release=resolve;});
+ await mount();expect(actionStarted).toBe(true);
+ actionRows=[{id:'curated',text:'User-curated task',done:true,edited:true,transcriptId:'current-anchor',audioTime:42}];
+ await act(async()=>root!.root.findByProps({'aria-label':'Action rows'}).props.onClick());
+ expect(visible(root!.toJSON())).toContain('User-curated task');
+ await act(async()=>{release();});await ready();
+ expect(visible(root!.toJSON())).toContain('User-curated task');expect(visible(root!.toJSON())).toContain('current-anchor');
+},60000);
+
+
+test('navigation cancels old extraction UI completion without blocking the new meeting version barrier',async()=>{
+ savedSummary='## Overview\nOld summary\n\n## Action items\n- Send API report';
+ let release!:()=>void;actionReplyWait=new Promise<void>(resolve=>{release=resolve;});
+ let work:Promise<void>|undefined;
+ try{
+  await mount();expect(actionStarted).toBe(true);
+  active=`combined-${++seq}`;savedSummary='Meeting B summary';summaryToken++;
+  documents.set(`meeting:${active}`,{markdown:'Meeting B notes',json:null,revision:1,source:'user_notes'});
+  await act(async()=>navigateView(active,savedSummary));await ready();
+  await review('select');await act(async()=>{work=mutate('select');});
+  expect(mutations).toBe(1);
+  await act(async()=>{release();await work;});
+  expect(savedSummary).toBe('');expect(archivedSummary).toBe('Meeting B summary');
+  expect(root!.root.findAllByProps({'aria-label':'Summary editor'})).toHaveLength(0);
+  expect(editor('Notes editor').props.value).toContain('Meeting B notes');
+ }finally{await act(async()=>{release();await work;});}
+},60000);

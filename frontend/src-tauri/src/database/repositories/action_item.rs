@@ -335,9 +335,30 @@ impl ActionItemsRepository {
         source_fingerprint: &str,
     ) -> Result<Vec<ActionItemView>, sqlx::Error> {
         let mut tx = pool.begin().await?;
+        Self::sync_ai_in_transaction(&mut tx, meeting_id, drafts, source_fingerprint).await?;
+        tx.commit().await?;
+
+        Self::list(
+            pool,
+            &ActionItemFilter {
+                meeting_id: Some(meeting_id.to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    /// Caller owns the write lock and projection/summary preconditions. Keep
+    /// reconciliation shared so guarded extraction retains curated task edits.
+    pub(crate) async fn sync_ai_in_transaction(
+        tx: &mut Transaction<'_, Sqlite>,
+        meeting_id: &str,
+        drafts: Vec<ActionItemDraft>,
+        source_fingerprint: &str,
+    ) -> Result<(), sqlx::Error> {
         let exists: Option<String> = sqlx::query_scalar("SELECT id FROM meetings WHERE id = ?")
             .bind(meeting_id)
-            .fetch_optional(&mut *tx)
+            .fetch_optional(&mut **tx)
             .await?;
         if exists.is_none() {
             return Err(sqlx::Error::RowNotFound);
@@ -346,20 +367,20 @@ impl ActionItemsRepository {
             "DELETE FROM action_items WHERE meeting_id = ? AND source = 'ai' AND edited = 0 AND done = 0",
         )
         .bind(meeting_id)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
 
         let kept: Vec<String> =
             sqlx::query_scalar("SELECT text FROM action_items WHERE meeting_id = ?")
                 .bind(meeting_id)
-                .fetch_all(&mut *tx)
+                .fetch_all(&mut **tx)
                 .await?;
         let mut seen: Vec<String> = kept.iter().map(|text| normalize_person_name(text)).collect();
         let mut position: i64 = sqlx::query_scalar(
             "SELECT COALESCE(MAX(position), -1) + 1 FROM action_items WHERE meeting_id = ?",
         )
         .bind(meeting_id)
-        .fetch_one(&mut *tx)
+        .fetch_one(&mut **tx)
         .await?;
 
         for draft in drafts {
@@ -370,7 +391,7 @@ impl ActionItemsRepository {
             }
             seen.push(key);
             let owner = clean(draft.owner_label);
-            let person_id = resolve_owner(&mut tx, meeting_id, owner.as_deref()).await?;
+            let person_id = resolve_owner(tx, meeting_id, owner.as_deref()).await?;
             sqlx::query(
                 "INSERT INTO action_items (id, meeting_id, text, owner_label, person_id, due_text, done, \
                  source, edited, audio_time, transcript_id, position, created_at, updated_at) \
@@ -385,7 +406,7 @@ impl ActionItemsRepository {
             .bind(draft.audio_time)
             .bind(clean(draft.transcript_id))
             .bind(position)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
             position += 1;
         }
@@ -393,18 +414,17 @@ impl ActionItemsRepository {
         sqlx::query("UPDATE meetings SET action_items_source = ? WHERE id = ?")
             .bind(source_fingerprint)
             .bind(meeting_id)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
-        tx.commit().await?;
+        Ok(())
+    }
 
-        Self::list(
-            pool,
-            &ActionItemFilter {
-                meeting_id: Some(meeting_id.to_string()),
-                ..Default::default()
-            },
-        )
-        .await
+    pub(crate) async fn list_in_transaction(
+        tx: &mut Transaction<'_, Sqlite>, meeting_id: &str,
+    ) -> Result<Vec<ActionItemView>, sqlx::Error> {
+        let rows = sqlx::query_as::<_, ActionRow>(&format!("{ACTION_SELECT} WHERE a.meeting_id = ? ORDER BY a.position, a.created_at"))
+            .bind(meeting_id).fetch_all(&mut **tx).await?;
+        Ok(rows.into_iter().map(view_from_row).collect())
     }
 
     /// Meetings that have a finished summary but were never read for action

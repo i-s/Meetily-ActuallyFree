@@ -804,6 +804,8 @@ pub fn run() {
             database::repositories::action_item::api_update_action_item,
             database::repositories::action_item::api_delete_action_item,
             database::repositories::action_item::api_sync_ai_action_items,
+            database::repositories::action_sync::api_action_sync_context,
+            database::repositories::action_sync::api_commit_action_sync,
             database::repositories::action_item::api_list_unsynced_action_meetings,
             database::repositories::notes_document::api_notes_recording_target,
             database::repositories::notes_document::api_read_notes_document,

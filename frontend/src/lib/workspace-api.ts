@@ -220,6 +220,7 @@ export const updateActionItem = (item: Pick<ActionItem, 'id' | 'text' | 'done'> 
     done: item.done,
   });
 export const deleteActionItem = (id: string) => invoke<void>('api_delete_action_item', { id });
+/** @deprecated Summary extraction must use syncMeetingActionItems's owned atomic commit. */
 export const syncAiActionItems = (meetingId: string, items: ActionItemDraft[], sourceFingerprint: string) =>
   invoke<ActionItem[]>('api_sync_ai_action_items', { meetingId, items, sourceFingerprint });
 export const listUnsyncedActionMeetings = () => invoke<string[]>('api_list_unsynced_action_meetings');

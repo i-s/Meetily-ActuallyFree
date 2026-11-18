@@ -87,6 +87,8 @@ export interface NotesEditorProps {
   onChange?: (content: NotesContent) => void;
   /** Synchronous JSON recovery draft; await markdown before generating or stopping. */
   onDraft?: (content: NotesContent, markdown: Promise<string>) => void;
+  /** Synchronous user edit notification, before asynchronous conversion. */
+  onEdit?: () => void;
   className?: string;
   /** Called once the initial content is in the editor. */
   onReady?: () => void;
@@ -100,6 +102,7 @@ export function NotesEditor({
   editable = true,
   onChange,
   onDraft,
+  onEdit,
   className,
   onReady,
   registerFlush,
@@ -111,6 +114,8 @@ export function NotesEditor({
   const [ready, setReady] = useState(false);
   const onChangeRef = useRef(onChange);
   onChangeRef.current = onChange;
+  const onEditRef = useRef(onEdit);
+  onEditRef.current = onEdit;
   const onDraftRef = useRef(onDraft);
   onDraftRef.current = onDraft;
   const publishRef = useRef<() => void>(() => {});
@@ -190,7 +195,10 @@ export function NotesEditor({
     // BlockNote remounts its Tiptap view when editable changes, removing
     // listeners. Reattach after the readiness transition as well as external
     // editable changes; editor object identity itself stays the same.
-    return editor.onChange(publish);
+    return editor.onChange(() => {
+      if (loaded.current) onEditRef.current?.();
+      publish();
+    });
   }, [editor, editable, ready]);
 
   return (

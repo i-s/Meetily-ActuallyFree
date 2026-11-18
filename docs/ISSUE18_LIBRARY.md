@@ -321,3 +321,127 @@ standalone TypeScript check runs concurrently with it. Local package version
 remains `0.2.18`; `gh release list` returned an empty list on 2026-11-18. This is
 not a published release, installed app or macOS hardware qualification. No DMG,
 Actions, push, PR, #19 deletion, agents, private data or Mac operations were used.
+
+## Combined R1 — action extraction ownership (2026-11-18)
+
+The reviewed parent is `fc09643030a91cbc76eba1680ee7913cdfb156a5`.
+`MeetingDocument` previously invoked the real `syncMeetingActionItems` helper and
+installed its completion without checking summary/projection/navigation changes.
+The helper first reconciled tasks, then independently saved the trimmed summary
+by meeting ID. A delayed completion could therefore resurrect archived text or
+replace a newer summary-process row; a JS cancellation check alone could not
+protect native task/anchor or summary writes.
+
+### Native ownership and atomic data flow
+
+The additive `database/repositories/action_sync.rs` commands are:
+
+- `api_action_sync_context({ meetingId })`: under the native write lock, capture a
+  terminal committed summary, its opaque ownership token, selected version ID and
+  revision, and the actual current transcript rows. Legacy selection initialization
+  uses the existing #14 owner. Pending jobs or missing summaries return `null`.
+- `api_commit_action_sync({ context, items, sourceFingerprint, summary })`: under
+  one native write transaction, compare meeting, selected version/revision, summary
+  token and complete canonical summary content/status. Stale context returns
+  `null` without changing tasks, anchors, source marker or summary. Validate every
+  proposed anchor/time against this meeting's selected canonical rows. Reconcile
+  tasks with the existing curated/done-item preservation logic, trim the summary
+  and update its timestamp atomically; return task rows from that transaction.
+  A failed trim rolls back the preceding task/marker reconciliation as well.
+
+Migration **20261118001800_action_sync_ownership.sql** adds
+`summary_processes.action_sync_token`, initializes existing rows without altering
+summary content/timestamps, and rotates the token on every INSERT and UPDATE.
+The UPDATE trigger is recursion-safe when only the token changes. Ownership is
+not a timestamp, fingerprint or meeting PK: existing-row UPSERT reset, completion,
+committed edits and delete/reinsert all invalidate old extraction, even if the
+same transcript revision and byte-identical result are restored later.
+
+**Writer obligations (#15 shared contract):** leave `action_sync_token` to SQLite;
+do not copy it into reset/UPSERT/completion payloads. Existing summary SQL writers
+need no extra parameter, callback or JS promise. Automated extraction must use the
+checked context/atomic command rather than separate generic task and summary
+writes. Existing #14 selection/correction signatures are unchanged.
+
+### Real helper, backfill and UI
+
+`action-item-sync.ts` first compares the caller's visible summary projection with
+that of the captured native document, allowing normal loaders to omit native
+metadata. Drafts, original Markdown and anchors are then derived only from that
+captured document/transcript, never the supplied paginated UI or old backfill
+transcript. The transaction still compares the full canonical native content and
+ownership, not merely the visible projection. A stale caller or native no-op emits
+no success event and has no meeting-only fallback write.
+
+Both section extraction and no-section backfill use this protocol. No-section
+backfill is **marker only**: reading an already-trimmed summary must not erase the
+tasks it previously produced. Recognized sections retain the existing extraction,
+deduplication and curated/done-task preservation behavior.
+
+`MeetingDocument` tracks extraction promises by owning meeting. The existing
+version preparation barrier drains rich Notes/summary conversion and autosave,
+then pending extraction before selection/correction can archive the summary.
+Another window/job is protected independently by native ownership checks. After
+navigation, a previous meeting's pending reply cannot block the new meeting's
+barrier. UI completions are cancelled on summary/projection/navigation changes;
+a synchronous optional `NotesEditor.onEdit` epoch also protects rich summary
+drafts whose Markdown conversion has not finished. Late task snapshots are not
+installed: current tasks are reread with request/meeting guards so later curated
+edits and anchors are retained. User Notes ownership/content are unchanged.
+
+### Executed reproductions and limits
+
+- Replaced the combined caller fixture's `action-item-sync` mock with the real
+  helper. The refined focused run temporarily restored the exact parent helper
+  and document implementations: **0 passed, 3 failed**. With accurate native
+  UPDATE-only save semantics, the absent row stayed absent but the mounted UI
+  resurrected old summary text after both selection and correction. An existing
+  newer same-version summary row was overwritten in the third case. The actual
+  page invalidation callback ran without remounting the document. Restoring the
+  fix made all 16 combined caller tests pass. Log of exact-parent red:
+  `/tmp/issue18-r1-action-real-path-red.log`.
+- Focused insert-only ownership mutation: same-row identical regeneration test
+  **failed**, proving the UPDATE trigger is required. Restoring it passed.
+- Removing the UI completion guard: pending rich draft test **failed** (summary
+  editor remounted from engine 2 to 8). Restoring it preserved the exact editor.
+- Delayed task snapshot regression failed before current-task rereading, then
+  passed with current edited text/anchor retained. Navigation/barrier regression
+  failed before per-meeting promise ownership, then passed without waiting for
+  the departed meeting's reply.
+- Real combined caller group now covers both pre-commit and post-commit delayed
+  replies, selection/correction, ordinary success, current UI/native/export
+  agreement, newer summary rows/drafts, task edits and navigation. Its final run
+  and the full isolated frontend/native/TypeScript results are reported with the
+  scoped commit. Boundary adapters still stand in for Tauri/BlockNote/picker/fs;
+  this is not a real WebView/desktop IPC execution.
+- Five new native cases execute real SQLite interleavings using production
+  guarded context/commit, task repositories and version selection/correction:
+  stale selection/correction; same-row UPSERT pending→completed identical bytes,
+  delete/reinsert, edits/new content at unchanged transcript revision; ordinary
+  success/curated tasks/Notes/anchors and marker-only reads; bad anchors and forced
+  trim rollback; transcript-only revision changes with unchanged summary token.
+  All migrations and the native export repository participate. Summary-job writes
+  in the interleaving fixture use the production SQL shape, not a running model
+  or background summary engine.
+
+Only warmed, device-free tests and standalone TypeScript checking qualify this
+correction. No new production export, native desktop build, agent, push, PR,
+Actions, DMG, release, Mac or private-data operation is part of R1. The earlier
+combined production export timeout is not upgraded to a pass by these tests.
+
+
+Final R1 lightweight verification:
+
+| Verification | Result | Local log |
+| --- | --- | --- |
+| Actual combined detail/version/Notes/action-sync/library callers | 16 passed, 139 assertions | `/tmp/issue18-r1-action-ui-green.log` |
+| Real action helper / canonical context / anchors / backfill | 6 passed, 23 assertions | `/tmp/issue18-r1-action-helper.log` |
+| Entire isolated frontend suite, Bun 1.3.10, cache disabled, 60s per-test | 52/52 files, 255 passed, 0 failed | `/tmp/issue18-r1-action-frontend-final.log` |
+| Production SQLite library/action/version suites, offline/locked, one warmed Cargo job | 50 passed, 0 failed, 0 ignored | `/tmp/issue18-r1-action-native-all.log` |
+| Recovery/Notes/version/all migrations, cached real FFmpeg and synthetic fixtures | 83 passed, 0 failed, 0 ignored | `/tmp/issue18-r1-action-recovery.log` |
+| Standalone TypeScript `--noEmit --project frontend/tsconfig.json` | exit 0 | `/tmp/issue18-r1-action-tsc-final.log` |
+
+The legacy generic task-only API remains signature-compatible for compatibility;
+normal extraction/backfill no longer uses it, and the frontend export is marked
+deprecated for summary extraction. No automatic summary writer should chain that
+API with a meeting-only `api_save_meeting_summary` call.
