@@ -34,7 +34,12 @@ here is **qualification only**, not the future in-app Codex provider/Notes featu
   `emit_failed`. This does not change the pre-existing completion counters, which
   count attempted work, not successful words.
 - `scripts/issue8_qualification.py events LOG`: reads diagnostic lines and reports
-  unfinished IDs, duplicate completions, count/drain mismatch and bad outcomes.
+  unfinished/unexpected IDs (including multiplicity), duplicate enqueue/completion
+  IDs, count/drain mismatch and bad outcomes. `identities_match` requires exact ID
+  counters with no duplicates; `drain_counts_match` additionally requires exactly
+  one drain and matching totals. Duplicate IDs invalidate a single-session log.
+  Separately, `stage_timing_complete` and `incomplete_stage_timing` flag missing
+  total/queue/processing durations; matching identities do not establish latency.
   One recording per log is required: chunk IDs restart between sessions. The
   existing application log may contain transcript text; keep it local and private.
   Only the new diagnostic records are text-free. Never upload the unfiltered log.
@@ -177,6 +182,7 @@ Copy `docs/fixtures/issue8-qualification.example.json` outside git. It starts
   "corpus_sha256": "actual hash", "resource_evidence": "resources.json",
   "audio_integrity_evidence": "review.json", "asr_events_evidence": "asr-observations.json",
   "audio_integrity": false, "queue_drained": false,
+  "drain_completed_seconds": null,
   "rss_peak_bytes": null, "system_swap_peak_bytes": null,
   "landmarks": [], "questions": []
 }
@@ -184,8 +190,36 @@ Copy `docs/fixtures/issue8-qualification.example.json` outside git. It starts
 
 Replace values with measured facts, not this example. A landmark is
 `{"language":"ru","speech_end_seconds":12.3,"display_seconds":14.1}`;
-questions include `synthetic_only`, `auth: chatgpt_subscription`, `during_asr`,
-`status`, `elapsed_seconds` plus local evidence path and recording-relative time.
+`speech_end_seconds` must be finite and in `[0,duration_seconds]`. Display must
+be finite, nonnegative and not precede speech. The speech-to-display target still
+applies to tail speech rendered after Stop: record `display_phase: post_stop`
+explicitly when `display_seconds > duration_seconds`; otherwise the phase is
+`recording` (optional to spell out). The checker reports the post-stop count rather
+than treating it as in-recording activity. Record `drain_completed_seconds` on the
+same monotonic recording-origin clock, finite and at/after recording Stop. This is
+queue-drain evidence, not the visible-text time or proof of audio integrity.
+
+Each question requires a measured interval, not just `during_asr: true`:
+
+```json
+{
+  "synthetic_only": true, "auth": "chatgpt_subscription", "during_asr": true,
+  "status": "passed", "elapsed_seconds": 5.0,
+  "start_seconds": 100.0, "end_seconds": 105.0,
+  "evidence": "qna-001.json"
+}
+```
+
+All three durations/times must be finite, elapsed must be nonnegative, and concurrent
+evidence requires `0 <= start_seconds <= end_seconds <= duration_seconds`.
+`end_seconds - start_seconds` must agree with the runner's `elapsed_seconds` within
+0.05 seconds (rounding tolerance, not permission to invent aligned times). Annotate
+start/end on the same recording-origin monotonic clock, including auth/setup time
+included in the runner measurement. Missing timing blocks review, invalid timing
+fails it, regardless of `during_asr`. Post-stop/straddling Q&A is not concurrent
+qualification evidence; retain such observations separately in the local failure/
+shutdown notes, not as a qualifying `questions` entry. Original evidence and clock
+alignment/uncertainty still require manual review.
 Set `physical_acceptance: measured` only after actual runs. Supply `issue6_evidence`
 and `configuration_decision` with comparison results/reasons/remaining limits.
 Run `qualification journal.json`; independently review all referenced originals.
@@ -202,15 +236,23 @@ cannot certify causality, audio quality, model identity, or physical truth.
 ## Checks actually run in this Linux worktree
 
 - `python3 -I -B -m unittest discover -s tests -p 'test_issue8_qualification.py' -v`:
-  10 passed; portable fake-CLI, resource/event/journal tests. These do not run ASR or macOS audio.
-- Full `python3 -I -B -m unittest discover -s tests -v`: 28 passed.
+  19 passed after review fixes; portable fake-CLI, resource/event/journal tests. These do not run ASR or macOS audio.
+- Full `python3 -I -B -m unittest discover -s tests -v`: 37 passed after review fixes.
 - Existing #6 tests: 15 passed, deterministic synthetic PCM only.
 - Real subscription Codex CLI 0.167.2, synthetic prompt hash
   `a43aeb41a9b2b752cc0adb513d87f225fd1bec7d10dd01336f650292e83460ff`:
   first smoke 5.282 s, hardened auth/version runner 4.898 s; return code 0,
   expected synthetic marker, no output text retained. Linux, no concurrent ASR.
-- Native Rust timing test/full Tauri compilation: **not run**; `rustc` and `cargo`
-  were not available. Coordinator review and native compilation are still required
-  before including the instrumentation in a final candidate.
+- Initial implementation could not find `rustc`/`cargo` on PATH. Independent Opus
+  review subsequently found standalone Rust 1.97.1 and passed the `timing.rs` unit
+  test. That establishes the standalone clock module test, **not** native Tauri
+  compilation; full native Tauri compilation is still pending before a candidate.
+- Review regressions were run red before changing the checker: 16 tests,
+  9 failing assertions and 8 subtest errors (the reproduced out-of-range journal
+  was `manual_review_required`; duplicate enqueue substitution had a true drain
+  match; post-stop/stage-completeness fields were absent). Green checks include
+  finite/bounded clocks, consistent concurrent Q&A intervals, explicit post-stop
+  display/drain, exact identities/multiplicities, and separate stage timing gaps.
+  No new live service requests were made during these review fixes.
 - Physical Macs, real-model/audio tests, 90-minute AC/battery runs, saved-audio
   integrity under Q&A and final configuration decision: **not run / pending**.

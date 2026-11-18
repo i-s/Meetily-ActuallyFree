@@ -68,6 +68,9 @@ printf 'SYNTHETIC answer\n'
         result = qualification.summarize_events("MEETILY_ISSUE8 " + json.dumps(x) for x in rows)
         self.assertEqual(result["unfinished_chunk_ids"], [2])
         self.assertEqual(result["duplicate_completions"], 1)
+        self.assertEqual(result["duplicate_completion_ids"], [1])
+        self.assertFalse(result["drain_counts_match"])
+        self.assertFalse(result["identities_match"])
 
     def test_nonfinite_diagnostic_clock_is_rejected(self):
         with self.assertRaises(ValueError):
@@ -79,34 +82,136 @@ printf 'SYNTHETIC answer\n'
         self.assertTrue(result["samples"][0]["process_alive"])
 
 
-    def test_full_journal_never_automatically_grants_acceptance(self):
+    def journal(self):
         runs = []
         for machine in ("M4 Pro/48 GB", "M1 Pro/32 GB"):
             for power in ("ac", "battery"):
                 run = dict(machine=machine, power=power, duration_seconds=5400,
                            audio_integrity=True, queue_drained=True, rss_peak_bytes=1,
-                           system_swap_peak_bytes=0,
+                           system_swap_peak_bytes=0, drain_completed_seconds=5402,
                            landmarks=[dict(language=language, speech_end_seconds=t, display_seconds=t+1)
                                       for language, t in (("ru", 10), ("en", 2700), ("mixed", 5390))],
                            questions=[dict(synthetic_only=True, auth="chatgpt_subscription",
-                                           during_asr=True, status="passed", elapsed_seconds=5)])
+                                           during_asr=True, status="passed", elapsed_seconds=5,
+                                           start_seconds=100, end_seconds=105)])
                 for key in ("app_sha", "macos_version", "asr_model", "model_sha256", "model_parameters",
                             "corpus_sha256", "resource_evidence", "audio_integrity_evidence", "asr_events_evidence"):
                     run[key] = "synthetic test placeholder, not evidence"
                 runs.append(run)
+        return dict(schema_version=1, physical_acceptance="measured", issue6_evidence="test",
+                    configuration_decision="test", runs=runs)
+
+    def review_journal(self, data):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "journal.json"
-            data = dict(schema_version=1, physical_acceptance="measured", issue6_evidence="test",
-                        configuration_decision="test", runs=runs)
             path.write_text(json.dumps(data))
-            args = type("Args", (), {"path": path})()
-            self.assertEqual(qualification.qualification(args)["status"], "manual_review_required")
-            runs[0]["questions"][0]["elapsed_seconds"] = 61
-            runs[0]["landmarks"][0]["display_seconds"] = 30
-            path.write_text(json.dumps(data))
-            result = qualification.qualification(args)
-            self.assertEqual(result["status"], "failed")
-            self.assertEqual(len(result["failed_targets"]), 2)
+            return qualification.qualification(type("Args", (), {"path": path})())
+
+    def test_full_journal_never_automatically_grants_acceptance(self):
+        data = self.journal()
+        self.assertEqual(self.review_journal(data)["status"], "manual_review_required")
+        data["runs"][0]["questions"][0]["elapsed_seconds"] = 61
+        data["runs"][0]["questions"][0]["end_seconds"] = 161
+        data["runs"][0]["landmarks"][0]["display_seconds"] = 30
+        result = self.review_journal(data)
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(len(result["failed_targets"]), 2)
+
+    def test_review_reproduction_out_of_recording_clocks_are_not_clean(self):
+        data = self.journal()
+        for run in data["runs"]:
+            for mark, speech in zip(run["landmarks"], (-100, 6000, 9000)):
+                mark.update(speech_end_seconds=speech, display_seconds=speech + 1)
+            run["questions"][0]["elapsed_seconds"] = -1
+        self.assertEqual(self.review_journal(data)["status"], "failed")
+
+    def test_question_requires_valid_concurrent_interval_despite_during_asr(self):
+        for changes in ({"start_seconds": None}, {"end_seconds": None},
+                        {"start_seconds": -1}, {"end_seconds": 5401},
+                        {"start_seconds": 110, "end_seconds": 105},
+                        {"elapsed_seconds": -1}, {"elapsed_seconds": float("inf")},
+                        {"elapsed_seconds": float("nan")}, {"end_seconds": 106}):
+            with self.subTest(changes=changes):
+                data = self.journal()
+                data["runs"][0]["questions"][0].update(changes)
+                self.assertNotEqual(self.review_journal(data)["status"], "manual_review_required")
+
+    def test_speech_clock_bounds_and_nonfinite_values(self):
+        for speech in (-1, 5401, float("inf"), float("nan"), None):
+            with self.subTest(speech=speech):
+                data = self.journal()
+                data["runs"][0]["landmarks"][0]["speech_end_seconds"] = speech
+                self.assertNotEqual(self.review_journal(data)["status"], "manual_review_required")
+
+    def test_post_stop_display_and_drain_are_separate(self):
+        data = self.journal()
+        data["runs"][0]["landmarks"][-1].update(speech_end_seconds=5400, display_seconds=5401,
+                                                display_phase="post_stop")
+        result = self.review_journal(data)
+        self.assertEqual(result["status"], "manual_review_required")
+        self.assertEqual(result["post_stop_display_landmarks"], 1)
+        data["runs"][0]["landmarks"][-1]["display_phase"] = "recording"
+        self.assertEqual(self.review_journal(data)["status"], "failed")
+        data = self.journal()
+        data["runs"][0]["drain_completed_seconds"] = 5399
+        self.assertEqual(self.review_journal(data)["status"], "failed")
+
+    def test_exact_id_reconciliation_rejects_duplicate_enqueue_substitution(self):
+        rows = [{"kind": "asr_queued", "chunk_id": i} for i in (1, 1)]
+        rows += [dict(kind="asr_chunk", chunk_id=i, outcome="emitted", total_seconds=3,
+                      queue_seconds=1, processing_seconds=2) for i in (1, 2)]
+        rows.append(dict(kind="asr_drained", queued=2, completed=2))
+        result = qualification.summarize_events("MEETILY_ISSUE8 " + json.dumps(x) for x in rows)
+        self.assertFalse(result["drain_counts_match"])
+        self.assertFalse(result["identities_match"])
+        self.assertEqual(result["duplicate_enqueue_ids"], [1])
+        self.assertEqual(result["unexpected_chunk_ids"], [2])
+        self.assertEqual(result["unfinished_chunk_ids"], [1])
+
+    def test_stage_timing_completeness_is_independent_of_matching_ids(self):
+        rows = [dict(kind="asr_queued", chunk_id=1),
+                dict(kind="asr_chunk", chunk_id=1, outcome="emitted", total_seconds=3),
+                dict(kind="asr_drained", queued=1, completed=1)]
+        result = qualification.summarize_events("MEETILY_ISSUE8 " + json.dumps(x) for x in rows)
+        self.assertTrue(result["drain_counts_match"])
+        self.assertTrue(result["identities_match"])
+        self.assertFalse(result["stage_timing_complete"])
+        self.assertEqual(result["incomplete_stage_timing"], [
+            {"chunk_id": 1, "missing_fields": ["queue_seconds", "processing_seconds"]}])
+
+    def test_missing_total_and_stage_durations_are_all_reported(self):
+        rows = [dict(kind="asr_queued", chunk_id=1),
+                dict(kind="asr_chunk", chunk_id=1, outcome="empty"),
+                dict(kind="asr_drained", queued=1, completed=1)]
+        result = qualification.summarize_events("MEETILY_ISSUE8 " + json.dumps(x) for x in rows)
+        self.assertTrue(result["identities_match"])
+        self.assertFalse(result["stage_timing_complete"])
+        self.assertEqual(result["incomplete_stage_timing"][0]["missing_fields"],
+                         ["total_seconds", "queue_seconds", "processing_seconds"])
+
+    def test_complete_single_session_has_exact_id_and_stage_matches(self):
+        rows = [dict(kind="asr_queued", chunk_id=i) for i in (1, 2)]
+        rows += [dict(kind="asr_chunk", chunk_id=i, outcome="emitted", total_seconds=3,
+                      queue_seconds=1, processing_seconds=2) for i in (2, 1)]
+        rows.append(dict(kind="asr_drained", queued=2, completed=2))
+        result = qualification.summarize_events("MEETILY_ISSUE8 " + json.dumps(x) for x in rows)
+        self.assertTrue(result["identities_match"])
+        self.assertTrue(result["drain_counts_match"])
+        self.assertTrue(result["stage_timing_complete"])
+        self.assertEqual(result["unexpected_chunk_ids"], [])
+        self.assertEqual(result["unfinished_chunk_ids"], [])
+
+    def test_display_and_drain_clocks_require_finite_nonnegative_evidence(self):
+        for field, value in (("display_seconds", -1), ("display_seconds", None),
+                             ("display_seconds", float("nan")),
+                             ("display_seconds", float("inf")),
+                             ("drain_completed_seconds", None),
+                             ("drain_completed_seconds", float("inf"))):
+            with self.subTest(field=field, value=value):
+                data = self.journal()
+                target = data["runs"][0] if field == "drain_completed_seconds" else data["runs"][0]["landmarks"][0]
+                target[field] = value
+                self.assertNotEqual(self.review_journal(data)["status"], "manual_review_required")
 
     def test_api_login_is_not_allowed(self):
         with tempfile.TemporaryDirectory() as directory:

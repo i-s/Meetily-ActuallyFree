@@ -6,6 +6,7 @@ transcript/audio files and never sends anything except the embedded synthetic pr
 to the explicitly selected local Codex CLI. Physical Mac acceptance remains manual.
 """
 import argparse
+from collections import Counter
 import hashlib
 import json
 import math
@@ -184,19 +185,34 @@ def summarize_events(lines):
             records.append(item)
     chunks = [x for x in records if x.get("kind") == "asr_chunk"]
     bad = [x for x in chunks if x.get("outcome") not in ("emitted", "empty")]
-    totals = [finite(x.get("total_seconds"), "total_seconds") for x in chunks]
+    totals = [finite(x["total_seconds"], "total_seconds") for x in chunks if "total_seconds" in x]
     queued = [x.get("chunk_id") for x in records if x.get("kind") == "asr_queued"]
     finished = [x.get("chunk_id") for x in chunks]
     drains = [x for x in records if x.get("kind") == "asr_drained"]
+    queued_counts, finished_counts = Counter(queued), Counter(finished)
+    duplicate_enqueues = sorted(i for i, count in queued_counts.items() if count > 1)
+    duplicate_completions = sorted(i for i, count in finished_counts.items() if count > 1)
+    # Counter differences retain multiplicity: one completion cannot satisfy two enqueues.
+    unfinished = sorted((queued_counts - finished_counts).elements())
+    unexpected = sorted((finished_counts - queued_counts).elements())
+    identities_match = queued_counts == finished_counts and not duplicate_enqueues and not duplicate_completions
+    incomplete_timing = [{"chunk_id": x["chunk_id"], "missing_fields": [
+        field for field in ("total_seconds", "queue_seconds", "processing_seconds") if field not in x
+    ]} for x in chunks]
+    incomplete_timing = [x for x in incomplete_timing if x["missing_fields"]]
     return {"schema_version": SCHEMA_VERSION, "kind": "issue8_asr_observations",
             "chunks": len(chunks), "outcomes": {k: sum(x.get("outcome") == k for x in chunks) for k in sorted({x.get("outcome") for x in chunks})},
             "max_dispatch_to_completion_seconds": max(totals) if totals else None,
             "max_queue_seconds": max((x["queue_seconds"] for x in chunks if "queue_seconds" in x), default=None),
             "max_processing_seconds": max((x["processing_seconds"] for x in chunks if "processing_seconds" in x), default=None),
-            "queued_chunks": len(queued), "unfinished_chunk_ids": sorted(set(queued) - set(finished)),
+            "queued_chunks": len(queued), "unfinished_chunk_ids": unfinished,
+            "unexpected_chunk_ids": unexpected, "duplicate_enqueue_ids": duplicate_enqueues,
+            "duplicate_completion_ids": duplicate_completions, "identities_match": identities_match,
             "duplicate_completions": len(finished) - len(set(finished)),
+            "stage_timing_complete": bool(chunks) and not incomplete_timing,
+            "incomplete_stage_timing": incomplete_timing,
             "drain_observed": bool(drains),
-            "drain_counts_match": bool(drains) and not (set(queued) - set(finished)) and len(finished) == len(set(finished)) and drains[-1].get("queued") == drains[-1].get("completed") == len(chunks) == len(queued),
+            "drain_counts_match": len(drains) == 1 and identities_match and drains[0].get("queued") == drains[0].get("completed") == len(chunks) == len(queued),
             "failed_or_unknown_chunks": len(bad),
             "status": "observed" if chunks else "no_diagnostic_chunks",
             "limits": "This is dispatcher/VAD-worker timing, not speech-to-text or WebView latency. A 90-minute physical run with recording-relative landmarks is required for acceptance."}
@@ -208,6 +224,18 @@ def qualification(args):
     if data.get("schema_version") != 1:
         raise ValueError("require schema_version 1")
     missing, failures = [], []
+    post_stop_displays = 0
+
+    def timing(item, field, context):
+        if item.get(field) is None:
+            missing.append(f"{context}: missing {field}")
+            return None
+        try:
+            return finite(item[field], field)
+        except ValueError:
+            failures.append(f"{context}: {field} must be finite")
+            return None
+
     if data.get("physical_acceptance") != "measured":
         missing.append("physical_acceptance must be measured, not a template")
     if not data.get("configuration_decision"):
@@ -243,30 +271,62 @@ def qualification(args):
             landmarks = run.get("landmarks", [])
             if not landmarks or {x.get("language") for x in landmarks} != {"ru", "en", "mixed"}:
                 missing.append(f"{key}: RU/EN/mixed speech/display landmarks")
-            for mark in landmarks:
-                speech = finite(mark.get("speech_end_seconds"), "speech_end_seconds")
-                display = finite(mark.get("display_seconds"), "display_seconds")
-                if display < speech:
-                    raise ValueError("display cannot precede speech")
-                if display - speech > 10:
+            drain = timing(run, "drain_completed_seconds", key)
+            if drain is not None and drain < duration:
+                failures.append(f"{key}: drain completion must be at/after recording stop")
+            valid_speech = []
+            for index, mark in enumerate(landmarks):
+                context = f"{key}/landmark[{index}]"
+                speech = timing(mark, "speech_end_seconds", context)
+                display = timing(mark, "display_seconds", context)
+                if speech is not None:
+                    if not 0 <= speech <= duration:
+                        failures.append(f"{context}: speech end outside recording [0,duration]")
+                    else:
+                        valid_speech.append(speech)
+                if display is not None:
+                    if display < 0 or (speech is not None and display < speech):
+                        failures.append(f"{context}: display must be nonnegative and not precede speech")
+                    # Post-stop rendering is legitimate tail evidence, not concurrent activity.
+                    phase = "post_stop" if display > duration else "recording"
+                    if phase == "post_stop":
+                        post_stop_displays += 1
+                        if mark.get("display_phase") != "post_stop":
+                            missing.append(f"{context}: post-stop display requires display_phase=post_stop")
+                    if "display_phase" in mark and mark["display_phase"] != phase:
+                        failures.append(f"{context}: display_phase inconsistent with recording stop")
+                if speech is not None and display is not None and display - speech > 10:
                     failures.append(f"{key}: speech-to-display > 10 seconds")
-            if landmarks and (min(x["speech_end_seconds"] for x in landmarks) > 60 or max(x["speech_end_seconds"] for x in landmarks) < 5340):
+            if valid_speech and (min(valid_speech) > 60 or max(valid_speech) < duration - 60):
                 missing.append(f"{key}: beginning/end landmarks (also sample throughout run)")
             questions = run.get("questions", [])
             if not questions:
                 missing.append(f"{key}: concurrent subscription Codex Q&A")
-            for question in questions:
+            for index, question in enumerate(questions):
                 if question.get("synthetic_only") is not True or question.get("auth") != "chatgpt_subscription":
                     failures.append(f"{key}: text/auth boundary not satisfied")
                 if question.get("during_asr") is not True:
                     missing.append(f"{key}: Q&A not observed during ASR")
                 if question.get("status") != "passed":
                     failures.append(f"{key}: Q&A failed/unavailable; retry required")
-                if finite(question.get("elapsed_seconds"), "elapsed_seconds") > 60:
-                    failures.append(f"{key}: Q&A > 60 seconds")
+                context = f"{key}/question[{index}]"
+                elapsed = timing(question, "elapsed_seconds", context)
+                start = timing(question, "start_seconds", context)
+                end = timing(question, "end_seconds", context)
+                if elapsed is not None:
+                    if elapsed < 0:
+                        failures.append(f"{context}: Q&A elapsed must be nonnegative")
+                    elif elapsed > 60:
+                        failures.append(f"{key}: Q&A > 60 seconds")
+                if start is not None and end is not None:
+                    if not 0 <= start <= end <= duration:
+                        failures.append(f"{context}: concurrent Q&A requires 0 <= start <= end <= duration")
+                    if elapsed is not None and not math.isclose(end - start, elapsed, rel_tol=0, abs_tol=0.05):
+                        failures.append(f"{context}: Q&A interval and elapsed disagree (>0.05 seconds)")
     return {"schema_version": 1, "kind": "issue8_qualification_review",
             "status": "failed" if failures else "blocked" if missing else "manual_review_required",
             "missing_evidence": missing, "failed_targets": failures,
+            "post_stop_display_landmarks": post_stop_displays,
             "limits": "Structural checks only. Independently review original audio, corpus/model comparison, resource timeline, concurrent ASR, power evidence and configuration decision. This tool never grants physical acceptance."}
 
 
