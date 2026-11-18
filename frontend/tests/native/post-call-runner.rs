@@ -8,12 +8,7 @@ async fn pool() -> SqlitePool {
         .await
         .unwrap();
     sqlx::raw_sql("CREATE TABLE meetings(id TEXT PRIMARY KEY,folder_path TEXT); CREATE TABLE transcript_selection(meeting_id TEXT,version_id TEXT,revision INTEGER); CREATE TABLE meeting_notes(meeting_id TEXT,revision INTEGER); INSERT INTO meetings VALUES('a','/synthetic/a'),('b','/synthetic/b'); INSERT INTO transcript_selection VALUES('a','live-a',3),('b','live-b',0);").execute(&p).await.unwrap();
-    sqlx::raw_sql(include_str!(
-        "../../src-tauri/migrations/20261118001500_post_call_queue.sql"
-    ))
-    .execute(&p)
-    .await
-    .unwrap();
+    crate::test_schema::queue_schema(&p).await;
     let mut tx = p.begin().await.unwrap();
     store::enqueue(&mut tx, "a").await.unwrap();
     store::enqueue(&mut tx, "b").await.unwrap();
@@ -30,6 +25,10 @@ fn snapshot(id: &str) -> Snapshot {
         },
         lines: vec![],
         notes: String::new(),
+        approved_vocabulary: crate::database::repositories::vocabulary::ApprovedGlobalVocabulary {
+            terms: String::new(),
+            revision: 0,
+        },
     }
 }
 const EMPTY: &str = r#"{"summary":[],"decisions":[],"tasks":[],"open_questions":[],"uncertainty":["No supported conclusions"]}"#;
@@ -101,7 +100,7 @@ async fn interruption_waits_for_owned_local_drain_and_keeps_job_queued() {
             owned.cancelled().await;
             Ok("post-call-refined:a".into())
         },
-        || async { panic!("summary cannot start after interruption") },
+        || async { Ok(snapshot("a")) },
         |_, _| async { panic!("CLI cannot start after interruption") },
     )
     .await
@@ -135,4 +134,90 @@ async fn notes_edit_during_cli_rejects_result_but_preserves_previous_publication
     assert_eq!(row.status, "waiting");
     assert!(row.result_json.is_none());
     assert_eq!(row.stage, "summary");
+}
+
+#[tokio::test]
+async fn ownership_watchdog_does_not_starve_a_work_future_holding_the_only_sqlite_connection() {
+    let p = pool().await;
+    let j = store::claim(&p).await.unwrap().unwrap();
+    let token = CancellationToken::new();
+    let run = runner::execute(
+        &p,
+        &j,
+        &token,
+        |_| async { Ok("post-call-refined:a".into()) },
+        || async { Ok(snapshot("a")) },
+        |_, _| async {
+            let tx = p.begin().await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            tx.commit().await.unwrap();
+            Ok(EMPTY.into())
+        },
+    );
+    assert!(tokio::time::timeout(std::time::Duration::from_secs(2), run)
+        .await
+        .expect("watchdog starved owned SQLite work")
+        .is_ok());
+}
+
+#[tokio::test]
+async fn changed_spelling_snapshot_cannot_hit_a_previous_guidance_cache_entry() {
+    let p = pool().await;
+    let calls = std::sync::atomic::AtomicUsize::new(0);
+    for revision in [7, 8, 8] {
+        if revision == 8 {
+            store::control(&p, "a", "refresh").await.unwrap();
+        }
+        let j = store::claim(&p).await.unwrap().unwrap();
+        let mut s = snapshot("a");
+        s.approved_vocabulary.revision = revision;
+        s.approved_vocabulary.terms = if revision == 7 {
+            "OpenAPI".into()
+        } else {
+            String::new()
+        };
+        let counter = &calls;
+        runner::execute(
+            &p,
+            &j,
+            &CancellationToken::new(),
+            |_| async { Ok("post-call-refined:a".into()) },
+            || async { Ok(s) },
+            |prompt, _| async move {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                assert!(prompt.contains(&format!("vocabulary:global:{revision}")));
+                Ok(EMPTY.into())
+            },
+        )
+        .await
+        .unwrap();
+    }
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(store::results(&p, "a").await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn speech_or_notes_changed_during_local_work_are_rejected_before_cli_dispatch() {
+    let p = pool().await;
+    let j = store::claim(&p).await.unwrap().unwrap();
+    runner::execute(
+        &p,
+        &j,
+        &CancellationToken::new(),
+        |_| async {
+            sqlx::query("INSERT INTO meeting_notes VALUES('a',1)")
+                .execute(&p)
+                .await
+                .unwrap();
+            Ok("post-call-refined:a".into())
+        },
+        || async { Ok(snapshot("a")) },
+        |_, _| async { panic!("a known-stale snapshot must not consume a Codex request") },
+    )
+    .await
+    .unwrap_err();
+    let a = &store::list(&p).await.unwrap()[0];
+    assert_eq!(a.status, "waiting");
+    assert_eq!(a.stage, "summary");
+    assert_eq!(a.candidate_id.as_deref(), Some("post-call-refined:a"));
 }

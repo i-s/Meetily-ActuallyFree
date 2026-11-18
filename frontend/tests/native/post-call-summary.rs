@@ -19,6 +19,10 @@ fn snapshot() -> Snapshot {
             speaker: Some("Speaker 1".into()),
         }],
         notes: "Maybe ask Sam to own rollout".into(),
+        approved_vocabulary: crate::database::repositories::vocabulary::ApprovedGlobalVocabulary {
+            terms: String::new(),
+            revision: 0,
+        },
     }
 }
 fn response() -> serde_json::Value {
@@ -77,13 +81,43 @@ fn long_context_fails_explicitly_instead_of_silently_truncating() {
 
 #[test]
 fn synthetic_ninety_minute_ru_en_text_retains_first_and_last_turn_without_truncation() {
-    let mut s=snapshot();
+    let mut s = snapshot();
     s.lines=(0..1200).map(|i|TranscriptSegment {
         id:format!("transcript-synthetic-{i:036}"),
         text:format!("Turn {i}: Обсуждаем API, проверяем контракт и сроки. This is synthetic local speech, not real user data. Уточнение решения требует основания в речи."),
         timestamp:"2026-11-18T10:00:00.000Z".into(),audio_start_time:Some(i as f64*4.5),audio_end_time:Some((i+1) as f64*4.5),duration:Some(4.5),speaker:Some("Speaker 1".into()),
     }).collect();
-    let prompt=s.prompt().expect("ordinary long RU/EN fixture should fit the bounded full-context path");
-    assert!(prompt.contains("Turn 0:"));assert!(prompt.contains("Turn 1199:"));
-    assert!(prompt.len()<512*1024);
+    let prompt = s
+        .prompt()
+        .expect("ordinary long RU/EN fixture should fit the bounded full-context path");
+    assert!(prompt.contains("Turn 0:"));
+    assert!(prompt.contains("Turn 1199:"));
+    assert!(prompt.len() < 512 * 1024);
+}
+
+#[test]
+fn approved_spelling_is_separate_immutable_context_and_cannot_be_speech_evidence() {
+    let mut s = snapshot();
+    s.approved_vocabulary = crate::database::repositories::vocabulary::ApprovedGlobalVocabulary {
+        terms: "OpenAPI\nЁлка API".into(),
+        revision: 7,
+    };
+    let prompt = s.prompt().unwrap();
+    assert!(prompt.contains("vocabulary:global:7"));
+    assert!(prompt.contains("approved_vocabulary"));
+    assert!(prompt.contains("spelling guide only"));
+    assert_eq!(
+        s.lines[0].text,
+        "Alex: I will send the API draft on Friday."
+    );
+    assert_eq!(s.notes, "Maybe ask Sam to own rollout");
+    let mut bad = response();
+    bad["tasks"][0]["evidence"][0] =
+        serde_json::json!({"source":"approved_vocabulary","row_id":null,"quote":"OpenAPI"});
+    assert!(Summary::parse(&bad.to_string(), &s).is_err());
+    s.approved_vocabulary.terms = "Ж".repeat(1001);
+    assert!(s.prompt().unwrap_err().contains("oversized"));
+    s.approved_vocabulary.terms.clear();
+    s.approved_vocabulary.revision = 8;
+    assert!(s.prompt().unwrap().contains("vocabulary:global:8"));
 }

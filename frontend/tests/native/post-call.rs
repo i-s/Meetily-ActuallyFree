@@ -9,18 +9,22 @@ async fn pool() -> SqlitePool {
         .unwrap();
     sqlx::raw_sql("CREATE TABLE meetings(id TEXT PRIMARY KEY, folder_path TEXT); CREATE TABLE transcript_selection(meeting_id TEXT PRIMARY KEY, version_id TEXT, revision INTEGER); CREATE TABLE meeting_notes(meeting_id TEXT PRIMARY KEY, notes_markdown TEXT, revision INTEGER); CREATE TABLE transcript_versions(id TEXT PRIMARY KEY, meeting_id TEXT, status TEXT, segments_json TEXT);
     INSERT INTO meetings VALUES('a','/synthetic/a'),('b','/synthetic/b'); INSERT INTO transcript_selection VALUES('a','live-a',3),('b','live-b',0); INSERT INTO meeting_notes VALUES('a','My idea, not agreed',7);").execute(&pool).await.unwrap();
-    sqlx::raw_sql(include_str!(
-        "../../src-tauri/migrations/20261118001500_post_call_queue.sql"
-    ))
-    .execute(&pool)
-    .await
-    .unwrap();
+    crate::test_schema::queue_schema(&pool).await;
     pool
 }
 async fn enqueue(pool: &SqlitePool, id: &str) {
     let mut tx = pool.begin().await.unwrap();
     store::enqueue(&mut tx, id).await.unwrap();
     tx.commit().await.unwrap();
+}
+async fn publish(
+    pool: &SqlitePool,
+    job: &store::Job,
+    revision: &store::Revision,
+    json: &str,
+) -> Result<(), String> {
+    store::bind_vocabulary(pool, job, 0).await?;
+    store::publish(pool, job, revision, 0, json).await
 }
 #[tokio::test]
 async fn enqueue_is_transactional_idempotent_and_two_calls_are_independent() {
@@ -92,15 +96,13 @@ async fn publication_is_atomic_idempotent_and_checks_meeting_version_transcript_
             ..tuple.clone()
         },
     ] {
-        assert!(store::publish(&p, &job, &invalid, "{\"summary\":[]}")
+        assert!(publish(&p, &job, &invalid, "{\"summary\":[]}")
             .await
             .is_err());
     }
     assert_eq!(store::list(&p).await.unwrap()[0].result_json, None);
-    store::publish(&p, &job, &tuple, "{\"summary\":[]}")
-        .await
-        .unwrap();
-    assert!(store::publish(&p, &job, &tuple, "changed").await.is_err());
+    publish(&p, &job, &tuple, "{\"summary\":[]}").await.unwrap();
+    assert!(publish(&p, &job, &tuple, "changed").await.is_err());
     let row = &store::list(&p).await.unwrap()[0];
     assert_eq!(row.status, "complete");
     assert_eq!(row.result_json.as_deref(), Some("{\"summary\":[]}"));
@@ -132,7 +134,7 @@ async fn cli_retry_preserves_local_stage_and_cancel_never_deletes_versions_or_no
     let retry = store::claim(&p).await.unwrap().unwrap();
     assert_eq!(retry.stage, "summary");
     store::control(&p, "a", "cancel").await.unwrap();
-    assert!(store::publish(
+    assert!(publish(
         &p,
         &retry,
         &store::Revision {
@@ -165,7 +167,7 @@ async fn refresh_retains_historical_artifacts_and_exposes_stale_results() {
         transcript_revision: 3,
         notes_revision: 7,
     };
-    store::publish(&p, &job, &revision, "first").await.unwrap();
+    publish(&p, &job, &revision, "first").await.unwrap();
     assert!(store::list(&p).await.unwrap()[0].result_current);
     sqlx::query("UPDATE meeting_notes SET revision=8 WHERE meeting_id='a'")
         .execute(&p)
@@ -174,7 +176,7 @@ async fn refresh_retains_historical_artifacts_and_exposes_stale_results() {
     assert!(!store::list(&p).await.unwrap()[0].result_current);
     store::control(&p, "a", "refresh").await.unwrap();
     let refreshed = store::claim(&p).await.unwrap().unwrap();
-    store::publish(
+    publish(
         &p,
         &refreshed,
         &store::Revision {
@@ -195,15 +197,112 @@ async fn refresh_retains_historical_artifacts_and_exposes_stale_results() {
 
 #[tokio::test]
 async fn durable_queue_reopen_recovers_owned_stage_and_result_without_duplicates() {
-    let dir=tempfile::tempdir().unwrap();
-    let options=sqlx::sqlite::SqliteConnectOptions::new().filename(dir.path().join("queue.sqlite")).create_if_missing(true).foreign_keys(true);
-    let p=SqlitePool::connect_with(options.clone()).await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let options = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(dir.path().join("queue.sqlite"))
+        .create_if_missing(true)
+        .foreign_keys(true);
+    let p = SqlitePool::connect_with(options.clone()).await.unwrap();
     sqlx::raw_sql("CREATE TABLE meetings(id TEXT PRIMARY KEY,folder_path TEXT); CREATE TABLE transcript_selection(meeting_id TEXT,version_id TEXT,revision INTEGER); CREATE TABLE meeting_notes(meeting_id TEXT,revision INTEGER); INSERT INTO meetings VALUES('a','/synthetic/a'); INSERT INTO transcript_selection VALUES('a','live-a',3);").execute(&p).await.unwrap();
-    sqlx::raw_sql(include_str!("../../src-tauri/migrations/20261118001500_post_call_queue.sql")).execute(&p).await.unwrap();
-    enqueue(&p,"a").await;let old=store::claim(&p).await.unwrap().unwrap();store::candidate(&p,&old,"post-call-refined:a").await.unwrap();store::advance(&p,&old,"summary").await.unwrap();
+    crate::test_schema::queue_schema(&p).await;
+    enqueue(&p, "a").await;
+    let old = store::claim(&p).await.unwrap().unwrap();
+    store::candidate(&p, &old, "post-call-refined:a")
+        .await
+        .unwrap();
+    store::advance(&p, &old, "summary").await.unwrap();
     p.close().await;
-    let reopened=SqlitePool::connect_with(options).await.unwrap();store::recover(&reopened).await.unwrap();let resumed=store::claim(&reopened).await.unwrap().unwrap();
-    assert_eq!(resumed.stage,"summary");assert_eq!(resumed.candidate_id.as_deref(),Some("post-call-refined:a"));assert!(resumed.epoch>old.epoch);
-    store::publish(&reopened,&resumed,&store::Revision{meeting_id:"a".into(),version_id:"live-a".into(),transcript_revision:3,notes_revision:0},"retained").await.unwrap();
-    store::recover(&reopened).await.unwrap();enqueue(&reopened,"a").await;assert!(store::claim(&reopened).await.unwrap().is_none());assert_eq!(store::results(&reopened,"a").await.unwrap()[0].result_json,"retained");
+    let reopened = SqlitePool::connect_with(options).await.unwrap();
+    store::recover(&reopened).await.unwrap();
+    let resumed = store::claim(&reopened).await.unwrap().unwrap();
+    assert_eq!(resumed.stage, "summary");
+    assert_eq!(resumed.candidate_id.as_deref(), Some("post-call-refined:a"));
+    assert!(resumed.epoch > old.epoch);
+    publish(
+        &reopened,
+        &resumed,
+        &store::Revision {
+            meeting_id: "a".into(),
+            version_id: "live-a".into(),
+            transcript_revision: 3,
+            notes_revision: 0,
+        },
+        "retained",
+    )
+    .await
+    .unwrap();
+    store::recover(&reopened).await.unwrap();
+    enqueue(&reopened, "a").await;
+    assert!(store::claim(&reopened).await.unwrap().is_none());
+    assert_eq!(
+        store::results(&reopened, "a").await.unwrap()[0].result_json,
+        "retained"
+    );
+}
+
+#[tokio::test]
+async fn distinct_approved_vocabulary_revisions_are_distinct_immutable_publications() {
+    let p = pool().await;
+    enqueue(&p, "a").await;
+    let first = store::claim(&p).await.unwrap().unwrap();
+    let r = store::Revision {
+        meeting_id: "a".into(),
+        version_id: "live-a".into(),
+        transcript_revision: 3,
+        notes_revision: 7,
+    };
+    store::bind_vocabulary(&p, &first, 7).await.unwrap();
+    assert!(store::bind_vocabulary(&p, &first, 8).await.is_err());
+    store::publish(&p, &first, &r, 7, "approved-seven")
+        .await
+        .unwrap();
+    store::control(&p, "a", "refresh").await.unwrap();
+    let second = store::claim(&p).await.unwrap().unwrap();
+    store::bind_vocabulary(&p, &second, 8).await.unwrap();
+    assert!(store::publish(&p, &second, &r, 7, "wrong-snapshot")
+        .await
+        .is_err());
+    store::publish(&p, &second, &r, 8, "empty-approved-eight")
+        .await
+        .unwrap();
+    let history = store::results(&p, "a").await.unwrap();
+    assert_eq!(history.len(), 2);
+    assert_eq!(history[0].vocabulary_revision, 8);
+    assert_eq!(history[1].vocabulary_revision, 7);
+    assert_eq!(
+        store::list(&p).await.unwrap()[0].vocabulary_revision,
+        Some(8)
+    );
+    assert_eq!(
+        store::list(&p).await.unwrap()[0].result_vocabulary_revision,
+        Some(8)
+    );
+}
+
+#[tokio::test]
+async fn forward_vocabulary_migration_retains_unguided_artifacts_under_a_distinct_identity() {
+    let p = SqlitePool::connect(":memory:").await.unwrap();
+    sqlx::raw_sql("CREATE TABLE meetings(id TEXT PRIMARY KEY,folder_path TEXT);INSERT INTO meetings VALUES('a','/synthetic/a');").execute(&p).await.unwrap();
+    sqlx::raw_sql(include_str!(
+        "../../src-tauri/migrations/20261118001500_post_call_queue.sql"
+    ))
+    .execute(&p)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO post_call_results(meeting_id,version_id,transcript_revision,notes_revision,result_json,created_at) VALUES('a','live-a',3,7,'retain-exactly','2026-original')").execute(&p).await.unwrap();
+    sqlx::raw_sql(include_str!(
+        "../../src-tauri/migrations/20261118001501_post_call_vocabulary.sql"
+    ))
+    .execute(&p)
+    .await
+    .unwrap();
+    let artifact = &store::results(&p, "a").await.unwrap()[0];
+    assert_eq!(artifact.vocabulary_revision, -1);
+    assert_eq!(artifact.result_json, "retain-exactly");
+    assert_eq!(artifact.created_at, "2026-original");
+    assert!(sqlx::query("PRAGMA foreign_key_check")
+        .fetch_all(&p)
+        .await
+        .unwrap()
+        .is_empty());
 }

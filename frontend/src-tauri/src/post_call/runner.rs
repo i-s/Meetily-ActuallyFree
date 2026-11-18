@@ -15,16 +15,23 @@ async fn owned<T, F: Future<Output = Result<T, String>>>(
     work: F,
 ) -> Result<T, String> {
     tokio::pin!(work);
-    let mut watch = tokio::time::interval(Duration::from_millis(100));
-    let result = loop {
-        tokio::select! {
-            result=&mut work=>break result,
-            _=watch.tick()=> {
-                // Defer/cancel can arrive through a different WebView. Cancel
-                // only this attempt and KEEP awaiting it: dropping a model
-                // future does not stop its spawn_blocking inference thread.
-                if !store::current(pool,job).await.unwrap_or(false) {token.cancel();}
+    let watch = async {
+        let mut interval = tokio::time::interval(Duration::from_millis(100));
+        loop {
+            interval.tick().await;
+            // Poll this future concurrently with work. Awaiting SQLite inside
+            // the select branch can starve work that owns the only connection.
+            if !store::current(pool, job).await.unwrap_or(false) {
+                token.cancel();
+                return;
             }
+        }
+    };
+    let result = tokio::select! {
+        result = &mut work => result,
+        _ = watch => {
+            // Never abandon spawn_blocking inference on an invalidated epoch.
+            work.await
         }
     };
     if token.is_cancelled() {
@@ -56,6 +63,9 @@ where
 {
     let result=async {
         if token.is_cancelled() {return Err("Recording has priority".into());}
+        let snapshot=owned(pool,job,token,snapshot()).await?;
+        if snapshot.revision.meeting_id!=job.meeting_id {return Err("Snapshot belongs to another meeting".into());}
+        store::bind_vocabulary(pool,job,snapshot.approved_vocabulary.revision).await?;
         if job.stage=="local" {
             let expected=format!("post-call-refined:{}",job.meeting_id);
             store::candidate(pool,job,&expected).await?;
@@ -63,21 +73,23 @@ where
             if candidate!=expected {return Err("Local refinement returned a candidate for another job".into());}
             store::advance(pool,job,"summary").await?;
         }
-        let snapshot=owned(pool,job,token,snapshot()).await?;
-        if snapshot.revision.meeting_id!=job.meeting_id {return Err("Snapshot belongs to another meeting".into());}
+        if !store::revision_current(pool,&snapshot.revision).await? { return Err("Selected transcript or Notes changed during local processing. Local candidate retained; retry summary with the latest committed snapshot.".into()); }
+        let vocabulary=snapshot.vocabulary()?;
+        let vocabulary_revision=vocabulary.revision();
+        // The actual validated helper revision is part of the artifact identity.
         // Explicit refresh of the same tuple is idempotent even after a lost
         // response. Never send another request when a valid artifact exists.
-        let cached:Option<String>=sqlx::query_scalar("SELECT result_json FROM post_call_results WHERE meeting_id=? AND version_id=? AND transcript_revision=? AND notes_revision=?")
-            .bind(&snapshot.revision.meeting_id).bind(&snapshot.revision.version_id).bind(snapshot.revision.transcript_revision).bind(snapshot.revision.notes_revision)
+        let cached:Option<String>=sqlx::query_scalar("SELECT result_json FROM post_call_results WHERE meeting_id=? AND version_id=? AND transcript_revision=? AND notes_revision=? AND vocabulary_revision=?")
+            .bind(&snapshot.revision.meeting_id).bind(&snapshot.revision.version_id).bind(snapshot.revision.transcript_revision).bind(snapshot.revision.notes_revision).bind(vocabulary_revision)
             .fetch_optional(pool).await.map_err(|e|e.to_string())?;
         let json=if let Some(cached)=cached {cached} else {
-            let prompt=snapshot.prompt()?;
+            let prompt=snapshot.prompt_with(&vocabulary)?;
             let raw=owned(pool,job,token,generate(prompt,token.clone())).await?;
             let result=Summary::parse(&raw,&snapshot)?;
             serde_json::to_string(&result).map_err(|e|e.to_string())?
         };
         if token.is_cancelled(){return Err("Post-call summary cancelled before publication".into());}
-        store::publish(pool,job,&snapshot.revision,&json).await
+        store::publish(pool,job,&snapshot.revision,vocabulary_revision,&json).await
     }.await;
     if let Err(error) = &result {
         // A stale epoch means the user already deferred/cancelled; don't undo it.

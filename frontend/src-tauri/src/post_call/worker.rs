@@ -17,6 +17,12 @@ pub static PRIORITY: LazyLock<Arc<priority::Priority>> =
 static STARTED: AtomicBool = AtomicBool::new(false);
 
 async fn snapshot(pool: &SqlitePool, meeting: &str) -> Result<Snapshot, String> {
+    // Read the proof-bearing list once, before any local inference. An edit
+    // during this attempt affects the next job/retry, never this prompt snapshot.
+    let approved_vocabulary =
+        crate::database::repositories::vocabulary::VocabularyRepository::approved_global(pool)
+            .await
+            .map_err(|e| e.to_string())?;
     let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
     sqlx::query("UPDATE meetings SET id=id WHERE id=?")
         .bind(meeting)
@@ -50,6 +56,7 @@ async fn snapshot(pool: &SqlitePool, meeting: &str) -> Result<Snapshot, String> 
         },
         lines,
         notes,
+        approved_vocabulary,
     })
 }
 
@@ -90,9 +97,8 @@ pub fn start<R: Runtime>(app: AppHandle<R>) {
                                     |prompt,token|async move {
                                         let path=codex_cli::commands::codex_cli_get_path().await?;
                                         let home=codex_cli::commands::isolated_auth_home().await?;
-                                        // #16 integration seam: approved_global -> ApprovedVocabulary::global
-                                        // -> augment_prompt here, saving that snapshot revision in provenance.
-                                        // Legacy get_global/get_effective are NOT summary evidence or guidance.
+                                        // Snapshot::prompt uses the accepted #16 bounded spelling helper.
+                                        // No legacy hints, live-session DTO or generic provider participates.
                                         codex_cli::cli::generate(path.as_deref(),&home,codex_cli::cli::DEFAULT_MODEL,
                                             "Saved meeting summary. Return only the specified evidence-backed JSON.",&prompt,Some(&token)).await
                                     }).await;

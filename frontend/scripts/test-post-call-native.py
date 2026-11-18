@@ -62,17 +62,19 @@ impl<R:Runtime> AppHandle<R>{{
 pub struct State<'a,T>(pub &'a T); impl<'a,T> std::ops::Deref for State<'a,T>{{type Target=T;fn deref(&self)->&T{{self.0}}}}
 pub mod async_runtime{{pub fn spawn<F>(f:F)->tokio::task::JoinHandle<F::Output> where F:std::future::Future+Send+'static,F::Output:Send+'static{{tokio::spawn(f)}}}}
 pub mod api{{{segment}}}
+pub mod config{{pub const DEFAULT_PARAKEET_MODEL:&str="synthetic";}}
 pub mod state{{pub struct AppState{{pub db_manager:DbManager}}pub struct DbManager(pub sqlx::SqlitePool);impl DbManager{{pub fn pool(&self)->&sqlx::SqlitePool{{&self.0}}}}}}
 pub mod database{{
  #[path="{SRC}/database/transcript_versions.rs"]pub mod transcript_versions;
  pub mod repositories{{
   #[path="{SRC}/database/repositories/speaker_identity.rs"]pub mod speaker_identity;
   pub mod setting{{pub struct SettingsRepository;impl SettingsRepository{{pub async fn get_post_call_transcript_config(p:&sqlx::SqlitePool)->Result<Option<(String,String)>,sqlx::Error>{{sqlx::query_as("SELECT postCallProvider,postCallModel FROM transcript_settings WHERE id='1' AND postCallProvider IS NOT NULL AND postCallModel IS NOT NULL").fetch_optional(p).await}}}}}}
-  pub mod vocabulary{{pub struct VocabularyRepository;impl VocabularyRepository{{pub async fn get_effective(_p:&sqlx::SqlitePool,_m:Option<&str>)->Result<Option<String>,sqlx::Error>{{Ok(None)}}}}}}
+  #[path="{SRC}/database/repositories/vocabulary.rs"]pub mod vocabulary;
  }}
 }}
 static ROOT:Mutex<Option<std::path::PathBuf>>=Mutex::new(None);
 pub mod codex_cli{{
+ #[path="{SRC}/codex_cli/vocabulary.rs"]pub mod vocabulary;
  #[path="{SRC}/codex_cli/cli.rs"]pub mod cli;
  pub mod commands{{pub async fn codex_cli_get_path()->Result<Option<String>,String>{{Ok(Some(crate::ROOT.lock().unwrap().as_ref().unwrap().join("fake codex").to_string_lossy().into_owned()))}}pub async fn isolated_auth_home()->Result<std::path::PathBuf,String>{{Ok(crate::ROOT.lock().unwrap().as_ref().unwrap().join("isolated-auth"))}}}}
 }}
@@ -90,6 +92,7 @@ pub mod audio{{
  pub mod retranscription{{
  use crate::{{AppHandle,Runtime,Manager,Emitter,state::AppState,database::repositories::vocabulary::VocabularyRepository}};
  use serde::{{Serialize,Deserialize}};use anyhow::{{anyhow,Result}};use std::sync::{{Mutex,atomic::{{AtomicBool,Ordering}}}};use std::path::Path;
+ pub static MUTATE_APPROVAL:AtomicBool=AtomicBool::new(false);
  pub static ASR_CALLS:std::sync::atomic::AtomicUsize=std::sync::atomic::AtomicUsize::new(0);
  {owned}
  {queued}
@@ -99,6 +102,7 @@ pub mod audio{{
  fn recording_in_person(_folder:&Path)->Result<bool>{{Ok(true)}}
  async fn run_retranscription<R:Runtime>(app:AppHandle<R>,meeting_id:String,_folder:String,language:Option<String>,_model:Option<String>,_provider:Option<String>,_prompt:Option<String>,version_id:String)->Result<RetranscriptionResult>{{
   ASR_CALLS.fetch_add(1,Ordering::SeqCst);
+  if MUTATE_APPROVAL.swap(false,Ordering::SeqCst){{VocabularyRepository::confirm_global(app.state::<AppState>().db_manager.pool(),"LaterApproved").await.map_err(anyhow::Error::msg)?;}}
   let row=crate::api::TranscriptSegment{{id:"candidate-room".into(),text:"Synthetic refined speech".into(),timestamp:"2026".into(),audio_start_time:Some(1.),audio_end_time:Some(2.),duration:Some(1.),speaker:Some("Microphone".into())}};
   crate::database::transcript_versions::finish_with_sources(app.state::<AppState>().db_manager.pool(),&version_id,&[row],&std::collections::HashMap::from([("candidate-room".into(),"room".into())])).await.map_err(anyhow::Error::msg)?;
   Ok(RetranscriptionResult{{meeting_id,version_id,segments_count:1,duration_seconds:2.,language}})

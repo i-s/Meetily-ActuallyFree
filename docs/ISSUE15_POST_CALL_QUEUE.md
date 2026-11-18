@@ -14,6 +14,9 @@ read on 2026-11-18; there were no comments.
 - The merge preserves both histories. `lib.rs` command registration retains the
   original Notes/selected-version APIs; recorder text-context helpers are additive.
   #15 implementation follows that integration commit, not inside it.
+- Accepted #16 history `ff957416929742730e7d26e4f0de3ee4dfbd59ed` was merged separately
+  as `7d526d4aff1763375c885593c6554afc69391eaa`, including approval migrations
+  `01600` and forward `01601`.
 - No PR, push, release, packaging, Actions, installation, real user data or service
   request belongs to this qualification. Independent Opus review is coordinator-owned.
 
@@ -25,8 +28,9 @@ recovery -> existing idempotent native save
   -> TranscriptsRepository save transaction:
        meeting + live snapshot + Notes association + post_call_jobs enqueue
   -> one process-owned native scheduler (not React)
+       attempt start -> selected transcript + Notes + approved spelling snapshot
        local stage -> awaited #14 ASR + selected-engine speaker refinement
-       summary stage -> committed selected transcript + committed Notes snapshot
+       summary stage -> verify captured transcript/Notes revisions still current
                      -> #13 isolated subscription Codex CLI
                      -> validated JSON + revision-fenced transaction
   -> post_call_results (immutable, separate from editable summary and Notes)
@@ -90,15 +94,18 @@ stages/versions survive; this is not a per-sample/per-ASR-chunk resume system.
   not the new unreviewed ASR candidate. Its UI states this. Reviewing/selecting a
   candidate remains the original #14 revision-checked operation; use
   “Summarize current selection” afterwards for an updated summary.
-- `worker::snapshot` reads selected version ID, current transcript rows/revision
+- Before local work, `worker::snapshot` reads selected version ID, current transcript rows/revision
   and committed Notes/revision in one SQLite transaction. Browser drafts not yet
   committed are not silently treated as durable Notes. A later committed recovery
   draft increments the independent Notes revision and makes an old result stale.
+- After local work, changed selection/transcript/Notes revisions stop dispatch before
+  Codex; the candidate is retained and Retry captures the latest committed context.
+  A race during CLI execution is still rejected transactionally at publication.
 - Publication checks meeting + selected version + transcript revision + Notes
   revision + claimed job epoch **inside its write transaction**. No stale result
   overwrites a newer selection, correction, Notes document or unrelated meeting.
 - Result and `complete` job state commit atomically. The artifact primary key is
-  the meeting/version/transcript-revision/Notes-revision tuple. An explicit refresh
+  the meeting/version/transcript-revision/Notes-revision/vocabulary-revision tuple. An explicit refresh
   of an already-published tuple reuses its artifact without another CLI request.
 - Previously published artifacts remain readable through `post_call_results`;
   `post_call_list` marks the latest artifact current/outdated. These artifacts do
@@ -160,30 +167,40 @@ and checkpoint reuse. Explicit in-person recordings retain neutral room micropho
 labels; no model-channel identity or voice-profile assertion is introduced. #10's
 accepted session-policy resolver must apply in the **shared native diarization
 inner path**, before the candidate-only restrictive adapter. This branch does not
-import unfinished #10/#11 work or duplicate that policy implementation. The added
+merge the accepted #10/#11/#12/#14 reference `3d36ddfeb146367cba1578f2d26a485db4201c87`
+independently or duplicate its policy implementation. Coordinator convergence must
+preserve the ordinary authoritative candidate entrypoint, original-folder policy,
+explicit selection and guarded native recording priority. Overlap includes
+`audio/retranscription.rs`, `audio/recording_commands.rs`, `diarization/mod.rs` and
+`database/transcript_versions.rs`. The added
 cancellation scope wraps work, not identity decisions; preserve it when merging
 that shared `spawn_blocking` entrypoint and both recorder-start gates.
 
-### #16 approved-vocabulary seam (not integrated here)
+### #16 accepted approved-vocabulary integration
 
-The updated contract names:
-`VocabularyRepository::approved_global(pool)` -> `ApprovedGlobalVocabulary {
-terms: String, revision: i64 }`, read with one SELECT at summary-job execution;
-`codex_cli::vocabulary::ApprovedVocabulary::global(&terms, revision)?` then
-`.augment_prompt(&prompt)?` before this worker's normal isolated `cli::generate`.
-Save the helper's actual `.revision()` and `vocabulary:global:N` snapshot identity
-in result/job provenance; include that snapshot in cache identity so an approved
-vocabulary change does not reuse a differently-guided result. The source is
-`approved_vocabulary`, scope global: spelling guidance only, not speech, Notes,
-decisions, or evidence. Never use legacy `get_global`/`get_effective` for summaries.
-Existing `get_effective` here remains only the preexisting local ASR hint interface.
+At the beginning of each executing attempt, before local inference, the native
+snapshot reader calls `VocabularyRepository::approved_global(pool)` with one SELECT.
+The immutable `terms`/`revision` snapshot stays owned by that attempt. Subsequent
+approval edits affect the next attempt, never mutate an in-flight prompt.
+`ApprovedVocabulary::global(&terms, revision)?` and `.augment_prompt(&prompt)?`
+run before the ordinary isolated `cli::generate`; errors are visible, without
+truncation or fallback. Legacy `get_global`/`get_effective` remain ASR-only hints.
 
-No unfinished files/branch/helper were copied. The integration point is immediately
-before `generate` in `worker.rs`; accepted #16 integration must add its actual
-snapshot to artifact provenance/cache key and run combined tests: legacy-only
-terms excluded, the in-flight snapshot immutable across edits, 1,000 Unicode
-characters/512 KiB final-prompt overflow explicit with no truncation/publication.
-Those combined tests have **not run** without the accepted helper. #16 owns it.
+Migration `20261118001501_post_call_vocabulary.sql` binds the attempt revision in
+`post_call_jobs` and adds it to the immutable artifact primary key. Pre-integration
+artifacts survive under revision `-1` (explicitly unbound); they cannot satisfy a
+new approved-snapshot cache lookup. The result UI exposes `vocabulary:global:N`.
+A refresh binds the latest approved snapshot, including a newer empty snapshot,
+and cannot reuse an artifact guided by a different revision. A vocabulary edit
+alone does not rewrite completed artifacts or automatically schedule a new job.
+
+The helper labels `approved_vocabulary`, scope `global`, as spelling-only untrusted
+data, separate from speech and personal Notes. It cannot be summary evidence,
+participant agreement, owner or deadline. Combined tests verify legacy exclusion,
+immutability across a mid-local-work approval edit, approval invalidation to an
+empty newer snapshot, independent speech/Notes provenance, distinct cache identities,
+forward artifact migration and visible 1,000-Unicode-character/512-KiB final-prompt
+limits with no CLI request on overflow. #16 owns the helper and approval proof.
 
 ### #18 summary-owner generation seam (not integrated here)
 
@@ -211,7 +228,7 @@ These tests use synthetic local text, SQLite and fake CLI executables only:
 
 - `python3 frontend/scripts/test-post-call-portable.py`: production queue storage,
   runner, evidence validation, recording-priority admission and scoped cancellation;
-  **16 passed**; includes disk reopen, epoch fencing, defer/resume, two calls, interruption, CLI
+  **25 passed**; includes disk reopen, epoch fencing, defer/resume, two calls, interruption, CLI
   failure/retry, immutable history and all revision-tuple stale guards.
 - `python3 frontend/scripts/test-post-call-native.py`: production scheduler,
   actual awaited refinement/start bodies, native command bodies, real migrations,
@@ -224,9 +241,10 @@ These tests use synthetic local text, SQLite and fake CLI executables only:
   passed** across real repository/save/recovery/Notes/version/SQLite/FFmpeg tests.
   Includes actual normal/recovery queue enqueue/rollback and deterministic candidate
   checkpoint preservation. Generated audio is synthetic; this is not an ASR test.
-- Isolated frontend runner: final **47/47** files passed. The initial run was **46/47**; the
+- Isolated frontend runner: final **49/49** files passed. The initial run was **46/47**; the
   page-editor mock lacked the newly imported Tauri event transport. After fixing
-  that fixture, all **10** page-editor tests and the entire isolated runner pass.
+  that fixture, all **10** page-editor tests and the entire isolated runner pass; the accepted
+  #16 history adds two vocabulary test files.
 - Queue UI **4 passed**, including scoped progress, persisted result/history,
   retry/defer, observation failures, stale cached-history tuple handling and no
   competing job/Notes/selection writes.

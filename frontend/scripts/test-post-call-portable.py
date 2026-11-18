@@ -36,7 +36,11 @@ tempfile="={v['tempfile']}"
     modules = '\n'.join(f'#[path="{SRC}/post_call/{n}.rs"] pub mod {n};' for n in ('store', 'summary', 'priority', 'runner'))
     (work / 'src/lib.rs').write_text(f'''pub mod api {{{segment}}}
 {modules}
+pub mod config {{pub const DEFAULT_PARAKEET_MODEL:&str="synthetic";}}
+pub mod codex_cli {{#[path="{SRC}/codex_cli/vocabulary.rs"]pub mod vocabulary;}}
+pub mod database {{pub mod repositories {{#[path="{SRC}/database/repositories/vocabulary.rs"]pub mod vocabulary;}}}}
 #[path="{SRC}/diarization/batch_control.rs"] pub mod batch_control;
+#[cfg(test)] #[path="{ROOT}/frontend/tests/native/post-call-fixture.rs"] mod test_schema;
 #[cfg(test)] #[path="{ROOT}/frontend/tests/native/post-call.rs"] mod tests;
 #[cfg(test)] #[path="{ROOT}/frontend/tests/native/post-call-summary.rs"] mod summary_tests;
 #[cfg(test)] #[path="{ROOT}/frontend/tests/native/post-call-priority.rs"] mod priority_tests;

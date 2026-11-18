@@ -8,11 +8,12 @@ type Job = {
   meeting_id: string; status: string; stage: string; epoch: number;
   candidate_id: string | null; error: string | null; result_json: string | null;
   result_version: string | null; result_transcript_revision: number | null;
-  result_notes_revision: number | null; result_current: boolean;
+  result_notes_revision: number | null; result_vocabulary_revision: number | null;
+  vocabulary_revision: number | null; result_current: boolean;
 };
 type Artifact = {
   version_id: string; transcript_revision: number; notes_revision: number;
-  result_json: string; created_at: string;
+  vocabulary_revision: number; result_json: string; created_at: string;
 };
 type Claim = {
   text: string; evidence: Array<{ source: string; row_id: string | null; quote: string }>;
@@ -83,13 +84,13 @@ function QueueJob({ job, control, busy }: { job: Job; control: (id: string, acti
       {job.result_json && <button className="underline" onClick={() => void loadHistory()}>History</button>}
     </div>
     {job.result_json && <details>
-      <summary className="cursor-pointer text-xs">{job.result_current ? 'Saved summary' : 'Outdated summary · selected transcript or Notes changed'}</summary>
-      <p className="my-1 break-all text-xs text-muted-foreground">Version {job.result_version} · transcript revision {job.result_transcript_revision} · Notes revision {job.result_notes_revision}</p>
+      <summary className="cursor-pointer text-xs">{job.result_current ? 'Saved summary' : 'Outdated summary · transcript, Notes or spelling snapshot changed'}</summary>
+      <p className="my-1 break-all text-xs text-muted-foreground">Version {job.result_version} · transcript revision {job.result_transcript_revision} · Notes revision {job.result_notes_revision} · Approved vocabulary {job.result_vocabulary_revision != null && job.result_vocabulary_revision >= 0 ? `vocabulary:global:${job.result_vocabulary_revision}` : 'not bound (older artifact)'}</p>
       <SummaryResult json={job.result_json} meetingId={job.meeting_id} current={job.result_current} />
     </details>}
-    {history && <details open><summary className="text-xs">Retained summary history ({history.length})</summary>{history.map(item => <details key={`${item.version_id}:${item.transcript_revision}:${item.notes_revision}`}>
-      <summary className="text-xs">{item.created_at} · transcript {item.transcript_revision} · Notes {item.notes_revision}</summary>
-      <SummaryResult json={item.result_json} meetingId={job.meeting_id} current={job.result_current && item.version_id === job.result_version && item.transcript_revision === job.result_transcript_revision && item.notes_revision === job.result_notes_revision} />
+    {history && <details open><summary className="text-xs">Retained summary history ({history.length})</summary>{history.map(item => <details key={`${item.version_id}:${item.transcript_revision}:${item.notes_revision}:${item.vocabulary_revision}`}>
+      <summary className="text-xs">{item.created_at} · transcript {item.transcript_revision} · Notes {item.notes_revision} · spelling snapshot {item.vocabulary_revision}</summary>
+      <SummaryResult json={item.result_json} meetingId={job.meeting_id} current={job.result_current && item.version_id === job.result_version && item.transcript_revision === job.result_transcript_revision && item.notes_revision === job.result_notes_revision && item.vocabulary_revision === job.result_vocabulary_revision} />
     </details>)}</details>}
     {error && <p role="alert" className="text-xs text-destructive">{error}</p>}
   </article>;

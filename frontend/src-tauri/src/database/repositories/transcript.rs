@@ -373,6 +373,7 @@ mod tests {
         sqlx::raw_sql(include_str!("../../../migrations/20261118001400_transcript_versions.sql")).execute(&pool).await.unwrap();
         sqlx::raw_sql(include_str!("../../../migrations/20261118001401_transcript_version_references.sql")).execute(&pool).await.unwrap();
         sqlx::raw_sql(include_str!("../../../migrations/20261118001500_post_call_queue.sql")).execute(&pool).await.unwrap();
+        sqlx::raw_sql(include_str!("../../../migrations/20261118001501_post_call_vocabulary.sql")).execute(&pool).await.unwrap();
         let meeting = TranscriptsRepository::save_transcript(&pool, "Test", &[make_turn("Alice"), make_turn("Speaker 2")], None, None)
             .await.unwrap();
         let linked: Vec<String> = sqlx::query_scalar("SELECT speaker_label FROM person_speakers WHERE meeting_id = ?")
@@ -419,6 +420,7 @@ mod issue9_recovery_tests {
         sqlx::raw_sql(include_str!("../../../migrations/20261118001400_transcript_versions.sql")).execute(&pool).await.unwrap();
         sqlx::raw_sql(include_str!("../../../migrations/20261118001401_transcript_version_references.sql")).execute(&pool).await.unwrap();
         sqlx::raw_sql(include_str!("../../../migrations/20261118001500_post_call_queue.sql")).execute(&pool).await.unwrap();
+        sqlx::raw_sql(include_str!("../../../migrations/20261118001501_post_call_vocabulary.sql")).execute(&pool).await.unwrap();
         super::super::notes_document::tests::create_notes_schema(&pool).await;
         pool
     }
