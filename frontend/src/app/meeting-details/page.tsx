@@ -423,6 +423,7 @@ function MeetingDetailsContent() {
     shouldAutoGenerate={shouldAutoGenerate}
     onAutoGenerateComplete={() => setShouldAutoGenerate(false)}
     onSummaryReady={(summary) => setMeetingSummary(summary)}
+    onSummaryInvalidated={() => { setMeetingSummary(null); setSummaryUserEdited(false); }}
     onMeetingUpdated={async () => {
       await Promise.allSettled([fetchMeetingDetails(), refetchMeetings()]);
     }}

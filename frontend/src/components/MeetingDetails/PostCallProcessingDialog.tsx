@@ -1,50 +1,22 @@
 "use client";
 
-/**
- * Owns the post-recording handoff. This must remain a single ordered workflow:
- * speaker count choice -> source-track retranscription -> refetch ->
- * diarization -> refetch -> summary gate. Starting summary or diarization
- * elsewhere races the transactional transcript replacement.
- *
- * Retranscription is event-driven because the Tauri start command returns after
- * spawning its native task. Listeners therefore register before invoke and are
- * meeting-ID filtered. The two refresh failures are intentionally distinct:
- * retrying the first must still run diarization, while retrying the second may
- * complete immediately. Audio-disabled meetings can explicitly continue with
- * their live transcript so the summary stage is never permanently blocked.
- */
+/** Native owns the durable job; the view only starts, observes or defers it. */
 
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { useDiarizationEngine } from '@/hooks/useDiarizationEngine';
-import { listen, UnlistenFn } from '@tauri-apps/api/event';
+import { listen } from '@tauri-apps/api/event';
 
 import { toast } from 'sonner';
 import { useConfig } from '@/contexts/ConfigContext';
-import { cn } from '@/lib/utils';
 import { Button } from '@/components/ui/button';
-import { fieldClass } from '@/components/ui/input';
 import { PostCallHandoffCard } from '@/components/PostCallHandoffCard';
 import type { RawModelInfo } from '@/hooks/useTranscriptionModels';
 import { isVisibleParakeetModel } from '@/lib/parakeet';
-import { announceChange } from '@/lib/workspace-api';
-
-type Stage = 'idle' | 'prompt' | 'enhancing' | 'diarizing' | 'refreshing' | 'error';
-type FailedStage = 'enhancing' | 'diarizing' | 'pre-diarization-refresh' | 'post-diarization-refresh';
 
 interface RetranscriptionProgress {
   meeting_id: string;
   progress_percentage: number;
   message: string;
-}
-
-interface RetranscriptionResult {
-  meeting_id: string;
-}
-
-interface RetranscriptionError {
-  meeting_id: string;
-  error: string;
 }
 
 interface ModelChoice {
@@ -92,379 +64,118 @@ async function resolveEnhancementModel(
   throw new Error('No downloaded transcription model is available for post-call enhancement.');
 }
 
-async function runRetranscription({
-  meetingId,
-  meetingFolderPath,
-  language,
-  model,
-  onProgress,
-}: {
-  meetingId: string;
-  meetingFolderPath: string;
-  language: string | null;
-  model: ModelChoice;
-  onProgress: (progress: RetranscriptionProgress) => void;
-}): Promise<void> {
-  const unlisteners: UnlistenFn[] = [];
-  let settled = false;
-  let timedOut = false;
-  let resolveCompletion!: () => void;
-  let rejectCompletion!: (error: unknown) => void;
-  let timeoutId: ReturnType<typeof setTimeout> | undefined;
-  const completion = new Promise<void>((resolve, reject) => {
-    resolveCompletion = resolve;
-    rejectCompletion = reject;
-  });
-  const cleanup = () => {
-    if (timeoutId) clearTimeout(timeoutId);
-    unlisteners.splice(0).forEach((unlisten) => unlisten());
-  };
-  const finish = (error?: unknown) => {
-    if (settled) return;
-    settled = true;
-    cleanup();
-    if (error) rejectCompletion(error);
-    else resolveCompletion();
-  };
-
-  try {
-    unlisteners.push(await listen<RetranscriptionProgress>(
-      'retranscription-progress',
-      (event) => {
-        if (event.payload.meeting_id === meetingId) onProgress(event.payload);
-      },
-    ));
-    unlisteners.push(await listen<RetranscriptionResult>(
-      'retranscription-complete',
-      (event) => {
-        if (!timedOut && event.payload.meeting_id === meetingId) finish();
-      },
-    ));
-    unlisteners.push(await listen<RetranscriptionError>(
-      'retranscription-error',
-      (event) => {
-        if (!timedOut && event.payload.meeting_id === meetingId) {
-          finish(new Error(event.payload.error));
-        }
-      },
-    ));
-
-    try {
-      await invoke('start_retranscription_command', {
-        meetingId,
-        meetingFolderPath,
-        language,
-        model: model.name,
-        provider: model.provider,
-        vocabularyTerms: null,
-        vocabularyScope: null,
-      });
-    } catch (error) {
-      finish(error);
-    }
-    timeoutId = setTimeout(() => {
-      timedOut = true;
-      void (async () => {
-        await invoke('cancel_retranscription_command').catch(() => undefined);
-        for (let attempt = 0; attempt < 60; attempt++) {
-          const active = await invoke<boolean>('is_retranscription_in_progress_command')
-            .catch(() => false);
-          if (!active) break;
-          await new Promise((resolve) => setTimeout(resolve, 500));
-        }
-        finish(new Error('Enhancement timed out and was cancelled.'));
-      })();
-    }, 30 * 60 * 1000);
-    await completion;
-  } finally {
-    cleanup();
-  }
+interface PostCallProcessingProps {
+  enabled: boolean; meetingId: string; meetingFolderPath?: string | null;
+  onRefetchTranscripts?: () => Promise<void>; onComplete: () => Promise<void> | void;
 }
 
-export function PostCallProcessingDialog({
-  enabled,
-  meetingId,
-  meetingFolderPath,
-  onRefetchTranscripts,
-  onComplete,
-}: {
-  enabled: boolean;
-  meetingId: string;
-  meetingFolderPath?: string | null;
-  onRefetchTranscripts?: () => Promise<void>;
-  onComplete: () => void;
-}) {
+export function PostCallProcessingDialog(props: PostCallProcessingProps) {
+  return <PostCallProcessingHandoff key={props.meetingId} {...props} />;
+}
+
+function PostCallProcessingHandoff({
+  enabled, meetingId, meetingFolderPath, onRefetchTranscripts, onComplete,
+}: PostCallProcessingProps) {
   const { selectedLanguage, transcriptModelConfig } = useConfig();
-  const [stage, setStage] = useState<Stage>(enabled ? 'prompt' : 'idle');
-  const { engine, isNemotron, error: engineError } = useDiarizationEngine(stage !== 'idle');
-  const [speakerCount, setSpeakerCount] = useState('2');
-  const [autoDetectSpeakers, setAutoDetectSpeakers] = useState(false);
-  const [progress, setProgress] = useState(0);
-  const [message, setMessage] = useState('Preparing enhanced transcript...');
+  const [working, setWorking] = useState(false);
+  const [message, setMessage] = useState('');
   const [error, setError] = useState<string | null>(null);
-  const [failedStage, setFailedStage] = useState<FailedStage | null>(null);
-  const initializedMeetingRef = useRef<string | null>(null);
-  const activeStageRef = useRef<FailedStage>('enhancing');
-  const skippedEnhancementRef = useRef(false);
+  const [done, setDone] = useState(false);
+  const job = useRef<string | null>(null);
+  const starting = useRef(false);
+  const [progress, setProgress] = useState(0);
+  const [completionPending, setCompletionPending] = useState(false);
+  const completing = useRef(false);
+  const completionFailed = useRef(false);
+  const handoffKey = `post-call-handoff:${meetingId}`;
+  const complete = useCallback(async (deferred = false) => {
+    if (completing.current) return;
+    completing.current = true;
+    try {
+      if (!deferred) await onRefetchTranscripts?.();
+      await onComplete();
+      // Persist only a successfully consumed handoff, never an inference start.
+      window.localStorage.setItem(handoffKey, deferred ? 'deferred' : 'ready');
+      completionFailed.current = false;
+      setCompletionPending(false); setDone(true); setWorking(false);
+      if (!deferred) toast.success('Refined version saved separately', { description: 'Review it in Transcript versions. Live text and corrections stay selected.' });
+    } catch (cause) {
+      completionFailed.current = true;
+      setCompletionPending(true); setWorking(false); setError(String(cause));
+    } finally { completing.current = false; }
+  }, [handoffKey, onComplete, onRefetchTranscripts]);
 
-  const storageKey = `post-call-processing:${meetingId}`;
-
+  // Poll persisted job state as well as listening to progress. Native ownership
+  // survives navigation/reload; missed completion events cannot lose a result.
   useEffect(() => {
-    if (!enabled || !meetingId || initializedMeetingRef.current === meetingId) return;
-    initializedMeetingRef.current = meetingId;
-    const terminalState = sessionStorage.getItem(storageKey);
-    if (terminalState === 'completed') {
-      onComplete();
-      return;
+    if (!enabled || done) return;
+    let disposed = false;
+    let checking = false;
+    let consumed: string | null = null;
+    try { consumed = window.localStorage.getItem(handoffKey); }
+    catch (cause) { setError(String(cause)); }
+    if (consumed === 'ready' || consumed === 'deferred') {
+      void Promise.resolve().then(onComplete).then(() => { if (!disposed) setDone(true); }).catch((cause) => { if (!disposed) { setError(String(cause)); setCompletionPending(true); completionFailed.current = true; } });
+      return () => { disposed = true; };
     }
-    setStage('prompt');
-  }, [enabled, meetingId, onComplete, storageKey]);
-
-  const completeWorkflow = () => {
-    sessionStorage.setItem(storageKey, 'completed');
-    setStage('idle');
-    toast.success('Post-call processing complete', {
-      description: skippedEnhancementRef.current
-        ? 'Speaker labels refreshed from the saved transcript.'
-        : 'Transcript enhanced and speaker labels refreshed.',
+    const check = async () => {
+      if (checking || starting.current) return;
+      const observedJob = job.current;
+      checking = true;
+      try {
+        const state = await invoke<{ versions: Array<{ id: string; kind: string; status: string; error?: string }> }>('list_transcript_versions', { meetingId });
+        if (disposed || starting.current || observedJob !== job.current) return;
+        const active = state.versions.find((v) => v.status === 'running');
+        if (active) { job.current = active.id; setWorking(true); }
+        else {
+          const finished = job.current ? state.versions.find((v) => v.id === job.current)
+            : [...state.versions].reverse().find((v) => v.kind === 'refined');
+          if (finished?.status === 'ready') {
+            job.current = finished.id;
+            if (!completionFailed.current) await complete();
+          } else if (finished) {
+            setWorking(false); setError(finished.error ?? `Refinement ${finished.status}. Previous text is unchanged.`);
+          }
+        }
+      } catch (cause) { if (!disposed) setError(String(cause)); }
+      finally { checking = false; }
+    };
+    void check();
+    const timer = setInterval(() => void check(), 2000);
+    const listener = listen<RetranscriptionProgress>('retranscription-progress', ({ payload }) => {
+      if (!disposed && payload.meeting_id === meetingId) { setMessage(payload.message); setProgress(payload.progress_percentage); }
     });
-    onComplete();
-  };
-
-  const refreshTranscript = async (
-    phase: 'pre-diarization-refresh' | 'post-diarization-refresh',
-  ) => {
-    activeStageRef.current = phase;
-    setStage('refreshing');
-    setMessage('Refreshing the enhanced transcript...');
-    await onRefetchTranscripts?.();
-    // The rerun links named speakers (and matched voices) to contacts.
-    announceChange('people');
-  };
-
-  const identifySpeakers = async (count: number | null) => {
-    activeStageRef.current = 'diarizing';
-    setStage('diarizing');
-    setProgress(100);
-    setMessage(count === null
-      ? 'Auto-detecting speakers...'
-      : `Identifying ${count} speaker${count === 1 ? '' : 's'}...`);
-    await invoke('diarize_meeting', { meetingId, numSpeakers: count });
-    await refreshTranscript('post-diarization-refresh');
-    completeWorkflow();
-  };
-
-  const runWorkflow = async (count: number | null) => {
-    if (!meetingFolderPath) {
-      throw new Error('The recording folder is unavailable for enhancement.');
-    }
-
-    setError(null);
-    setFailedStage(null);
-    activeStageRef.current = 'enhancing';
-    setStage('enhancing');
-    setProgress(0);
-    setMessage('Preparing enhanced transcript...');
-    const postCallConfig = await invoke<PostCallTranscriptConfig>('api_get_post_call_transcript_config')
-      .catch(() => ({ provider: 'live' as const, model: '' }));
-    const useLiveDefault = postCallConfig.provider === 'live';
-    const model = await resolveEnhancementModel(
-      useLiveDefault ? transcriptModelConfig?.provider : postCallConfig.provider,
-      useLiveDefault ? transcriptModelConfig?.model : postCallConfig.model,
-    );
-    await runRetranscription({
-      meetingId,
-      meetingFolderPath,
-      language: model.provider === 'parakeet' || selectedLanguage === 'auto'
-        ? null
-        : selectedLanguage || null,
-      model,
-      onProgress: (nextProgress) => {
-        setProgress(nextProgress.progress_percentage);
-        setMessage(nextProgress.message);
-      },
-    });
-    // Retranscription transactionally replaces the rows. Refresh immediately so
-    // a later diarization error can never leave the old live transcript onscreen.
-    await refreshTranscript('pre-diarization-refresh');
-    await identifySpeakers(count);
-  };
-
-  const getSelectedSpeakerCount = (): number | null | undefined => {
-    if (isNemotron || autoDetectSpeakers) return null;
-    const count = Number(speakerCount);
-    if (!Number.isInteger(count) || count < 1 || count > 20) {
-      setError('Enter the total number of speakers, from 1 to 20.');
-      return undefined;
-    }
-    return count;
-  };
+    return () => { disposed = true; clearInterval(timer); void listener.then((stop) => stop()).catch(() => undefined); };
+  }, [enabled, meetingId, done, handoffKey, onComplete, complete]);
 
   const start = async () => {
-    const count = getSelectedSpeakerCount();
-    if (count === undefined) return;
+    if (starting.current || completing.current || completionPending) return;
+    starting.current = true;
+    setError(null); setWorking(true); setProgress(0);
     try {
-      if (failedStage === 'diarizing') {
-        await identifySpeakers(count);
-      } else if (failedStage === 'pre-diarization-refresh') {
-        await refreshTranscript('pre-diarization-refresh');
-        await identifySpeakers(count);
-      } else if (failedStage === 'post-diarization-refresh') {
-        await refreshTranscript('post-diarization-refresh');
-        completeWorkflow();
-      } else {
-        skippedEnhancementRef.current = false;
-        await runWorkflow(count);
-      }
-    } catch (cause) {
-      const nextError = cause instanceof Error ? cause.message : String(cause);
-      setFailedStage(activeStageRef.current);
-      setError(nextError);
-      setStage('error');
-      toast.error('Post-call processing failed', { description: nextError });
-    }
-  };
-
-  const skipEnhancement = async () => {
-    const count = getSelectedSpeakerCount();
-    if (count === undefined) return;
-    skippedEnhancementRef.current = true;
-    setError(null);
-    setFailedStage(null);
-    try {
-      await identifySpeakers(count);
-    } catch (cause) {
-      const nextError = cause instanceof Error ? cause.message : String(cause);
-      setFailedStage(activeStageRef.current);
-      setError(nextError);
-      setStage('error');
-      toast.error('Speaker identification failed', { description: nextError });
-    }
-  };
-
-  const continueWithLiveTranscript = async () => {
-    try {
-      skippedEnhancementRef.current = true;
-      await refreshTranscript('post-diarization-refresh');
-      completeWorkflow();
-      toast.info('Using the live transcript', {
-        description: 'No enhanced audio pass was applied; the saved live text remains available.',
+      if (!meetingFolderPath) throw new Error('Saved audio is unavailable. Existing text remains readable.');
+      const config = await invoke<PostCallTranscriptConfig>('api_get_post_call_transcript_config');
+      const live = config.provider === 'live';
+      const model = await resolveEnhancementModel(live ? transcriptModelConfig?.provider : config.provider, live ? transcriptModelConfig?.model : config.model);
+      const started = await invoke<{ version_id: string }>('start_retranscription_command', {
+        meetingId, meetingFolderPath, model: model.name, provider: model.provider,
+        language: model.provider === 'parakeet' || selectedLanguage === 'auto' ? null : selectedLanguage || null,
       });
-    } catch (cause) {
-      const nextError = cause instanceof Error ? cause.message : String(cause);
-      setFailedStage('post-diarization-refresh');
-      setError(nextError);
-      setStage('error');
-    }
+      job.current = started.version_id;
+    } catch (cause) { setError(String(cause)); setWorking(false); }
+    finally { starting.current = false; }
   };
-
-  const isWorking = stage === 'enhancing' || stage === 'diarizing' || stage === 'refreshing';
-  const visibleProgress = Math.max(4, Math.min(100, progress));
-
-  if (stage === 'idle') return null;
-
-  const choiceClass = (selected: boolean) =>
-    cn(
-      'h-9 rounded-lg border text-sm font-semibold transition-[background-color,border-color,color,transform] active:scale-[0.97]',
-      selected
-        ? 'border-af-accent bg-af-accent text-af-on-accent'
-        : 'border-af-border bg-af-panel-2 text-af-text-2 hover:border-af-border-strong hover:bg-af-hover hover:text-af-text',
-    );
-
-  return (
-    <PostCallHandoffCard
-      centered
-      busy={isWorking}
-      title={
-        isWorking
-          ? 'Improving the transcript'
-          : stage === 'error'
-            ? 'Could not finish that step'
-            : isNemotron
-              ? 'Identify speakers with Nemotron'
-              : 'How many people spoke?'
-      }
-      detail={
-        isWorking
-          ? message
-          : isNemotron
-            ? 'Automatically identify up to 8 speakers from the full recording.'
-            : 'Include yourself. A real count labels speakers more accurately.'
-      }
-    >
-      {isWorking ? (
-        <div className="h-1.5 overflow-hidden rounded-full bg-af-border">
-          <div
-            className="h-full rounded-full bg-af-accent transition-[width] duration-300"
-            style={{ width: `${visibleProgress}%` }}
-          />
-        </div>
-      ) : (
-        <div className="space-y-3">
-          {engineError && <p role="alert" className="text-sm text-af-danger">{engineError}</p>}
-          {!engine && !engineError && (
-            <p role="status" className="text-sm text-af-text-3">Loading diarization settings…</p>
-          )}
-          {isNemotron && (
-            <Button className="w-full" onClick={() => { void start(); }}>
-              {stage === 'error' ? 'Retry auto-detect' : 'Auto-detect & continue'}
-            </Button>
-          )}
-          {engine && !isNemotron && (
-            <>
-              <div className="grid grid-cols-4 gap-2">
-                {[1, 2, 3, 4, 5, 6, 7, 8].map((count) => (
-                  <button
-                    key={count}
-                    type="button"
-                    className={choiceClass(!autoDetectSpeakers && speakerCount === String(count))}
-                    onClick={() => {
-                      setSpeakerCount(String(count));
-                      setAutoDetectSpeakers(false);
-                      setError(null);
-                    }}
-                  >
-                    {count}
-                  </button>
-                ))}
-                <button
-                  type="button"
-                  className={`col-span-4 ${choiceClass(autoDetectSpeakers)}`}
-                  onClick={() => {
-                    setAutoDetectSpeakers(true);
-                    setError(null);
-                  }}
-                >
-                  Auto-detect
-                </button>
-              </div>
-              <input
-                type="number"
-                min={1}
-                max={20}
-                value={autoDetectSpeakers ? '' : speakerCount}
-                placeholder={autoDetectSpeakers ? 'Speakers will be detected automatically' : undefined}
-                onFocus={() => setAutoDetectSpeakers(false)}
-                onChange={(event) => {
-                  setSpeakerCount(event.target.value);
-                  setAutoDetectSpeakers(false);
-                }}
-                className={cn(fieldClass, 'h-9')}
-                aria-label="Total number of speakers"
-              />
-            </>
-          )}
-          {error && <p className="text-sm text-af-danger">{error}</p>}
-          <div className={cn('flex items-center gap-2', isNemotron ? 'justify-center' : 'justify-end')}>
-            <Button variant="ghost" onClick={() => { void (stage === 'error' ? continueWithLiveTranscript() : skipEnhancement()); }}>
-              Keep live transcript
-            </Button>
-            {!isNemotron && <Button disabled={!engine} onClick={() => { void start(); }}>
-              {stage === 'error' ? 'Retry' : 'Continue'}
-            </Button>}
-          </div>
-        </div>
-      )}
-    </PostCallHandoffCard>
-  );
+  if (!enabled || done) return null;
+  return <PostCallHandoffCard centered busy={working} title="Local post-meeting refinement"
+    detail="ASR and automatic speaker refinement save a separate version. Live text and manual corrections are never automatically replaced. Shared-room speaker identification is outside MVP. This step does not start a summary or send text to a provider.">
+    <div className="space-y-3">
+      {error && <p role="alert" className="text-sm text-af-danger">{error}</p>}
+      {completionPending ? <Button onClick={() => void complete()}>Retry completion refresh</Button> : working ? <>
+        <p role="status" className="text-sm">{message || 'Processing saved audio locally…'} ({progress}%)</p>
+        <Button variant="ghost" onClick={() => { void invoke('cancel_retranscription_command', { meetingId, versionId: job.current }).catch((cause) => setError(String(cause))); }}>Cancel refinement</Button>
+        <p className="text-xs text-af-text-2">Cancellation waits for the current model inference. You can leave this page; the result and status remain saved.</p>
+      </> : <Button onClick={() => void start()} disabled={!meetingFolderPath}>{error ? 'Retry local refinement' : 'Create refined version'}</Button>}
+      <Button variant="ghost" onClick={() => void complete(true)}>Keep live transcript / defer</Button>
+    </div>
+  </PostCallHandoffCard>;
 }

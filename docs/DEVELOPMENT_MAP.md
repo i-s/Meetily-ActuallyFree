@@ -115,12 +115,40 @@ source labels rather than guessing a speaker or switching engines.
 
 ## 3. Post-call processing and model selection
 
+Issue #14's local ASR + diarization candidate workflow, immutable live/refined/
+corrections snapshots, revision-checked selection and text corrections, restart/
+cancellation ownership, source-neutral in-person policy, #9 recovery invariants,
+#15/#16 interfaces and deferred same-audio RU/EN/Mac qualification are documented
+in [ISSUE14_TRANSCRIPT_VERSIONS.md](ISSUE14_TRANSCRIPT_VERSIONS.md). Read it before
+changing retranscription commit or post-call sequencing. Native refinement now
+saves a separate version; it never deletes selected transcript rows on success.
+Meeting details owns the normal version review/select/correction UI. Automatic
+post-recording summary handoff is deferred to the approved subscriber Codex CLI
+integration, rather than silently using a legacy configured text provider.
+The feature note also names the #10 seam: opaque recording metadata and per-row
+capture source maps survive candidate/correction/restore; generated labels are
+not manual identity. #10's accepted session-policy resolution must cover the
+shared native inner path, before the candidate-only restrictive adapter.
+R1 adds editor-safe in-place refresh, snapshot contact mappings, version-aware
+retained task anchors, consumed per-meeting handoff/retry, fresh local language
+detection and manifest-required dual-source checks. #15 owns queue/preemption;
+#16 owns term corrections.
+R2 preserves deleted/conflicted contact-mapping evidence during restore: only
+absent evidence permits ordinary normalized contact reconstruction. See the
+feature note for exact/normalized controls, meeting isolation and rollback tests.
+
 Issue #12's live/library Notes editor, session-keyed autosave, transactional
 save/recovery association, independent data ownership, revisioned read interfaces
 for #13/#15/#18, portable coverage and deferred physical Mac gates are documented
 in [ISSUE12_NOTES.md](ISSUE12_NOTES.md). Read it before changing Notes or copying
 live data during Stop. A Notes draft is not speech, a title is not a session key,
 and a JS completion callback is not the owner of its native association.
+
+Combined #12/#14 editor preparation, stable `meeting:<id>` Notes ownership,
+independent revisions and real-component/SQLite qualification are documented in
+[ISSUE12_14_INTEGRATION.md](ISSUE12_14_INTEGRATION.md). Selection and correction
+drain Notes conversion/store readback and summary saving before native mutation;
+transcript projection refresh never replaces Notes or consents to recovery writes.
 
 Summary-generated title ownership, placeholder rejection and completion refresh
 are documented in [SUMMARY_GENERATED_TITLES.md](SUMMARY_GENERATED_TITLES.md).

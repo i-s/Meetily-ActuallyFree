@@ -114,7 +114,11 @@ async fn selected_versions_compatibility_uses_actual_selection_and_correction_wi
     use crate::transcript_versions as versions;
     let pool = db().await;
     meeting(&pool, "m", "Meeting").await;
-    notes(&pool, "m", "Моя идея не речь", 7).await;
+    notes(&pool, "m", "Previous Notes", 6).await;
+    let rich = serde_json::json!([{"type":"paragraph","content":[{"type":"text","text":"Моя идея AP","styles":{}},{"type":"text","text":"I не речь","styles":{"bold":true}}]}]);
+    let markdown = "Моя идея AP**I не речь**";
+    let revision = crate::database::repositories::notes_document::write(&pool, "meeting:m", markdown, Some(rich.clone()), 6).await.unwrap();
+    assert_eq!(revision, 7);
     phrase(&pool, "live-row", "m", "Live words", 2.0).await;
     sqlx::query("INSERT INTO summary_processes(meeting_id,status,created_at,updated_at,result) VALUES('m','completed','now','now','Former summary')").execute(&pool).await.unwrap();
     let baseline = versions::selected(&pool, "m").await.unwrap();
@@ -135,7 +139,12 @@ async fn selected_versions_compatibility_uses_actual_selection_and_correction_wi
     versions::correct_text(&pool, "m", "refined-row", "Исправленный API", selected.revision).await.unwrap();
     let corrected = library::export_snapshot(&pool, "m", 7).await.unwrap();
     assert_eq!(corrected.transcripts[0].text, "Исправленный API");
-    assert_eq!(corrected.notes.revision, 7);
+    assert_eq!(corrected.notes.revision, revision);
+    assert_eq!(corrected.notes.markdown, markdown);
+    assert_eq!(corrected.notes.json, Some(rich));
+    assert!(library::export_snapshot(&pool, "m", 6).await.is_err());
+    let hits = library::search(&pool, "идея api", 10, false).await.unwrap();
+    assert_eq!(hits.len(), 1); assert_eq!(hits[0].kind, "notes");
     assert!(library::search(&pool, "уточнённая", 10, false).await.unwrap().is_empty());
     assert_eq!(library::search(&pool, "исправленный", 10, false).await.unwrap().len(), 1);
 }

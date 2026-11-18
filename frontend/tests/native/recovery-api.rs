@@ -13,8 +13,10 @@ async fn state() -> AppState {
         .connect(":memory:")
         .await
         .unwrap();
-    sqlx::raw_sql("CREATE TABLE meetings (id TEXT PRIMARY KEY, title TEXT, created_at TEXT, updated_at TEXT, folder_path TEXT, title_is_manual INTEGER); CREATE TABLE transcripts (id TEXT PRIMARY KEY, meeting_id TEXT, transcript TEXT, timestamp TEXT, audio_start_time REAL, audio_end_time REAL, duration REAL, speaker TEXT);")
+    sqlx::raw_sql("CREATE TABLE meetings (id TEXT PRIMARY KEY, title TEXT, created_at TEXT, updated_at TEXT, folder_path TEXT, title_is_manual INTEGER); CREATE TABLE person_speakers(person_id TEXT, meeting_id TEXT, speaker_label TEXT, UNIQUE(meeting_id,speaker_label)); CREATE TABLE transcripts (id TEXT PRIMARY KEY, meeting_id TEXT, transcript TEXT, timestamp TEXT, audio_start_time REAL, audio_end_time REAL, duration REAL, speaker TEXT);")
         .execute(&pool).await.unwrap();
+    sqlx::raw_sql(include_str!("../../src-tauri/migrations/20261118001400_transcript_versions.sql")).execute(&pool).await.unwrap();
+    sqlx::raw_sql(include_str!("../../src-tauri/migrations/20261118001401_transcript_version_references.sql")).execute(&pool).await.unwrap();
     crate::notes_document::tests::create_notes_schema(&pool).await;
     AppState {
         db_manager: DbManager(pool),

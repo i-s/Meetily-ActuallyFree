@@ -57,6 +57,8 @@ type SummaryStatus = 'idle' | 'processing' | 'summarizing' | 'regenerating' | 'c
 export interface MeetingDocumentProps {
   meetingId: string;
   focusNotes?: boolean;
+  transcriptChanging?: boolean;
+  registerTranscriptPreparation?: (prepare: () => Promise<void>) => (() => void);
   aiSummary: any;
   summaryUserEdited: boolean;
   onSummaryChange: (summary: any, source: 'user' | 'system') => void;
@@ -140,6 +142,8 @@ export function MeetingDocument(props: MeetingDocumentProps) {
 function NotesTab({
   meetingId,
   focusNotes,
+  transcriptChanging,
+  registerTranscriptPreparation,
   aiSummary,
   summaryUserEdited,
   onSummaryChange,
@@ -236,6 +240,22 @@ function NotesTab({
     setUserEdited(true);
   });
 
+  const notesConversion = useRef<() => Promise<void>>(async () => {});
+  const summaryConversion = useRef<() => Promise<void>>(async () => {});
+  const registerNotesFlush = useCallback((flush: () => Promise<void>) => {
+    notesConversion.current = flush;
+    return () => { notesConversion.current = async () => {}; };
+  }, []);
+  const registerSummaryFlush = useCallback((flush: () => Promise<void>) => {
+    summaryConversion.current = flush;
+    return () => { summaryConversion.current = async () => {}; };
+  }, []);
+  useEffect(() => registerTranscriptPreparation?.(async () => {
+    await Promise.all([notesConversion.current(), summaryConversion.current()]);
+    const saved = await summarySaver.flush();
+    if (!saved) throw new Error('Save pending notes and summary edits before changing transcript versions. Retry after storage recovers.');
+  }), [registerTranscriptPreparation, summarySaver.flush]);
+
   const generating = summaryStatus === 'processing' || summaryStatus === 'summarizing' || summaryStatus === 'regenerating';
   const hasSummary = !!aiSummary && !!markdown.trim();
 
@@ -299,7 +319,7 @@ function NotesTab({
         {/* Notes */}
         <section ref={notesSection} id="user-notes" tabIndex={-1}>
           <SectionTitle icon={NotebookPen}>Your notes — not recognized speech</SectionTitle>
-          <MeetingNotesEditor key={meetingId} target={`meeting:${meetingId}`} />
+          <MeetingNotesEditor key={meetingId} target={`meeting:${meetingId}`} editable={!transcriptChanging} registerFlush={registerNotesFlush} />
         </section>
 
         {/* Action items */}
@@ -456,6 +476,8 @@ function NotesTab({
           ) : hasSummary ? (
             <NotesEditor
               key={`summary-${meetingId}-${revision}`}
+              editable={!transcriptChanging}
+              registerFlush={registerSummaryFlush}
               initialBlocks={blocks}
               initialMarkdown={blocks ? null : markdown}
               placeholder="The summary is empty."

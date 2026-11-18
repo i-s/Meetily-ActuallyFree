@@ -90,6 +90,7 @@ export interface NotesEditorProps {
   className?: string;
   /** Called once the initial content is in the editor. */
   onReady?: () => void;
+  registerFlush?: (flush: () => Promise<void>) => (() => void);
 }
 
 export function NotesEditor({
@@ -101,6 +102,7 @@ export function NotesEditor({
   onDraft,
   className,
   onReady,
+  registerFlush,
 }: NotesEditorProps) {
   const [theme] = useAppTheme();
   const dark = themeInfo(theme).dark;
@@ -151,11 +153,22 @@ export function NotesEditor({
   // Preserve exact JSON before conversion starts. A failed conversion leaves
   // the recovery draft intact and blocks an AI snapshot of stale markdown.
   const lastMarkdown = useRef(initialMarkdown ?? '');
+  const conversions = useRef<Promise<void>>(Promise.resolve());
+  useEffect(() => registerFlush?.(async () => {
+    // Only the newest edit is authoritative; an older conversion may still be
+    // finishing when a newer JSON draft has already replaced it.
+    for (;;) {
+      const pending = conversions.current;
+      try { await pending; }
+      catch (error) { if (pending === conversions.current) throw error; }
+      if (pending === conversions.current) return;
+    }
+  }), [registerFlush]);
+  const conversionRevision = useRef(0);
   useEffect(() => {
-    let revision = 0;
     const publish = () => {
       if (!loaded.current || (!onChangeRef.current && !onDraftRef.current)) return;
-      const currentRevision = ++revision;
+      const currentRevision = ++conversionRevision.current;
       const json = structuredClone(editor.document);
       const converted = blocksToMarkdownSafely(editor, json, { source: 'notes-editor', fallbackMarkdown: lastMarkdown.current });
       const markdown = converted.then(result => {
@@ -163,11 +176,15 @@ export function NotesEditor({
         return result.markdown;
       });
       onDraftRef.current?.({ json, markdown: lastMarkdown.current }, markdown);
-      void markdown.then(value => {
-        if (currentRevision !== revision) return;
+      const published = markdown.then(value => {
+        if (currentRevision !== conversionRevision.current) return;
         lastMarkdown.current = value;
         onChangeRef.current?.({ json, markdown: value });
-      }).catch(() => {});
+      });
+      conversions.current = published;
+      // The preparation barrier observes this rejection; a normal edit must
+      // still journal exact JSON without an unhandled promise rejection.
+      void published.catch(() => {});
     };
     publishRef.current = publish;
     // BlockNote remounts its Tiptap view when editable changes, removing

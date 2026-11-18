@@ -52,9 +52,11 @@ impl MeetingNotesRepository {
         }
         let markdown = markdown.filter(|text| !text.trim().is_empty());
         let json = json.filter(|value| !value.is_null()).map(|value| value.to_string());
+        // New documents start at one so an editor that read absence at zero
+        // cannot overwrite this compatibility save through the revisioned API.
         sqlx::query(
-            "INSERT INTO meeting_notes (meeting_id, notes_markdown, notes_json, created_at, updated_at) \
-             VALUES (?, ?, ?, datetime('now'), datetime('now')) \
+            "INSERT INTO meeting_notes (meeting_id, notes_markdown, notes_json, revision, created_at, updated_at) \
+             VALUES (?, ?, ?, 1, datetime('now'), datetime('now')) \
              ON CONFLICT(meeting_id) DO UPDATE SET notes_markdown = excluded.notes_markdown, \
                  notes_json = excluded.notes_json, updated_at = excluded.updated_at, revision = meeting_notes.revision + 1",
         )

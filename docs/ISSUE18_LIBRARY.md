@@ -256,3 +256,68 @@ exit failed with `parent_not_active`; it was relayed successfully when the R1 tu
 became active. No second competing export, DMG, Actions, push or Mac operation was
 started. Full production export and real installed macOS UI/picker/audio playback
 remain qualification limits, not silently promoted acceptance passes.
+
+
+## Authorized combined integration qualification — 2026-11-18
+
+The local #18 head `2b7dbca968aed6feb479fc927568d52178ba715c` is merged
+with accepted Notes/version head `226ff989997e49a404ab8b684e6168f453f31c4f`
+using a two-parent feature merge. No default branch or remote is changed.
+The three textual conflicts retain both command/repository modules and combine
+the Notes focus/deep-link section with the version preparation barrier. Notes
+remain keyed by meeting, not selected transcript; conversion, revision CAS and
+summary flush must finish before selection/correction, and editing is disabled
+only while that operation owns the barrier.
+
+The actual combined caller test exposed a pre-existing sibling-key collision:
+`TranscriptVersions` and `MeetingExportDialog` both used the bare meeting ID.
+A focused assertion failed with React's duplicate-key warning before the selector
+key was namespaced to `versions:<meeting>`. It now passes without the warning;
+this does not change Notes editor ownership or transcript revision identity.
+
+### Fresh verification on the combined sources
+
+- `tests/library/combined-entrypoints.test.tsx`: **5 passed, 81 assertions**.
+  Actual detail page, version selection/correction, rich Notes editor/store,
+  library page/search hook, detail and batch export callers are exercised together.
+  Immediate formatted RU/EN edits wait for conversion and persist exact rich JSON
+  and Markdown at the expected revision; selection/correction refreshes the
+  chosen speech projection without remounting Notes. Archived/dirty summaries
+  disappear from search and both Markdown exports. Competing Notes writers block
+  mutation/export until the normal explicit reviewed replacement; picker write
+  failures surface, cancellation produces no success/write, and navigation while
+  a picker waits cannot write the abandoned snapshot. Transport, BlockNote engine,
+  picker/filesystem and unrelated chrome remain synthetic boundary adapters.
+- All frontend files ran in **separate Bun 1.3.10 processes**, with transpiler
+  cache disabled and a 60,000ms per-test limit: **51/51 files, 238 tests passed**.
+  This includes #18 4,501-row deep-link pagination and #14 action time navigation.
+  Log: `/tmp/issue18-final-combined-frontend.log`.
+- Portable library fixture now defaults to the current merged version repository,
+  while preserving explicit read-only compatibility-ref support. Real production
+  search/export/Notes repository bodies, all checked-in SQL migrations and real
+  SQLite: **44 passed, 0 failed, 0 ignored**, offline/locked with one Cargo job.
+  The selected-version case writes formatted Notes through native revision CAS,
+  selects/corrects real snapshots, verifies exact Notes JSON/Markdown/revision,
+  rejects a stale export revision, and searches joined adjacent rich runs.
+  Log: `/tmp/issue18-final-combined-library-sql.log`.
+- Portable recovery fixture: **83 passed, 0 failed, 0 ignored**, real SQLite and
+  cached FFmpeg with synthetic fixtures, offline and one Cargo job. Covers all
+  Notes/version attachment, conflict, migration-zero, idempotent retry and disk
+  reopen cases. Log: `/tmp/issue18-final-combined-recovery.log`.
+- Standalone TypeScript `--noEmit`: **passed** before the production build.
+  Log: `/tmp/issue18-final-combined-tsc.log`.
+- #14 `transcript_versions.rs` and `ActionItemsList.tsx` are unchanged from the
+  accepted incoming head: original action anchors and audio-time fallback remain.
+  #18 pagination/generation guards, source distinctions and deep links remain.
+
+Initial harness errors (the menu is `Export…`, not `Export`) and a new native test
+assertion that treated export Markdown's String as Option were corrected before
+these final green runs; neither required a product behavior workaround.
+
+One sequential bounded final production frontend export is authorized after this
+merge commit. Its exact SHA, phase, log and exit status will be reported separately;
+no success is implied here. No native build/test embedding `frontend/out` or
+standalone TypeScript check runs concurrently with it. Local package version
+remains `0.2.18`; `gh release list` returned an empty list on 2026-11-18. This is
+not a published release, installed app or macOS hardware qualification. No DMG,
+Actions, push, PR, #19 deletion, agents, private data or Mac operations were used.

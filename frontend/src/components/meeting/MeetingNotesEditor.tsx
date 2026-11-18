@@ -1,12 +1,28 @@
 'use client';
 
-import { useEffect, useState, useSyncExternalStore } from 'react';
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { NotesEditor } from '@/components/editor/NotesEditor';
-import { editNotes, flushNotes, getNotesSnapshot, loadNotes, readNotesDocument, recoverNotesDraft, saveRetainedNotes, cancelNotesRecovery, resumeNotesRecovery, retryNotesBackup, saveReviewedNotes, subscribeNotes, type NotesDocument } from '@/lib/notes-store';
+import { editNotes, flushNotes, getNotesSnapshot, loadNotes, readNotesDocument, recoverNotesDraft, saveRetainedNotes, cancelNotesRecovery, resumeNotesRecovery, retryNotesBackup, saveReviewedNotes, notesForContext, subscribeNotes, type NotesDocument } from '@/lib/notes-store';
 
 /** Shared by the normal live panel and library detail view. Keep ASR updates
  * outside this document's ownership: they must never remount its editor. */
-export function MeetingNotesEditor({ target }: { target: string }) {
+export function MeetingNotesEditor({ target, editable = true, registerFlush }: {
+  target: string;
+  editable?: boolean;
+  registerFlush?: (flush: () => Promise<void>) => (() => void);
+}) {
+  const conversion = useRef<() => Promise<void>>(async () => {});
+  const registerConversion = useCallback((flush: () => Promise<void>) => {
+    conversion.current = flush;
+    return () => { conversion.current = async () => {}; };
+  }, []);
+  useEffect(() => registerFlush?.(async () => {
+    await conversion.current();
+    // The Notes store remains the sole writer. This readback barrier drains
+    // native saves and detects CAS conflicts, but never consents to replacing a
+    // competing draft or writing through paused/quota-blocked recovery.
+    await notesForContext(target);
+  }), [registerFlush, target]);
   const snapshot = useSyncExternalStore(
     listener => subscribeNotes(target, listener),
     () => getNotesSnapshot(target),
@@ -89,7 +105,8 @@ export function MeetingNotesEditor({ target }: { target: string }) {
       </div>)}
       {snapshot.loaded && <NotesEditor
         key={`${target}:${retry}`}
-        editable={!snapshot.backupBlocked && !snapshot.recoveryPaused}
+        editable={editable && !snapshot.backupBlocked && !snapshot.recoveryPaused}
+        registerFlush={registerConversion}
         initialBlocks={snapshot.content.json}
         initialMarkdown={snapshot.content.markdown}
         placeholder="Your own Notes — saved locally, separately from speech and AI summaries."

@@ -25,3 +25,29 @@ test('publishes exact JSON synchronously before asynchronous markdown finishes',
   expect(await drafts[0].markdown).toBe('latest');
   act(() => view!.unmount());
 });
+
+test('flush waits for the newest conversion across editable transitions and ignores older completion', async () => {
+  const pending: Array<(value: string) => void> = [];
+  const previous = editor.blocksToMarkdownLossy;
+  editor.blocksToMarkdownLossy = () => new Promise<string>(resolve => pending.push(resolve));
+  const updates: string[] = [];
+  let flush!: () => Promise<void>;
+  const register = (value: () => Promise<void>) => { flush = value; return () => {}; };
+  const onChange = (content: { markdown: string }) => updates.push(content.markdown);
+  let root!: ReturnType<typeof create>;
+  try {
+    await act(async () => { root = create(<NotesEditor onChange={onChange} registerFlush={register} />); });
+    await act(async () => ready());
+    act(() => changed!());
+    await act(async () => root.update(<NotesEditor editable={false} onChange={onChange} registerFlush={register} />));
+    await act(async () => root.update(<NotesEditor editable onChange={onChange} registerFlush={register} />));
+    act(() => changed!());
+    let finished = false;
+    const barrier = flush().then(() => { finished = true; });
+    await Promise.resolve(); expect(finished).toBe(false);
+    await act(async () => { pending[1]('new RU/EN formatting'); await barrier; });
+    expect(updates).toEqual(['new RU/EN formatting']);
+    await act(async () => { pending[0]('old conversion'); });
+    expect(updates).toEqual(['new RU/EN formatting']);
+  } finally { act(() => root?.unmount()); editor.blocksToMarkdownLossy = previous; }
+});

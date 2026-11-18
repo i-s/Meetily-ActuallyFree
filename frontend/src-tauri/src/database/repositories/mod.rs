@@ -10,3 +10,5 @@ pub mod transcript;
 pub mod transcript_chunk;
 pub mod vocabulary;
 pub mod library;
+
+pub(crate) mod speaker_identity;

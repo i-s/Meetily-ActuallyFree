@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Run actual recovery commands + repository transactions with real SQLite/FFmpeg.
 
-Only Tauri handle/state transport, device metadata and unrelated contact linking
-are stubbed. Production command bodies, JSON types, audio commit logic and SQL
+Only Tauri handle/state transport and device metadata are stubbed.
+Contact-link entrypoints are extracted unchanged from the production repository. Production command bodies, JSON types, audio commit logic and SQL
 are included verbatim. This does not establish macOS/Tauri ABI or model behavior.
 """
 from pathlib import Path
@@ -40,7 +40,7 @@ version="0.0.0"
 edition="2021"
 [dependencies]
 {dependencies}
-sqlx={{version="={versions['sqlx']}",default-features=false,features=["sqlite","runtime-tokio","chrono"]}}
+sqlx={{version="={versions['sqlx']}",default-features=false,features=["sqlite","runtime-tokio","chrono","derive"]}}
 tokio={{version="={versions['tokio']}",features=["full"]}}
 uuid={{version="={versions['uuid']}",features=["v4"]}}
 serde={{version="={versions['serde']}",features=["derive"]}}
@@ -53,6 +53,12 @@ serde={{version="={versions['serde']}",features=["derive"]}}
             source = (notes_dir / f'{name}.rs').read_text().replace('#[tauri::command]', '')
             source = source.replace('../../../migrations/20261118001200_recording_notes.sql', str(ROOT / 'frontend/src-tauri/migrations/20261118001200_recording_notes.sql'))
             (work / f'src/{name}.rs').write_text(source)
+        person_source = (notes_dir / 'person.rs').read_text()
+        def person_method(name):
+            start = person_source.index(f'    pub(crate) async fn {name}(')
+            end = person_source.index('\n    }', start) + len('\n    }')
+            return person_source[start:end]
+        person_methods = '\n'.join(person_method(name) for name in ('link_named_speakers', 'reconcile_speaker_identity'))
         (work / 'src/lib.rs').write_text(f'''#![allow(dead_code)]
 extern crate self as tauri;
 pub trait Runtime {{}}
@@ -67,12 +73,15 @@ mod state {{
 }}
 mod api;
 pub use database::repositories::notes_document;
-mod database {{ pub mod repositories {{
+mod database {{ #[path="{ROOT}/frontend/src-tauri/src/database/transcript_versions.rs"] pub mod transcript_versions; pub mod repositories {{
+    #[path="{ROOT}/frontend/src-tauri/src/database/repositories/speaker_identity.rs"] pub mod speaker_identity;
     #[path="{work}/src/meeting_notes.rs"] pub mod meeting_notes;
     #[path="{work}/src/notes_document.rs"] pub mod notes_document;
     pub mod person {{
+    use sqlx::{{Sqlite, Transaction}};
+    use super::speaker_identity::{{is_person_name, ensure_label_identity}};
     pub struct PeopleRepository;
-    impl PeopleRepository {{ pub async fn link_named_speakers(_tx:&mut sqlx::Transaction<'_,sqlx::Sqlite>,_meeting:&str)->Result<(),sqlx::Error>{{Ok(())}} }}
+    impl PeopleRepository {{ {person_methods} }}
 }} }} }}
 #[path="{REPOSITORY}"] mod repository;
 mod audio {{
@@ -86,6 +95,7 @@ mod audio {{
     #[path="{work}/src/incremental_saver.rs"] pub mod incremental_saver;
 }}
 #[cfg(test)] #[path="{ROOT}/frontend/tests/native/recovery-api.rs"] mod recovery_api_tests;
+#[cfg(test)] #[path="{ROOT}/frontend/tests/native/notes-versions.rs"] mod notes_versions_tests;
 '''.replace(repr(ffmpeg), '"' + ffmpeg + '"'))
         subprocess.run(['cargo', 'test', '--manifest-path', str(work / 'Cargo.toml'), *(sys.argv[1:] or ['recovery']), '--', '--test-threads=1'], check=True)
         allowed = {(p['name'], p['version'], p.get('source')) for p in lock['package']}
