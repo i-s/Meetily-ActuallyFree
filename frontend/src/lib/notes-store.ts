@@ -240,14 +240,18 @@ export function createNotesStore(options: { invoke?: typeof invoke; storage?: St
         try {
           const revision = await transport<number>('api_write_notes_document', { target, ...content, expectedRevision: entry.revision });
           entry.revision = revision;
+          if (entry.backupBlocked) {
+            // Do not retire the only durable browser copy on just a UI promise
+            // or failed verification. Native readback must match the exact
+            // document/revision acknowledged by the CAS write.
+            const verified = await readNotesDocument(target);
+            if (verified?.revision !== revision || verified.markdown !== content.markdown || !sameJson(verified.json ?? null, content.json)) throw new Error('Notes conflict or native recovery verification failed. Original draft retained.');
+          }
+          // This acknowledgement belongs to the captured target, even when a
+          // newer draft owns its editor. Notify canonical readers without marking
+          // that draft saved or retiring its recovery journal.
+          publish(entry, { committedRevision: revision });
           if (generation === entry.generation) {
-            if (entry.backupBlocked) {
-              // Do not retire the only durable browser copy on just a UI promise
-              // or failed verification. Native readback must match the exact
-              // document/revision acknowledged by the CAS write.
-              const verified = await readNotesDocument(target);
-              if (entry.generation !== generation || verified?.revision !== revision || verified.markdown !== content.markdown || !sameJson(verified.json ?? null, content.json)) throw new Error('Notes conflict or native recovery verification failed. Original draft retained.');
-            }
             const consumed = [...entry.sources, ...(entry.journal ? [entry.journal] : [])];
             // A legacy receipt itself needs storage. With zero capacity, keep
             // the immutable supersession record AND its legacy sources instead
@@ -259,7 +263,7 @@ export function createNotesStore(options: { invoke?: typeof invoke; storage?: St
               entry.journal = undefined;
             }
             entry.dirty = false;
-            publish(entry, { state: 'saved', committedRevision: revision, error: null, warning: entry.backupBlocked ? `Notes saved natively. Browser recovery storage is unavailable; editing stays locked until Retry recovery backup succeeds.${deferredCleanup ? ' Original recovery records are retained until safe legacy cleanup is possible.' : ''}` : null });
+            publish(entry, { state: 'saved', error: null, warning: entry.backupBlocked ? `Notes saved natively. Browser recovery storage is unavailable; editing stays locked until Retry recovery backup succeeds.${deferredCleanup ? ' Original recovery records are retained until safe legacy cleanup is possible.' : ''}` : null });
           } else journal(target, entry);
         } catch (e) {
           publish(entry, { state: 'error', error: message(e) });

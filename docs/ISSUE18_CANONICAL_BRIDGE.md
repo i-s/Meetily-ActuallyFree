@@ -185,3 +185,49 @@ self-review only; no delegates. No heavy export or full desktop-native check was
 repeated: the successful production export/static verification applies **only to
 parent e32eacb**, and its full desktop-native prerequisite blocker remains separate.
 No packaging, Actions, push/PR, system changes, Mac or private-data operation.
+
+## Canonical bridge R2 — superseded Notes acknowledgement (2026-11-19)
+
+Exact reviewed parent: `5de3094b3cb299262f4f186ade8c74eb217bc6e6`.
+A native CAS acknowledgement for Notes A advanced the writer's private revision,
+but did not notify canonical readers when a newer draft B already owned the editor.
+If B failed, the focused generated summary could remain visible indefinitely even
+though the authoritative canonical view excluded it.
+
+The writer now publishes the confirmed native revision to the captured target
+independently of draft generation. Generation still owns saved-state publication,
+dirty clearing and journal retirement. Thus B retains its exact rich JSON,
+conversion/pending/error state and recovery journal; a retry uses A's acknowledged
+revision. Storage-blocked recovery still requires exact native revision, Markdown
+and rich JSON readback before publishing the acknowledgement. A generation change
+during that readback does not authorize retiring the newer draft. No revision is
+fabricated from an unsuccessful write or unsuccessful recovery verification.
+No native transaction, artifact, task/owner resolver, alias routing or summary
+ownership guard changed.
+
+### Executed evidence and limits
+
+- On the exact parent, the actual-store regression observed native revision **5**
+  but published revision **4**; the mounted normal detail regression observed
+  canonical **null** but **1** obsolete summary editor. Logs:
+  `/tmp/issue18-r2-store-red.log`, `/tmp/issue18-r2-mounted-red.log`.
+- Corrected actual-store tests: **15 passed / 87 assertions**, including A ack
+  while B is converting, B write failure/retry, retained journal revision, newer
+  conversion-error preservation and meeting/recording-target isolation.
+- Mounted ordinary callers: **26 passed / 208 assertions**, including failed B,
+  retry, canonical absence, blocked export while unsaved, both normal Markdown
+  exports after retry, stable Notes editor, dirty manual summary and navigation.
+  Original R1 pending/failed/unrelated-target and late-response controls also pass.
+- All six Notes files run independently: editor **2**, entrypoints **3**, quota
+  mounted **5**, quota store **9**, shared-storage/alias races **9**, store **15**.
+  Failed recovery readback explicitly retains committed revision **0**, error and
+  source journal; successful verified retry advances the published revision.
+- Final full isolated frontend: **71/71 files, 385 passed, no warnings**,
+  `/tmp/issue18-r2-frontend-all.log`. TypeScript `--noEmit`: **exit 0** using
+  the existing Bun runtime (`/tmp/issue18-r2-tsc.log`); the initial shell launcher
+  could not find Node, so the unchanged TypeScript entrypoint was run with Bun.
+
+These are production frontend/store callers with synthetic native transport,
+BlockNote and picker/filesystem adapters, not actual desktop IPC or device/model
+qualification. No heavy export/native rebuild, agents, packaging, Actions, Mac,
+private data, push or PR. Earlier heavy evidence remains limited to e32eacb.

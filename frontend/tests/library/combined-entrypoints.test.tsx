@@ -27,7 +27,7 @@ let selectedText='Live text',selectedRowId='old-line';
 let outputPath:string|null='/synthetic/user-selected.custom',writeError=false,pickerWait:Promise<void>|null=null;
 const written:Array<{path:string;text:string}>=[],toasts:Array<{kind:string;text:string}>=[];
 let savedSummary='Stored summary', archivedSummary='', mutations=0, failNotes=false, failSummary=false, version=0, pendingSummary=false;
-let holdNotes=false, holdSummary=false, holdWrite=false, failNotesConversion=false;
+let holdNotes=false, holdSummary=false, holdWrite=false, failNotesConversion=false, failAfterSuccessfulWrite=false;
 const conversions:Array<{kind:string;resolve:(value:string)=>void}> = [];
 let releaseWrite:(()=>void)|undefined;
 let actionWait:Promise<void>|null=null, actionReplyWait:Promise<void>|null=null, actionStarted=false, summaryToken=0, summaryExists=true;
@@ -51,6 +51,7 @@ const transport=async(name:string,args:any):Promise<any>=>{
   if((previous?.revision??0)!==args.expectedRevision)throw new Error('Notes conflict: competing writer');
   const revision=args.expectedRevision+1;
   documents.set(target,{markdown:args.markdown,json:structuredClone(args.json),revision,source:'user_notes'});
+  if(failAfterSuccessfulWrite){failAfterSuccessfulWrite=false;failNotes=true;}
   return revision;
  }
  if(name==='list_transcript_versions')return {selected_id:version?'new':'live',revision:7+version,audio_available:true,versions:[{id:'new',kind:'refined',status:'ready',created_at:'2026-11-18',settings_json:'{"recording_metadata":{"in_person":false},"source_map":{"new-line":"microphone"}}'}]};
@@ -173,7 +174,7 @@ const ready=async()=>{await act(async()=>{for(const fn of [...timers.values()])f
 async function mount(seed=true){active=`combined-${++seq}`;if(seed)documents.set(`meeting:${active}`,{markdown:'Stored notes',json:null,revision:1,source:'user_notes'});await act(async()=>{root=create(<Page/>);});await ready();await act(async()=>{await flushNotes(`meeting:${active}`);});}
 async function review(operation:string){await act(async()=>button(operation==='select'?'Review snapshot':'Correct selected text').props.onClick());}
 const mutate=(operation:string)=>button(operation==='select'?'Save current corrections':'Save text correction').props.onClick();
-afterEach(async()=>{holdNotes=false;holdSummary=false;holdWrite=false;failNotes=false;failSummary=false;pendingSummary=false;failNotesConversion=false;releaseWrite?.();for(const p of conversions.splice(0))p.resolve(richMarkdown);await act(async()=>root?.unmount());root=undefined;timers.clear();storeTimers.clear();storage.clear();documents.clear();calls.length=0;reloads=0;mutations=0;version=0;selectedText='Live text';selectedRowId='old-line';written.length=0;toasts.length=0;outputPath='/synthetic/user-selected.custom';writeError=false;pickerWait=null;navigated='';quota=false;savedSummary='Stored summary';archivedSummary='';releaseWrite=undefined;clock=0;actionWait=null;actionReplyWait=null;actionStarted=false;summaryToken=0;summaryExists=true;actionRows=[];canonicalSummary=null;canonicalWait=null;nativeEvents.clear();});
+afterEach(async()=>{failAfterSuccessfulWrite=false;holdNotes=false;holdSummary=false;holdWrite=false;failNotes=false;failSummary=false;pendingSummary=false;failNotesConversion=false;releaseWrite?.();for(const p of conversions.splice(0))p.resolve(richMarkdown);await act(async()=>root?.unmount());root=undefined;timers.clear();storeTimers.clear();storage.clear();documents.clear();calls.length=0;reloads=0;mutations=0;version=0;selectedText='Live text';selectedRowId='old-line';written.length=0;toasts.length=0;outputPath='/synthetic/user-selected.custom';writeError=false;pickerWait=null;navigated='';quota=false;savedSummary='Stored summary';archivedSummary='';releaseWrite=undefined;clock=0;actionWait=null;actionReplyWait=null;actionStarted=false;summaryToken=0;summaryExists=true;actionRows=[];canonicalSummary=null;canonicalWait=null;nativeEvents.clear();});
 
 const visible=(node:any):string=>typeof node==='string'?node:Array.isArray(node)?node.map(visible).join(''):(node?.children??[]).map(visible).join('');
 const exactButton=(label:string,last=false)=>{const found=root!.root.findAllByType('button').filter(node=>visible(node)===label);return last?found.at(-1)!:found[0]!;};
@@ -455,4 +456,57 @@ test('R1 committed Notes revision fences a previously captured canonical reply a
  await act(async()=>editor('Notes editor').props.onChange({target:{blocks:rich}}));await act(async()=>{await flushNotes(`meeting:${active}`);});
  await act(async()=>{release();});
  expect(root!.root.findAllByProps({'aria-label':'Summary editor'})).toHaveLength(0);
+},60000);
+
+ test('R2 superseded Notes ack clears focused generated summary while rich B fails, then exports agree after retry',async()=>{
+ savedSummary='';summaryExists=false;await mount();await act(async()=>{publishCanonical();for(const event of nativeEvents)event();});await ready();
+ const target=`meeting:${active}`,revision=documents.get(target).revision;
+ const identity=editor('Notes editor').props['data-engine'];
+ holdWrite=true;failAfterSuccessfulWrite=true;
+ await act(async()=>editor('Notes editor').props.onChange({target:{value:'A committed'}}));
+ let saving!:Promise<void>;await act(async()=>{saving=flushNotes(target);});
+ await act(async()=>editor('Notes editor').props.onChange({target:{blocks:rich}}));
+ holdWrite=false;await act(async()=>{releaseWrite?.();await saving;});
+ expect(documents.get(target).revision).toBe(revision+1);
+ expect(getNotesSnapshot(target).state).toBe('error');
+ expect(getNotesSnapshot(target).content.json).toEqual(rich);
+ expect(await transport('post_call_canonical_summary',{meetingId:active})).toBeNull();
+ expect(root!.root.findAllByProps({'aria-label':'Summary editor'})).toHaveLength(0);
+ expect(getNotesSnapshot(target).committedRevision).toBe(revision+1);
+ expect(editor('Notes editor').props['data-engine']).toBe(identity);
+ const {captureMeetingExport}=await import('../../src/lib/meeting-export');
+ await act(async()=>{await expect(captureMeetingExport(active)).rejects.toThrow('Notes disk unavailable');});
+ expect([...storage.values()].some(raw=>JSON.parse(raw).content?.markdown===richMarkdown)).toBe(true);
+ failNotes=false;await act(async()=>{await flushNotes(target);});
+ expect(getNotesSnapshot(target).committedRevision).toBe(revision+2);
+ expect(getNotesSnapshot(target).state).toBe('saved');
+ expect((await captureMeetingExport(active)).summary).toBeNull();
+ await detailExport();expect(written[0].text).toContain('No summary available');expect(written[0].text).not.toContain('Canonical report discussed');
+ await act(async()=>root!.update(<MeetingsPage/>));await act(async()=>exactButton('Export…').props.onClick());await act(async()=>exactButton('Export',true).props.onClick());
+ expect(written[1].text).toContain(richMarkdown);expect(written[1].text).not.toContain('Canonical report discussed');
+ },60000);
+
+for(const control of ['manual draft','navigation'])test(`R2 superseded Notes ack preserves ${control} ownership`,async()=>{
+ savedSummary='';summaryExists=false;await mount();await act(async()=>{publishCanonical();for(const event of nativeEvents)event();});await ready();
+ const target=`meeting:${active}`,revision=documents.get(target).revision;
+ holdWrite=true;failAfterSuccessfulWrite=true;
+ await act(async()=>editor('Notes editor').props.onChange({target:{value:'A committed'}}));
+ let saving!:Promise<void>;await act(async()=>{saving=flushNotes(target);});
+ await act(async()=>editor('Notes editor').props.onChange({target:{blocks:rich}}));
+ let identity:any;
+ if(control==='manual draft'){
+  holdSummary=true;await act(async()=>editor('Summary editor').props.onChange({target:{blocks:rich}}));
+  identity=editor('Summary editor').props['data-engine'];
+ }else{
+  active=`combined-${++seq}`;documents.set(`meeting:${active}`,{markdown:'Other meeting notes',json:null,revision:9,source:'user_notes'});
+  canonicalSummary=null;savedSummary='Other meeting summary';await act(async()=>navigateView(active,savedSummary));await ready();
+ }
+ holdWrite=false;await act(async()=>{releaseWrite?.();await saving;});
+ expect(getNotesSnapshot(target).committedRevision).toBe(revision+1);expect(getNotesSnapshot(target).state).toBe('error');
+ if(control==='manual draft'){
+  await act(async()=>root!.update(<Page/>));
+  expect(editor('Summary editor').props['data-engine']).toBe(identity);expect(editor('Summary editor').props.value).toContain('API follow-up');
+ }else{
+  expect(editor('Summary editor').props.value).toContain('Other meeting summary');expect(getNotesSnapshot(`meeting:${active}`).committedRevision).toBe(9);
+ }
 },60000);

@@ -112,8 +112,11 @@ test('failed readback preserves the source even after native write; retry verifi
   await expect(store.saveRetainedNotes(h.target)).rejects.toThrow('verification unavailable');
   expect(h.rows.get(h.key)).toBe(h.raw);
   expect(h.native.markdown).toBe(exact.markdown);
+  expect(store.getNotesSnapshot(h.target).committedRevision).toBe(0);
+  expect(store.getNotesSnapshot(h.target).state).toBe('error');
   h.setVerifyFailure(false); await store.saveRetainedNotes(h.target);
   expect(h.rows.has(h.key)).toBe(false);
+  expect(store.getNotesSnapshot(h.target).committedRevision).toBe(h.native.revision);
 });
 
 test('cancel invalidates pending conversion, keeps the source, and requires explicit resume/reconversion', async () => {
