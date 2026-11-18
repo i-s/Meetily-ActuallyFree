@@ -1,114 +1,88 @@
-/**
- * Labs automation handoff shared by source lifecycle adapters and legacy
- * meeting offers. Only an automation-owned take follows its detected call;
- * manually started recordings remain under user control.
- *
- * The recorder owns the start and stop sequences, so the hand-off between the
- * detection events (in the root layout) and the recorder goes through
- * sessionStorage, which survives the page change to the recorder.
+/** One common recorder reservation across independent client adapters. Native
+ * recording_lease owns an actual take; this token owns only its JS handoff.
  */
-
 const PENDING_KEY = 'labsAutoStartPending';
 const STARTING_KEY = 'labsAutoStartInFlight';
 const ACTIVE_KEY = 'labsAutoRecordingProcess';
 export const AUTOMATION_CHANGED_EVENT = 'meetily-automation-changed';
-
-/** A start request older than this was not picked up and is ignored. */
 const PENDING_TTL_MS = 60_000;
-
 export interface AutomatedCall {
-  /** Friendly name, e.g. "Zoom". */
   app: string;
-  /** Process the detector matched, e.g. "Zoom.exe". */
   process: string;
-  /** Lifecycle adapter + native call identity, independent of PID/device/mute. */
   source?: string;
   sessionId?: string;
+  token?: string;
+  recordingLease?: import('./native-recording').RecordingLease;
 }
-
-function read(key: string): string | null {
+function read(key: string): string | null { try { return sessionStorage.getItem(key); } catch { return null; } }
+function write(key: string, value: string | null): boolean {
   try {
-    return sessionStorage.getItem(key);
-  } catch {
-    return null;
-  }
+    if (value === null) sessionStorage.removeItem(key); else sessionStorage.setItem(key, value);
+    return read(key) === value;
+  } catch { return false; }
 }
-
-function writeKey(key: string, value: string | null) {
-  try {
-    if (value === null) sessionStorage.removeItem(key);
-    else sessionStorage.setItem(key, value);
-  } catch {
-    // Callers can fail closed by checking the handoff write before routing.
-  }
-}
-
 function parse(value: string | null): AutomatedCall | null {
   if (!value) return null;
   try {
-    const parsed = JSON.parse(value) as Partial<AutomatedCall>;
-    if (typeof parsed.process === 'string' && parsed.process) {
-      return { app: typeof parsed.app === 'string' && parsed.app ? parsed.app : parsed.process, process: parsed.process,
-        ...(typeof parsed.source === 'string' ? { source: parsed.source } : {}),
-        ...(typeof parsed.sessionId === 'string' ? { sessionId: parsed.sessionId } : {}),
-      };
-    }
-  } catch {
-    // Written by #38 as the bare process name.
-    return { app: value, process: value };
-  }
-  return null;
+    const { at: _at, ...call } = JSON.parse(value);
+    return typeof call.process === 'string' && call.process ? call : null;
+  } catch { return { app: value, process: value }; } // historical bare process
 }
-
-/** Called right before the recorder is asked to start for a detected call. */
-export function markAutomatedStart(call: AutomatedCall) {
-  const value = JSON.stringify({ ...call, at: Date.now() });
-  writeKey(PENDING_KEY, value);
-  return read(PENDING_KEY) === value;
+function matches(a: AutomatedCall | null, b: AutomatedCall): boolean {
+  return !!a?.token && a.token === b.token && a.source === b.source && a.sessionId === b.sessionId;
 }
-
+export function reservationCurrent(call: AutomatedCall, phase: 'pending' | 'inflight'): boolean {
+  return matches(parse(read(phase === 'pending' ? PENDING_KEY : STARTING_KEY)), call);
+}
 export function automatedStartInProgress(): AutomatedCall | null {
   return parse(read(PENDING_KEY)) || parse(read(STARTING_KEY));
 }
-
-export function releaseAutomatedStart() { writeKey(STARTING_KEY, null); }
-
-/**
- * The recorder takes the pending request when a start begins. It is cleared
- * whatever happens, so a later manual start is never mistaken for it.
+/** Synchronous admission: no adapter priority and no await between claim/write.
+ * The caller retains the generated opaque token on this same expectedCall.
  */
+export function markAutomatedStart(call: AutomatedCall): boolean {
+  if (automatedStartInProgress()) return false;
+  call.token = crypto.randomUUID();
+  return write(PENDING_KEY, JSON.stringify({ ...call, at: Date.now() }));
+}
 export function takeAutomatedStart(): AutomatedCall | null {
   const value = read(PENDING_KEY);
-  writeKey(PENDING_KEY, null);
-  if (!value) return null;
-  try {
-    const at = Number((JSON.parse(value) as { at?: number }).at ?? 0);
-    if (!at || Date.now() - at > PENDING_TTL_MS) return null;
-  } catch {
+  const call = parse(value);
+  if (!call?.token || !value) {
+    if (value && read(PENDING_KEY) === value) write(PENDING_KEY, null);
     return null;
   }
-  const call = parse(value);
-  if (call) writeKey(STARTING_KEY, JSON.stringify(call));
+  try {
+    const at = JSON.parse(value).at;
+    if (typeof at !== 'number' || Date.now() - at > PENDING_TTL_MS) {
+      if (reservationCurrent(call, 'pending')) write(PENDING_KEY, null);
+      return null;
+    }
+  } catch { return null; }
+  if (read(STARTING_KEY) || !write(STARTING_KEY, value)) return null;
+  if (reservationCurrent(call, 'pending')) write(PENDING_KEY, null);
   return call;
 }
-
-/** The recording now running was started for this call. */
-export function beginAutomatedRecording(call: AutomatedCall) {
-  releaseAutomatedStart();
-  writeKey(ACTIVE_KEY, JSON.stringify(call));
+export function releaseAutomatedStart(expectedCall: AutomatedCall): void {
+  for (const phase of ['pending', 'inflight'] as const) {
+    if (reservationCurrent(expectedCall, phase)) write(phase === 'pending' ? PENDING_KEY : STARTING_KEY, null);
+  }
+}
+export function beginAutomatedRecording(expectedCall: AutomatedCall): boolean {
+  if (!reservationCurrent(expectedCall, 'inflight')) return false;
+  if (!write(ACTIVE_KEY, JSON.stringify(expectedCall))) return false;
+  releaseAutomatedStart(expectedCall);
+  window.dispatchEvent(new Event(AUTOMATION_CHANGED_EVENT));
+  return true;
+}
+/** Only callers that just queried native recording authority may restore this
+ * display mirror. It never admits a start and cannot authorize native Stop.
+ */
+export function reconcileAutomatedRecording(call: AutomatedCall | null): void {
+  const value = call ? JSON.stringify(call) : null;
+  if (read(ACTIVE_KEY) === value) return;
+  write(ACTIVE_KEY, value);
   window.dispatchEvent(new Event(AUTOMATION_CHANGED_EVENT));
 }
-
-/** The call the running recording stops with, if automation started it. */
-export function automatedRecording(): AutomatedCall | null {
-  return parse(read(ACTIVE_KEY));
-}
-
-/** Recording stopped, or the user chose to keep it going after the call. */
-export function endAutomatedRecording() {
-  if (read(ACTIVE_KEY) === null && read(PENDING_KEY) === null && read(STARTING_KEY) === null) return;
-  releaseAutomatedStart();
-  writeKey(ACTIVE_KEY, null);
-  writeKey(PENDING_KEY, null);
-  window.dispatchEvent(new Event(AUTOMATION_CHANGED_EVENT));
-}
+export function automatedRecording(): AutomatedCall | null { return parse(read(ACTIVE_KEY)); }
+export function endAutomatedRecording(): void { reconcileAutomatedRecording(null); }

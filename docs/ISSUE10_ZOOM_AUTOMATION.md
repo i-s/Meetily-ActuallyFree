@@ -1,96 +1,142 @@
-# Issue #10 — Zoom automatic recording software
+# Issue #10 — Zoom lifecycle: observation, qualification and guarded recorder
 
-Live issue read **2026-11-18**: **[[macOS 06/16] Автостарт и автостоп Zoom](https://github.com/i-s/Meetily-ActuallyFree/issues/10)**, open, **zero comments**. Accepted software base: `4269de67c6747b2f5fce72596826c05dadbb3e1c` (#9). This implements a candidate adapter and actual application automation, not a qualified detector or an issue-closure attestation. No Mac operation, installer/DMG, packaging, Actions dispatch, push, release or private/user-data operation belongs to this work.
+Live issue read 2026-11-18: **[[macOS 06/16] Автостарт и автостоп Zoom](https://github.com/i-s/Meetily-ActuallyFree/issues/10)**, open, zero comments. Accepted software base `4269de67c6747b2f5fce72596826c05dadbb3e1c`; independent Opus R1 follow-up base `7d3ff8aeac1caddb73a8e72b8dcd0b0b66065110`.
 
-## Prior work and the unresolved physical finding
+**Real Zoom classes are observation-only. None is qualified to authorize capture.** The automatic recording implementation is exercised with explicitly synthetic qualified fixtures, not enabled by old saved Labs/detection preferences. There is no production qualification override. Manual recording remains available as manual recording, **not** as a substitute for issue #10's required verified automation. Issue acceptance, leave-open reliability, latency bounds and #6 acoustic separation remain unresolved.
 
-Reviewed the planning workspace's AGENTS/domain/issue instructions, glossary, requirements, macOS specification, ADR 0001 and call-signals research. Reviewed the local prior fork `origin/fix/codex-call-detection` at `2169cabcac80a22f5a8fea6c54d13e8b971bb261`, its bounded AX probe, per-source tracker and `docs/CALL_DETECTION.md`, and this checkout's [issue #7 note](ISSUE7_CALL_SIGNALS.md). The fork credits YoungTeurus/meetily's MIT implementation at `4732a3ff2331e3b33e007313c06b7748625e9304`; that attribution remains in the adapter.
+## Prior evidence and the qualification gate (R1-6)
 
-The prior physical Zoom inspection was **UNKNOWN despite granted Accessibility access, English UI and a visible toolbar**. Nothing here overturns that observation. Neither AX permission, synthetic controls, process launch nor HAL I/O proves a qualified participant lifecycle. The stricter candidate can still return Unknown on the target client; if it cannot distinguish participation on the mandatory physical matrix, **required automation is not achieved**. A manual notification is not a substitute.
+Reviewed planning AGENTS/domain/issue guidance, glossary, requirements, macOS spec, ADR 0001 and call-signals research; checkout AGENTS/map; prior MIT fork `origin/fix/codex-call-detection` at `2169cabcac80a22f5a8fea6c54d13e8b971bb261` and its `CALL_DETECTION.md`. The bounded AX code retains its attribution to YoungTeurus/meetily at `4732a3ff2331e3b33e007313c06b7748625e9304`.
 
-## Native evidence and lifecycle ownership
+The prior physical result was **UNKNOWN despite granted AX, English UI and visible toolbar**. This work does not overturn it. AX permission, executable launch, mic/camera/HAL activity, mute, silence, preview/device test or a human truth marker is not a qualified call lifecycle signal. In particular, a waiting room exposing the same controls would invalidate the candidate; software debouncing cannot resolve identical signatures.
 
-- `meeting_detection/zoom.rs`: bounded read-only AX inspection, on a blocking worker. No focus changes, control actions, AXValue/chat text, permission prompts, external SDKs, audio inference or network calls. Shared 700 ms scan budget, 50 ms timeout per AX target, 16 windows/128 children/768 nodes/depth 14 bounds; OS scheduling is not a hard real-time guarantee. Diagnostics retain fixed reasons/counts, not labels/window titles.
-- `meeting_detection/lifecycle.rs::scan_zoom`: read-only public AppKit `NSRunningApplication.runningApplicationsWithBundleIdentifier` inventory for the exact `us.zoom.xos` bundle, with a local autorelease pool and bounded PID list; helpers/keyword matches are not identities. Failed/nil/invalid inventory is Unknown. Other bundle IDs/layouts are unsupported until observed. A successful empty bundle inventory supplies `zoom_not_running`; this is process-exit evidence, **not** a process-launch start rule.
-- Positive candidate: enabled participant control **and** enabled leave/end control in the **same window**, with exact supported English/Russian command labels. Menu-only Leave was deliberately rejected because it does not distinguish a waiting room. No window title substring, mic/camera activity, silence, mute, preview, test or default-device change is an input to lifecycle inference. A waiting room exposing the same pair would invalidate this candidate; physical testing must check that explicitly.
-- Positive idle candidate: complete single Home window with enabled Join + New Meeting and an explicitly disabled Leave Meeting menu item. Missing/hidden toolbar, no AX access, unsupported language/layout, timeout/limit/read failure or an omitted adapter is Unknown, not exit. Already-read positive controls can survive an incomplete unrelated tree; negative evidence requires completeness.
-- `meeting_detection/evidence.rs::Tracker`: per-source identity; two positive observations create one logical session. Continuous explicit inactive observations for 45,000 ms end it. Unknown/omitted source resets confirmation and exit grace without ending a live session. Gaps >20,000 ms discard debounce/grace time. Helper/device/mute changes do not allocate a new session. Settings/monitor restarts preserve native sessions but discard debounce/grace evidence.
-- Native `meeting-lifecycle` snapshots and `get_meeting_lifecycle_snapshot` expose `{revision, enabled, sources:[{source,app,process,presence,reason,session_id}]}`. `session_id` is opaque and retained through Unknown and inactive grace, null after a confirmed end; the current observation and logical call ownership are different facts. Revisions reject stale event/query replies. Monitor-generation checks under the native state lock reject obsolete blocking scans and stale start authorization after monitor restart/disable. The process epoch prevents a prior native run's session token authorizing a new start.
+- `meeting_detection/zoom.rs`: read-only public AppKit exact bundle `us.zoom.xos` inventory, then bounded AX control traversal on a blocking worker. No focus/control actions, AXValue/chat text, permission prompts, vendor entitlement, audio or network access. Shared 700 ms scan budget, 50 ms per target IPC timeout, 16 windows/128 children/768 nodes/depth 14 bounds. OS scheduling is not real-time.
+- Positive **candidate observation**: enabled participant + leave/end controls in the same window, exact supported EN/RU command vocabulary. Menu-only Leave is insufficient. Negative candidate: complete single Home with enabled Join + New Meeting + explicitly disabled Leave menu; successful empty AppKit bundle inventory supplies process absence. Failed/nil inventory, permission loss, hidden/unsupported controls, timeouts/limits and omitted adapters are Unknown.
+- `Tracker`: stable source keys; two positive samples allocate an observed session; 45,000 ms continuous explicit inactive confirms its end. Unknown/omission resets debounce/grace, retains the session; >20,000 ms sampling gaps discard unobserved debounce time. Poll 3 s, initial delay 2 s. These are **provisional software knobs**, not measured join/leave delay bounds (#7 remains pending).
+- `meeting-lifecycle` / `get_meeting_lifecycle_snapshot`: `{revision,enabled,sources:[{source,app,process,presence,reason,session_id,qualified}]}`. Every real source currently has `qualified:false`, including after loading previously enabled settings. Revisions and monitor-generation checks reject obsolete scans/replies. `session_id` denotes a candidate observation session, not qualification, person identity or an actual recording.
+- `validate_start` requires current monitor generation, native automation enablement, positive current source and **qualification** before setup and again immediately before capture. Production cannot satisfy the last requirement today. Only test-local synthetic fixtures set qualification; no command, environment switch or persisted setting enables it.
 
-The macOS monitor polls the candidate every **3 seconds**, separately from the configurable legacy-offer interval. Startup has the existing 2-second delay. Nominal software timing is two polls for join and at least 45 s continuously observed inactive for end, plus scan/scheduling/startup/model/device time. These are **provisional software knobs, not research-established latency bounds**. #7 measured production bounds are still TBD. No latency guarantee is claimed.
-
-## Actual application path and manual override
+## Native recorder authority and Stop routing (R1-1, R1-4)
 
 ```text
-native monitor / blocking Zoom AX scan
-  -> shared Tracker + native lifecycle snapshot
-  -> root layout meeting-lifecycle listener (main window only)
-  -> meeting-lifecycle.ts serialized reconciliation
-  -> markAutomatedStart + launchRecording / normal recorder-route handoff
-  -> useRecordingStart + existing local model/device setup
-  -> RecordingService.startRecordingWithDevices(..., lifecycleSession)
-  -> registered Tauri start_recording_with_devices_and_meeting
-  -> native start_recording_with_lifecycle
-  -> existing RecordingManager/capture/pipeline
+qualified fixture / future evidence-qualified adapter
+  -> shared token reservation -> normal launchRecording route/event
+  -> useRecordingStart -> RecordingService.startRecordingWithDevices
+  -> Tauri start_recording_with_devices_and_meeting(lifecycleSession)
+  -> guarded native start under engine lifecycle lock
+  -> freeze source/session owner across awaited setup/capture
+  -> actual RecordingManager/pipeline
+  -> native RecordingLease returned from THAT start
 
-confirmed native exit of that SAME source/session
-  -> root reconciliation
-  -> requestRecordingStop
-  -> existing recorder Stop/save/recovery/postprocessing sequence
+same owner session confirms end
+  -> root queries native recording state (also on reload)
+  -> requestRecordingStop(navigate, expectedLease)
+  -> route JSON / event detail carries SAME lease
+  -> RecordingControls -> stop_recording(args.expected)
+  -> engine lifecycle lock + atomic authority compare/enablement claim
+  -> only accepted request enters normal Stop/save/recovery/postprocessing
 ```
 
-The native start validates the opaque token before initialization and again after model/device/diarizer setup immediately before opening capture. It requires a currently positive source and enabled detection, not merely a retained session through Unknown. A leave during frontend model loading cancels start. A leave racing native stream startup requests the **normal Stop/save path**, not a parallel backend teardown. Startup failures use existing visible recording errors and release the handoff reservation. Native Zoom startup rejects saved In-person mode or a per-app selection other than exactly `zoom.us`; it never changes preferences or silently captures Discord/global audio instead. Explicit existing all-system selection remains allowed.
+`audio/recording_ownership.rs` owns a process-lifetime opaque generation and optional `LifecycleOwner {source,session_id,app,process}`. A take has `RecordingLease {generation,owner}`. Both native start paths allocate it under the existing engine lifecycle lock. The owner is frozen **before** awaited stream startup, so a call ending while the WebView goes away cannot erase ownership. The start return value carries the original lease even if a later awaited notification overlaps another take. `get_recording_state.recording_lease` restores ownership on reload independently of a JS completion promise. The main WebView still routes automatic Stop: this is not a new OS service, and an absent/dead WebView may delay Stop until return; it no longer loses the native owner.
 
-The root listener subscribes before fetching the native snapshot; route changes and monitor restarts do not manufacture a new session. Pending and in-flight starts reserve the single recorder. Session suppression is persisted in sessionStorage as one tombstone per source. Manual Stop, failed start, a busy recorder and “Don't stop it” do not immediately retry the same session; only a subsequent confirmed call gets another opportunity. Native-call identity survives PID/device/mute changes. Manual recordings have no lifecycle owner and cannot be stopped by these events. An ownership check after asynchronous recording-state lookup prevents an old stop request from acting on a replacement manual take.
+Every automated Stop must carry an expected lease; missing/invalid handoffs fail closed. The legacy automated path also uses the lease captured by its start, never the newest manual take's lease. Before any tray/window/event/audio/save side effect, native `claim_stop` compares the full generation **and owner** and native enablement while holding the short authority mutex under the engine lifecycle lock. Disable and “Don't stop it” release use the same authority mutex. A rejection returns `false` to the UI. Automated Controls do not invoke manual stop callbacks, set stopping/processing flags, save, navigate or announce success when rejected. Native completion events drive accepted postprocessing. Manual button/tray/minibar Stop has no expected guard and remains functional.
 
-The main WebView/root listener and sessionStorage are required for automatic routing/Stop; this is not an OS service. If the WebView is unavailable, native status is retained and reconciled on its return; it is not a guaranteed background auto-stop while the WebView is dead. Closed/unavailable UI, app restart during a manually suppressed call, permission loss and failed storage need final qualification. Failed storage prevents routed automatic start; the manual recorder remains available. When automation/detection is disabled, no synthetic end is inferred and the current take remains under manual control. Re-enabling does not retry an already consumed session.
+A delayed Stop A after manual Stop A + manual Start B therefore cannot stop B, even after navigation/await/reload. UI enablement is checked after awaited recording-state and directory queries; native enablement is checked again at the actual Stop acceptance boundary. Disabling detection also disables native automation authority. An accepted Stop linearizes before a later disable; disable does not undo shutdown already accepted. Unknown or disable is never fabricated into a lifecycle exit.
 
-## Zoom on speakers: identity is NOT lifecycle
+Native Zoom startup also rejects In-person mode or a per-app selection other than exactly `zoom.us`; it does not rewrite preferences or silently widen capture. Existing explicit global capture is allowed only for manual recording or a genuinely qualified future start.
 
-#6 acoustic acceptance is still **not run**. There is no new AEC, voice separation, voiceprint assumption or remote-active microphone gate. Both source tracks and their audio/timestamps/transcript turns remain; the microphone is never muted/dropped merely because remote speech is present, so this change does not erase local double-talk.
+## One common reservation; #11 integration contract
 
-Until there is a qualified route-specific identity policy, **all new macOS microphone speech is conservatively `Microphone`, not `You`**, including manually started calls and headsets. This deliberately sacrifices confident local identity rather than let a Zoom-through-speakers remote-only utterance become `You`. Windows/Linux retain their existing convention; in-person mode remains source-only. Live microphone audio is not enrolled as a known user embedding under the unverified policy.
+`meeting-automation.ts` is the one common implementation:
 
-`MeetingMetadata.microphone_identity_unverified` persists the policy. Offline diarization disables the mic-to-You dual-track shortcut for these takes and uses the existing whole-recording path; it must not reinterpret mic provenance as identity. Enhance/retranscription also reads that flag and labels the retained mic track `Microphone` rather than `You`; invalid flag types fail provenance validation. Old metadata defaults to the historical policy and is not rewritten. Live text/timestamps and source audio are unchanged; acoustic separation, accurate local `You`, duplicate remote pickup handling and real double-talk ASR accuracy remain #6's physical gates. This is a safe attribution floor, **not** proof of separation or a full identity AC pass.
+- `markAutomatedStart(expectedCall): boolean` synchronously rejects existing pending/in-flight reservations and assigns a unique opaque `token` on the caller's object.
+- Key is `source` + `sessionId` + token. `takeAutomatedStart()` transfers that **same** token pending → in-flight. Invalid old tokenless automation cannot degrade into an unguarded manual start.
+- `reservationCurrent(expectedCall,'pending'|'inflight')`, `releaseAutomatedStart(expectedCall)` and `beginAutomatedRecording(expectedCall): boolean` are scoped. Late release/begin from A cannot cancel/adopt B, including another source. Browser active-call state is only a display mirror; `reconcileAutomatedRecording` is for a just-queried native lease, not admission.
+- Busy/consumed source-session tombstones are written before asynchronous admission. Simultaneous Zoom/Discord claims have no private queue or priority: one shared reservation wins; busy sessions are consumed, not queued for a surprise later handover. No automatic Zoom↔Discord capture switch or room speaker differentiation is introduced.
 
-## Composable interfaces and integration conflicts
+#10 owns native generation/owner authority and guarded Stop. #11 retains its `discord-call-state` / `get_discord_automation_status` schema (`enabled,state,reason,session_id,transition,qualified`, plus `platform_supported`, nullable `client_present`, allowlisted evidence and journal metadata), Discord-only qualification commands and adapter/journal namespace. Its enabled flag means read-only observation, real classes stay `qualified:false`, Unknown is neither active_media nor End. No Discord private REQUEST_KEY, no subscription of Zoom to Discord capture, no raw AX labels/audio in journals, and no pending-branch cherry-picks or architectural replacement. At eventual integration, #11's qualified synthetic/future start must install its owner through the same engine lock/authority and return the actual native lease; real unqualified Discord must remain unable to capture. Do not merge namespace semantics by guessing identity from client lifecycle.
 
-- New source adapters should supply a **single batch** of `Observation` values to `lifecycle::observe_sources(generation, observations)` per monitor poll, with a stable `key` (e.g. `zoom`/`discord`), fixed diagnostic `Probe`, and Unknown for unavailable evidence. Do not call the tracker separately for each adapter; missing observations reset debounce. Omitted snapshot sources are published Unknown with logical session retained. The session/token/snapshot API is source-neutral; the Zoom AX mechanism is not.
-- The frontend reconciler already accepts multiple sources. One recorder means **first accepted session wins**. Calls seen while pending, recording or stopping are consumed with a visible conflict message, never queued, merged, source-switched or used to stop someone else's take. No automatic Zoom-to-Discord handover is promised. Choosing a different overlap policy is an explicit coordinator/product decision.
-- #11 likely conflicts in `meeting_detection.rs`, `lib.rs`, root `layout.tsx`, `meeting-automation.ts`, Settings and native command registration. Integrate its source-specific adapter into the batch/snapshot path; **do not replace this with CAM/HAL/process disappearance, a second monitor-owned recorder or a manual prompt**. Legacy process offers remain separate; macOS Zoom is excluded from that fallback. Legacy meeting-ended cannot stop session-owned recordings. This commit does not claim a macOS Discord detector.
-- #14 likely conflicts in `diarization/mod.rs`, worker/start interfaces and metadata policy. Preserve `microphone_identity_unverified` in every post-call source identity decision; never reintroduce source-only `You`. Keep the #9 source selection, shutdown and durable recovery semantics.
-- #12 can attach Notes to the ordinary meeting created by the recorder; lifecycle status is not a meeting/person identity. This work introduces no Notes store, product-text provider or paid API. Audio/ASR stay local; only the separately approved subscriber Codex CLI may handle product text.
+Likely integration conflicts: `lib.rs` command signatures/registration, root `layout.tsx`, `RecordingControls`, `useRecordingStart`, shared reservation/launch helpers, Labs enablement and capture metadata. #14 must preserve the identity policy and shared source predicate in both direct and meeting post-call paths; #12 attaches Notes to the ordinary recording meeting, not a lifecycle/person ID.
 
-## Tests and acceptance accounting
+## Scoped native microphone provenance (R1-5)
 
-Portable commands (toolchain/dependencies must be available; Bun groups run separately):
+The previous blanket all-macOS label change is removed. `RecordingManager::prepare_source_provenance` freezes a native recording policy before model/capture startup:
+
+| Context at startup | Mic identity policy |
+| --- | --- |
+| In-person/room | Neutral `Microphone`; no room-person differentiation |
+| Identifiable Zoom automatic owner or explicitly selected `zoom.us` on macOS | Unverified, neutral `Microphone` |
+| Manual global capture on macOS with Zoom present (exact public bundle inventory) | Unverified, neutral `Microphone`, even if Zoom is only idle/preview |
+| Global macOS capture with unavailable inventory | Ambiguous; neutral, never proof of `You` |
+| Explicit unrelated selected app, or global capture with verified Zoom absence | Existing unrelated behavior preserved |
+| Windows/Linux calls | Existing convention preserved; room remains neutral |
+
+This scopes **provenance**, not lifecycle, and does not infer a call from process presence. It covers manually recorded identifiable Zoom speaker scenarios without a special frontend flag. There is no qualified route-specific AEC/headset test, so an identified Zoom context is neutral on headsets too. Global capture with idle Zoom is intentionally conservative; an unrelated explicit app is not relabeled simply because idle Zoom is open. The frozen decision does **not** identify a Zoom app launched after recording startup, another bundle/browser meeting, private routing or an unobserved route. Those gaps need a fresh identifiable recording/context and final qualification; there is no claim that legacy unrelated mic identity is acoustically proven. No automatic successful `You` separation is claimed.
+
+Both source tracks, text and timestamps remain. Remote activity never gates/drops microphone audio, so local overlap is not deliberately erased. #6 remote-only/double-talk speech/ASR/acoustics are still **not run**. This is conservative attribution, not AEC, voice separation or accurate local identity.
+
+## Offline identity and source labels (R1-2, R1-3)
+
+`MeetingMetadata.microphone_identity_unverified` persists the native decision. `diarization/identity_policy.rs` reads it (and room provenance) before the actual call:
+
+- Flagged takes bypass the dual-track mic→You shortcut and mic enrollment. Live initialization does not seed an unqualified legacy local-user voiceprint, and mic audio is not enrolled as a known local speaker.
+- Whole-file Pyannote receives `trust_legacy_user:false` **before** its centroid/voiceprint match block, so polluted legacy enrollment is not consulted. Direct file/recording entrypoints read the same metadata, not just `diarize_meeting`.
+- Post-inference user-cluster assignment and transcript `You`-overlap inference are disabled for flagged takes, including remote-only system/Guest rows and a future adapter returning an erroneous user index. A stale `You` without overlapping inference becomes Unknown, not a confident identity.
+- Existing enrollment files/data are **not deleted**. Historical unflagged recordings retain the prior convention. Invalid provenance cannot silently grant trust; unreadable/malformed metadata fails the operation.
+- Explicit manual names survive; generated/source pieces of a flagged manual composite are not promoted to people. Text, IDs and timings remain unchanged.
+
+`speaker_labels.rs` supplies the shared `is_generated_part`, `manual_names` and `is_manual_label` predicate for offline diarization and retranscription. It covers `Microphone`, mic, system, system audio, Guest, You, Unknown, numeric Speaker N and source composites. `Microphone` is refinable, never a human name. Real names (including names inside composites) remain manual. Enhance retains flagged mic as Microphone; whole-file anonymous speaker refinement is not source→identity proof.
+
+## Observation-only qualification via actual app controls
+
+Settings → Meeting Detection → **Zoom: observation only** owns a bounded local in-memory journal, separate from recorder controls:
+
+1. On the **single final combined build**, enable read-only Meeting Detection, enter machine, actual macOS/client version, UI language, Accessibility inventory and route. No separate DMG, local build or Mac action is requested during software preparation.
+2. Start the journal while idle; mark **actual observed state**, not an anticipated click: idle, preview, waiting, joined, joined-muted, silence, reconnecting, device changed, left with Zoom open, permission lost. Markers never feed the detector or authorize capture.
+3. Native observation entries include Unix-ms and monotonic elapsed-ms timestamps, candidate presence, fixed allowlisted reason and opaque observed session. No raw AX labels/window titles, audio, transcript text or paths. Unknown permission loss stays Unknown, never End. Version metadata is bounded; machine/route/language/permission/truth are enums.
+4. Stop and explicitly export JSON before app exit; download is local, never uploaded. Start refuses to overwrite an existing journal; clearing is explicit and UI-confirmed. A 3,600-entry cap stops collection and records `capacity_reached`; no unbounded memory or background file writer. This is not durable across app restart.
+5. Compare truth/observations manually against the #7 matrix: repeated preview/waiting vs muted join, permission revoke/restore, mute/silence/reconnect, device change, leave-open and rejoin, both M4 Pro/48 GB and M1 Pro/32 GB and supported EN/RU/client/route classes. Record missed/false transitions, unknown intervals, uncertainty and measured delays. An UNKNOWN, shared waiting signature or missing scenario is **not a pass**. Leave-open remains unresolved.
+
+Commands are Zoom-only: `start_zoom_observation(metadata)`, `mark_zoom_observation(truth)`, `stop_zoom_observation`, `export_zoom_observation`, `clear_zoom_observation`. Exports retain `physical_acceptance:not_run`/`qualified:false`; they are evidence preparation, not an automatic certificate. A reviewed, evidence-backed production qualification mapping would require a subsequent software decision; there is no UI/CLI “force qualified” switch.
+
+## Red → green verification and limits
+
+Runtime red evidence against `7d3ff8a`:
+
+- Frontend disable-after-awaited-state and unqualified-positive tests both failed (`1` stop/start instead of `0`). Native preflight accepted the unqualified candidate. Source-label regression treated Microphone as a manual name.
+- Actual native Stop wrappers/prefix: delayed A after manual B and native-disable while queued both returned `Completed` in the baseline. The baseline harness adds only an unused optional expected field for injection; its production guard behavior is unchanged.
+- Actual `diarize_meeting` + real SQLite + production voiceprint decision block: flagged remote Guest consulted the polluted legacy user match once (`1`, expected `0`). Unrelated legacy/manual-name controls passed.
+
+Reproducible commands (Cargo/Rust dependencies pinned to repository lock; Bun groups separate):
 
 ```sh
 python3 -I frontend/scripts/test-meeting-lifecycle-portable.py
+python3 -I frontend/scripts/test-guarded-recording-stop-portable.py --baseline # expected FAIL
+python3 -I frontend/scripts/test-guarded-recording-stop-portable.py
+python3 -I frontend/scripts/test-offline-identity-portable.py --baseline # expected FAIL
+python3 -I frontend/scripts/test-offline-identity-portable.py
 python3 -I frontend/scripts/test-retranscription-sources-portable.py
-# from frontend, each in its own process:
+# from frontend, separate processes:
 bun test tests/lib/meeting-automation.test.ts
 bun test tests/lib/meeting-lifecycle.test.ts
 bun test tests/hooks/zoom-automation.test.tsx
+bun test tests/hooks/guarded-recording-stop.test.tsx
+bun test tests/hooks/zoom-observation.test.tsx
 bun node_modules/typescript/bin/tsc --noEmit --project tsconfig.json
 ```
 
-The portable native harness includes the production AX classifier/tracker, serde lifecycle snapshots, command bodies and recording-mode policy. Only Tauri command annotations are removed in the temporary lifecycle copy. macOS FFI is cfg-excluded: this does **not** compile the macOS SDK, desktop wrappers or IPC. Synthetic frontend hook tests use the real recorder hook, root reconciler, event/route launch helpers and RecordingService; the Tauri transport/audio/model responses are mocked. They establish token propagation, manual ownership, startup cancellation, start/leave race normal Stop dispatch and error cleanup, not audio accuracy or an installed-app result. No recording/model fixtures or hardware measurements are used.
+Harness boundaries: lifecycle includes production tracker/classifier/native ownership/snapshot/journal/policy modules, stripping only Tauri command annotations; macOS FFI is cfg-excluded. Guarded-Stop harness includes actual wrappers, pre-effect inner prefix and state-query body, with transport/manager and post-accept capture/save work stubbed; it establishes the atomic authorization boundary, not hardware shutdown. Offline harness includes the actual command, naming/SQL/persistence and real centroid→voiceprint decision block, with synthetic inference/DSP and contact-link stubs; existing enrollment fixture bytes are retained, reads/writes counted. No real model/audio fixture or acoustic pass. Frontend tests exercise actual launch/event/recorder hook/service/Controls/observation components with mocked Tauri transport. Final pass counts and type-check outcome are in the completion handoff.
 
-| Live issue AC | Software evidence | Remaining acceptance |
+No full desktop native/macOS SDK compile, Next production build, installed app, physical/model/ASR accuracy, DMG/packaging, Actions trigger, push, merge/release, user-data/Mac operation, subagent or issue closure occurred. Prior R0 test counts are historical; R1 command-path regressions supersede their ownership/identity assumptions.
+
+## Issue AC status after R1
+
+| AC | Implemented/tested software | Not established |
 | --- | --- | --- |
-| Verified join/leave detector with research-established latency bounds | Candidate AX adapter + native per-source debounce + actual start/Stop wiring | **Not accepted**: prior physical UNKNOWN unresolved; full Mac detector and latency qualification pending #7/final build |
-| Running Zoom, mic test, waiting/preview do not create a meeting; mute/silence do not end | Synthetic classifier negatives; menu-only Leave rejected; audio/mute absent from policy; Unknown retains live session | **Physical pending**; reject candidate if waiting/preview shares positive controls |
-| Muted join, reconnect, device changes, leave with Zoom open | Same session through Unknown/grace; muted-control fixtures; explicit Home idle can confirm leave with client alive | **Physical pending** for actual exposed controls, reconnect semantics and route changes |
-| Manual Stop does not restart same call; next real call detects | Session tombstones/native IDs; deterministic root/recorder and multi-source tests | **Software tested**, installed-app/real-call check pending |
-| Automatic signal sequences and physical Zoom on Mac; state/errors visible | Native/frontend deterministic sequences; real recorder entrypoint tests; Settings presence/reason and normal capture errors | **Software tested**, physical half pending; no whole-AC completion claim |
+| Verified automatic join/leave and research-derived latency bounds | Qualified-fixture recorder path, native qualification gate and observations | **Required real automation not achieved**: all real classes capture-blocked; physical UNKNOWN/bounds pending |
+| Idle/test/preview/waiting negative; mute/silence retention | Candidate negatives, observation-only gate, Unknown retention | Actual UI signature distinction, false-positive/negative rates |
+| Muted join/reconnect/device change/leave-open | Synthetic sequences, scoped provenance, timestamped truth journal | Actual supported client/route behavior; leave-open unresolved |
+| Manual Stop suppresses same call, next call rearms | Token reservations/tombstones, durable native owner/generation, stale-stop and disable-race tests | Installed-app/physical call qualification |
+| Automatic sequence + Mac scenario; visible state/errors | Actual recorder/Controls/qualification paths and visible unqualified status | Physical half and full #6 identity/double-talk acceptance |
 
-### Verification performed on Linux
-
-- Native portable lifecycle/AX-classifier/capture-policy harness: **25 passed**, 0 failed. Production snapshot command body and stale-token validation exercised, including two independent synthetic sources and generation rejection. macOS AppKit/AX code is cfg-excluded, **not compiled** here.
-- Isolated Bun groups: meeting handoff **5 passed**; lifecycle sequences/races **9 passed**; actual recorder hook + service entrypoints **3 passed**; existing Recording Settings mode **1 passed**; existing recording state/shutdown **2 passed**. The synthetic capture-error case intentionally logs `Synthetic capture unavailable` while asserting cleanup.
-- One early recorder test invocation hit its configured 120-second background timeout under host contention and was stopped; rerun with adequate timeout completed successfully. No hardware failure is inferred from that timeout.
-- Enhance/retranscription source-policy harness: **5 passed**, 0 failed, including retained mic/system source labels and invalid-policy rejection.
-- Standalone TypeScript checking passed once during implementation. A later full check caught test-only deferred-mock return types; those were corrected to the optional recording-state contract and all 9 lifecycle tests passed again. The final type-check outcome is recorded with the completion report. No Next production build, full native desktop build, native macOS compile, model/ASR fixture, installed application or physical audio test was run. This Linux environment lacks `pkg-config`; it is not an authoritative macOS build environment.
-
-Before acceptance on **both M4 Pro/48 GB and M1 Pro/32 GB**, use the final combined CI-built candidate only: compile/link macOS AX FFI; record exact source/artifact/client/macOS/language/permission/route inventory; run #7's repeated idle/test/preview/waiting/muted-join/silence/reconnect/device/leave-open/rejoin matrix and manual-stop/rearm/overlap tests; measure actual start/stop delays; exercise denied/revoked AX and unsupported controls; run #6 remote-only and local-plus-remote speakers tests with retained source audio and transcript provenance. A missing route/version or Unknown result is not a pass. No Mac qualification is delegated to the user during this software preparation.
+Coordinator owns independent Opus review and eventual combined integration. Keep #11 namespaces and one recorder authority; do not claim room speaker differentiation or successful local-user separation.

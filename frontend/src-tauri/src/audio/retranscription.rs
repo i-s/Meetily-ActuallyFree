@@ -244,25 +244,7 @@ fn find_retranscription_sources(folder: &Path, fallback: &Path) -> Result<Vec<Re
     Ok(sources)
 }
 
-fn is_manual_speaker_label(label: &str) -> bool {
-    let trimmed = label.trim();
-    if trimmed.is_empty() {
-        return false;
-    }
-    let is_generated = trimmed.split(" + ").all(|part| {
-        let p = part.trim();
-        p.eq_ignore_ascii_case("guest")
-            || p.eq_ignore_ascii_case("you")
-            || p.eq_ignore_ascii_case("unknown")
-            || p.eq_ignore_ascii_case("mic")
-            || p.eq_ignore_ascii_case("microphone")
-            || p.eq_ignore_ascii_case("system")
-            || p.eq_ignore_ascii_case("system audio")
-            || (p.to_ascii_lowercase().starts_with("speaker ")
-                && p[8..].trim().chars().all(|c| c.is_ascii_digit()))
-    });
-    !is_generated
-}
+fn is_manual_speaker_label(label: &str) -> bool { crate::speaker_labels::is_manual_label(label) }
 
 /// Keep named people across Enhance runs, never promote a source label into
 /// an identity. Legacy call-mic hints retain their existing You convention.

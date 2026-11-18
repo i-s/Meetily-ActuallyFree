@@ -11,6 +11,7 @@ import { listen, UnlistenFn } from '@tauri-apps/api/event';
 export interface RecordingState {
   is_recording: boolean;
   is_stopping?: boolean;
+  recording_lease?: import('@/lib/native-recording').RecordingLease | null;
   in_person?: boolean;
   is_paused: boolean;
   is_microphone_muted: boolean;
@@ -82,8 +83,8 @@ export class RecordingService {
     systemDeviceName: string | null,
     meetingName: string,
     lifecycleSession?: string
-  ): Promise<void> {
-    return invoke('start_recording_with_devices_and_meeting', {
+  ): Promise<import('@/lib/native-recording').RecordingLease> {
+    return invoke<import('@/lib/native-recording').RecordingLease>('start_recording_with_devices_and_meeting', {
       micDeviceName,
       systemDeviceName,
       meetingName,

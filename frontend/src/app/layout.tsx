@@ -29,7 +29,7 @@ import { UpdateCheckProvider } from '@/components/UpdateCheckProvider'
 import { RecordingPostProcessingProvider } from '@/contexts/RecordingPostProcessingProvider'
 import { ImportDialogProvider } from '@/contexts/ImportDialogContext'
 import { isAudioExtension, getAudioFormatsDisplayList } from '@/constants/audioFormats'
-import { loadLabsPreferences } from '@/lib/labs'
+import { LABS_CHANGED_EVENT, loadLabsPreferences } from '@/lib/labs'
 import { createLifecycleAutomation, type LifecycleSnapshot } from '@/lib/meeting-lifecycle'
 import { automatedStartInProgress, automatedRecording, endAutomatedRecording, markAutomatedStart } from '@/lib/meeting-automation'
 import { getPendingCrashReport, type PendingCrashReport } from '@/services/crashReportService'
@@ -312,11 +312,17 @@ export default function RootLayout({
   // or stops a take. Native snapshots retain sessions across route changes.
   useEffect(() => {
     if (!startupResolved || startupError || pendingCrashReport || isMinibar || !recordingNoticeAcknowledged) return
+    const syncAutomation = () => {
+      void invoke('set_meeting_automation_enabled', { enabled: loadLabsPreferences().meetingAutomation && !showOnboarding })
+        .catch(error => console.error('Could not synchronize native automation authority:', error));
+    };
+    syncAutomation();
+    window.addEventListener(LABS_CHANGED_EVENT, syncAutomation);
     const lifecycle = createLifecycleAutomation({
       enabled: () => loadLabsPreferences().meetingAutomation && !showOnboarding,
       state: () => invoke('get_recording_state'),
       start: () => startRecordingAnywhere.current(),
-      stop: () => requestRecordingStop((href) => router.push(href)),
+      stop: (expected) => requestRecordingStop((href) => router.push(href), expected),
       error: (error) => toast.error('Meeting automation failed', { description: String(error) }),
       conflict: (app) => toast.info(`${app} call detected while the recorder is busy`, {
         description: 'The existing take keeps its owner. No second recording was started.',
@@ -345,9 +351,9 @@ export default function RootLayout({
 
         if (loadLabsPreferences().meetingAutomation && active_media && !showOnboarding) {
           void invoke<{ is_recording?: boolean }>('get_recording_state').then((state) => {
-            if (state.is_recording || automatedStartInProgress()) return;
-            markAutomatedStart({ app, process });
-            startRecording();
+            if (!loadLabsPreferences().meetingAutomation || state.is_recording || automatedStartInProgress()) return;
+            if (markAutomatedStart({ app, process })) startRecording();
+            else toast.error('Meeting automation could not reserve the recorder');
           }).catch((error) => console.error('Could not check recording state for meeting automation:', error));
           return;
         }
@@ -388,13 +394,15 @@ export default function RootLayout({
       const call = automatedRecording();
       if (call?.sessionId) return; // lifecycle-owned calls never follow legacy process disappearance
       if (!call || call.process !== event.payload.process || !loadLabsPreferences().meetingAutomation) return;
-      void invoke<{ is_recording?: boolean }>('get_recording_state').then((state) => {
+      void invoke<import('@/lib/native-recording').NativeRecordingState>('get_recording_state').then((state) => {
+        if (!loadLabsPreferences().meetingAutomation) return;
         if (!state.is_recording) {
           endAutomatedRecording();
           return;
         }
-        toast(`${call.app} call ended`, { description: 'Meeting automation is stopping and saving the recording.' });
-        requestRecordingStop((href) => router.push(href));
+        if (call.recordingLease && state.recording_lease?.generation === call.recordingLease.generation) {
+          requestRecordingStop((href) => router.push(href), call.recordingLease);
+        }
       }).catch((error) => console.error('Could not check recording state for meeting automation:', error));
     });
 
@@ -403,6 +411,7 @@ export default function RootLayout({
       unlistenStart.then((fn) => fn());
       unlistenEnd.then((fn) => fn());
       lifecycle.dispose();
+      window.removeEventListener(LABS_CHANGED_EVENT, syncAutomation);
       unlistenLifecycle.then((fn) => fn());
     };
   }, [showOnboarding, startupResolved, startupError, pendingCrashReport, isMinibar, router, recordingNoticeAcknowledged]);

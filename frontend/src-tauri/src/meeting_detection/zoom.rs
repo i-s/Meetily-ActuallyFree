@@ -160,7 +160,7 @@ fn classify(snapshot: &Snapshot) -> Probe {
 }
 
 #[cfg(target_os = "macos")]
-pub use native::probe_running;
+pub use native::{probe_running, client_present};
 
 #[cfg(test)]
 mod tests {
@@ -410,6 +410,8 @@ mod native {
             Some(pids)
         }
     }
+
+    pub fn client_present() -> Option<bool> { main_pids().map(|pids| !pids.is_empty()) }
 
     /// Public AppKit bundle inventory, never executable/keyword heuristics.
     pub fn probe_running(diagnostics: bool) -> Probe {

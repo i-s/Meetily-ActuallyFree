@@ -20,6 +20,8 @@ const {
   endAutomatedRecording,
   markAutomatedStart,
   takeAutomatedStart,
+  releaseAutomatedStart,
+  reservationCurrent,
 } = await import('../../src/lib/meeting-automation.ts');
 
 const zoom = { app: 'Zoom', process: 'Zoom.exe' };
@@ -43,7 +45,9 @@ describe('meeting automation hand-off', () => {
 
   test('only the recording automation started is stopped for its call', () => {
     assert.equal(automatedRecording(), null);
-    beginAutomatedRecording(zoom);
+    assert.equal(markAutomatedStart(zoom), true);
+    const call = takeAutomatedStart()!;
+    assert.equal(beginAutomatedRecording(call), true);
     assert.deepEqual(automatedRecording(), zoom);
     endAutomatedRecording();
     assert.equal(automatedRecording(), null);
@@ -59,4 +63,23 @@ describe('meeting automation hand-off', () => {
     endAutomatedRecording();
     assert.deepEqual(announced, []);
   });
+});
+
+test('common reservation is exclusive across sources and late A release cannot cancel B', () => {
+  store.clear();
+  const a = { app: 'Zoom', process: 'zoom.us', source: 'zoom', sessionId: 'A' };
+  const b = { app: 'Discord', process: 'Discord', source: 'discord', sessionId: 'B' };
+  assert.equal(markAutomatedStart(a), true);
+  assert.equal(markAutomatedStart(b), false);
+  const pending = takeAutomatedStart()!;
+  assert.equal(reservationCurrent(pending, 'inflight'), true);
+  assert.equal(markAutomatedStart(b), false);
+  releaseAutomatedStart(pending);
+  assert.equal(markAutomatedStart(b), true);
+  const second = takeAutomatedStart()!;
+  releaseAutomatedStart(pending);
+  assert.equal(beginAutomatedRecording(pending), false);
+  assert.equal(reservationCurrent(second, 'inflight'), true);
+  assert.equal(beginAutomatedRecording(second), true);
+  assert.equal(automatedRecording()?.sessionId, 'B');
 });

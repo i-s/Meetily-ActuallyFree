@@ -31,11 +31,18 @@ def main():
         shutil.copyfile(REPO / "Cargo.lock", work / "Cargo.lock")
         lifecycle = (DETECTION / "lifecycle.rs").read_text().replace("#[tauri::command]", "")
         (work / "src/lifecycle.rs").write_text(lifecycle)
+        for name, path in [("ownership", REPO / "frontend/src-tauri/src/audio/recording_ownership.rs"),
+                           ("zoom_observation", DETECTION / "zoom_observation.rs")]:
+            (work / f"src/{name}.rs").write_text(path.read_text().replace("#[tauri::command]", ""))
         (work / "src/lib.rs").write_text(f'''#![allow(dead_code)]
 static MONITOR_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 #[path="{DETECTION}/evidence.rs"] mod evidence;
 #[path="{DETECTION}/zoom.rs"] mod zoom;
 mod lifecycle;
+mod zoom_observation;
+#[path="{REPO}/frontend/src-tauri/src/speaker_labels.rs"] mod speaker_labels;
+#[path="{REPO}/frontend/src-tauri/src/diarization/identity_policy.rs"] mod identity_policy;
+mod audio {{ #[path="{work}/src/ownership.rs"] pub mod recording_ownership; }}
 #[path="{REPO}/frontend/src-tauri/src/audio/recording_mode.rs"] mod recording_mode;
 ''')
         subprocess.run(["cargo", "test", "--offline", "--manifest-path", str(work / "Cargo.toml"),

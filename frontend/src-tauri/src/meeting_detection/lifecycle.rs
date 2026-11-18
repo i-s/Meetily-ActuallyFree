@@ -13,6 +13,7 @@ pub struct SourceState {
     presence: String,
     reason: String,
     session_id: Option<String>,
+    qualified: bool,
 }
 #[derive(Clone, Default, Serialize)]
 pub struct Snapshot {
@@ -49,6 +50,9 @@ pub fn suspend(enabled: bool) -> Snapshot {
     for source in &mut state.snapshot.sources {
         source.presence = "unknown".into();
         source.reason = if enabled { "monitor_restarting" } else { "detection_disabled" }.into();
+        if source.source == "zoom" {
+            super::zoom_observation::observe(&source.presence, &source.reason, source.session_id.as_deref());
+        }
     }
     state.snapshot.clone()
 }
@@ -97,8 +101,14 @@ impl State {
                 source: observation.key.clone(), app: observation.app.clone(), process: observation.process.clone(),
                 presence: match probe.presence { Presence::Active => "active", Presence::Inactive => "inactive", Presence::Unknown => "unknown" }.into(),
                 reason: probe.reason.into(), session_id: self.sessions.get(&observation.key).cloned(),
+                // No real AX/client/route class has passed physical qualification.
+                // This is not persisted, and there is no production override.
+                qualified: false,
             };
             self.snapshot.sources.retain(|s| s.source != observation.key);
+            if source.source == "zoom" {
+                super::zoom_observation::observe(&source.presence, &source.reason, source.session_id.as_deref());
+            }
             self.snapshot.sources.push(source);
         }
         self.snapshot.enabled = true;
@@ -115,12 +125,22 @@ pub fn get_meeting_lifecycle_snapshot() -> Snapshot {
 pub fn validate_start(session: &str) -> Result<(), String> {
     let state = STATE.lock().unwrap();
     if state.monitor_generation == super::MONITOR_GENERATION.load(std::sync::atomic::Ordering::SeqCst)
+        && crate::audio::recording_ownership::automation_enabled()
         && state.snapshot.enabled && state.snapshot.sources.iter()
-        .any(|source| source.session_id.as_deref() == Some(session) && source.presence == "active") {
+        .any(|source| source.session_id.as_deref() == Some(session) && source.presence == "active" && source.qualified) {
         Ok(())
     } else {
-        Err("The call ended or detection was disabled before capture could start.".into())
+        Err("Zoom automation is observation-only: this client has not passed physical lifecycle qualification, or the call/automation is no longer active. Use the manual recording controls; collect the Zoom qualification journal in Meeting Detection settings for the final combined Mac build.".into())
     }
+}
+
+pub fn session_owner(session: &str) -> Option<crate::audio::recording_ownership::LifecycleOwner> {
+    STATE.lock().unwrap().snapshot.sources.iter()
+        .find(|source| source.session_id.as_deref() == Some(session))
+        .map(|source| crate::audio::recording_ownership::LifecycleOwner {
+            source: source.source.clone(), session_id: session.into(),
+            app: source.app.clone(), process: source.process.clone(),
+        })
 }
 
 pub fn session_source(session: &str) -> Option<String> {
@@ -196,8 +216,10 @@ mod tests {
             *state = State::default();
             state.observe(0, &[sample("zoom", Presence::Active)]);
             state.observe(3_000, &[sample("zoom", Presence::Active)]);
+            state.snapshot.sources[0].qualified = true; // synthetic fixture ONLY
             state.sessions["zoom"].clone()
         };
+        crate::audio::recording_ownership::set_meeting_automation_enabled(true);
         assert!(validate_start(&id).is_ok());
         assert_eq!(get_meeting_lifecycle_snapshot().sources[0].session_id.as_deref(), Some(id.as_str()));
         suspend(false);
@@ -208,4 +230,16 @@ mod tests {
         let generation = super::super::MONITOR_GENERATION.load(std::sync::atomic::Ordering::SeqCst);
         assert!(observe_sources(generation.wrapping_add(1), &[sample("zoom", Presence::Active)]).is_none());
     }
+    #[test]
+    fn r1_legacy_enabled_candidate_does_not_authorize_capture() {
+        let id = {
+            let mut state = STATE.lock().unwrap();
+            *state = State::default();
+            state.observe(0, &[sample("zoom", Presence::Active)]);
+            state.observe(3_000, &[sample("zoom", Presence::Active)]);
+            state.sessions["zoom"].clone()
+        };
+        assert!(validate_start(&id).is_err(), "unqualified physical AX candidate authorized recording");
+    }
+
 }

@@ -2,8 +2,9 @@
 //! macOS Zoom never uses the legacy process/audio lease fallback for automation.
 pub mod evidence;
 pub mod lifecycle;
+pub mod zoom_observation;
 #[cfg(any(target_os = "macos", test))]
-mod zoom;
+pub(crate) mod zoom;
 
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -529,6 +530,7 @@ pub async fn set_meeting_detection_settings<R: Runtime>(
         start_monitor(&app);
     } else {
         MONITOR_GENERATION.fetch_add(1, Ordering::SeqCst);
+        crate::audio::recording_ownership::set_meeting_automation_enabled(false);
         let _ = app.emit("meeting-lifecycle", lifecycle::suspend(false));
     }
     Ok(())
@@ -545,6 +547,7 @@ pub async fn start_meeting_detection<R: Runtime>(app: AppHandle<R>) -> Result<()
 #[tauri::command]
 pub async fn stop_meeting_detection<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
     MONITOR_GENERATION.fetch_add(1, Ordering::SeqCst);
+    crate::audio::recording_ownership::set_meeting_automation_enabled(false);
     let _ = app.emit("meeting-lifecycle", lifecycle::suspend(false));
     Ok(())
 }

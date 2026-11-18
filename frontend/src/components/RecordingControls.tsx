@@ -37,7 +37,9 @@ import { useAppAudio } from '@/hooks/useAppAudio';
 import { GroupPicker } from '@/components/groups/GroupBits';
 import { Hint } from '@/components/ui/tooltip';
 import { Spinner } from '@/components/ui/spinner';
-import { STOP_RECORDING_EVENT, STOP_REQUEST_KEY } from '@/lib/recording-launch';
+import { STOP_RECORDING_EVENT, takeRecordingStopRequest, validRecordingLease } from '@/lib/recording-launch';
+import { stopRecordingRequest, type RecordingLease } from '@/lib/native-recording';
+import { loadLabsPreferences } from '@/lib/labs';
 import { formatClock } from '@/lib/dates';
 
 interface RecordingControlsProps {
@@ -276,16 +278,16 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
     }
   }, [onRecordingStart, isStarting]);
 
-  const stopRecordingAction = useCallback(async () => {
+  const stopRecordingAction = useCallback(async (expected?: RecordingLease) => {
     try {
-      setIsProcessing(true);
+      if (expected && !loadLabsPreferences().meetingAutomation) return;
+      if (!expected) setIsProcessing(true);
       // Recordings save under the install-local data root (same directory as the database).
       const dataDir = await invoke<string>('get_database_directory');
       const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-      const didStop = await invoke<boolean>('stop_recording', {
-        args: { save_path: `${dataDir}/recording-${timestamp}.wav` },
-      });
-      setIsProcessing(false);
+      if (expected && !loadLabsPreferences().meetingAutomation) return;
+      const didStop = await stopRecordingRequest(`${dataDir}/recording-${timestamp}.wav`, expected);
+      if (!expected) setIsProcessing(false);
       if (!didStop) return;
       Analytics.trackTranscriptionSuccess();
       // Rust emits one completion event; RecordingPostProcessingProvider saves
@@ -293,10 +295,12 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
     } catch (error) {
       console.error('Failed to stop recording:', error);
       if (errorText(error).includes('No recording in progress')) return;
-      setIsProcessing(false);
-      onRecordingStop(false);
+      if (!expected) {
+        setIsProcessing(false);
+        onRecordingStop(false);
+      }
     } finally {
-      setIsStopping(false);
+      if (!expected) setIsStopping(false);
     }
   }, [onRecordingStop]);
 
@@ -311,22 +315,23 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
   // automation) routes here and leaves a request, so the normal stop and save
   // flow runs from this card.
   useEffect(() => {
-    let requested = false;
-    try {
-      requested = sessionStorage.getItem(STOP_REQUEST_KEY) === '1';
-      if (requested) sessionStorage.removeItem(STOP_REQUEST_KEY);
-    } catch {
-      requested = false;
+    const request = takeRecordingStopRequest();
+    if (request && isRecording) {
+      if (request.expected) void stopRecordingAction(request.expected);
+      else void handleStopRecording();
     }
-    if (requested && isRecording) void handleStopRecording();
-  }, [isRecording, handleStopRecording]);
+  }, [isRecording, handleStopRecording, stopRecordingAction]);
 
-  // The same request while this page is open (command bar, meeting automation).
   useEffect(() => {
-    const onStop = () => void handleStopRecording();
+    const onStop = (event: Event) => {
+      const expected = (event as CustomEvent).detail;
+      if (expected != null) {
+        if (validRecordingLease(expected)) void stopRecordingAction(expected);
+      } else void handleStopRecording();
+    };
     window.addEventListener(STOP_RECORDING_EVENT, onStop);
     return () => window.removeEventListener(STOP_RECORDING_EVENT, onStop);
-  }, [handleStopRecording]);
+  }, [handleStopRecording, stopRecordingAction]);
 
   const handlePauseRecording = useCallback(async () => {
     if (!isRecording || isPaused || isPausing) return;

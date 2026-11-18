@@ -127,7 +127,7 @@ fn install_fatal_error_callback<R: Runtime>(
                 let _ = stop_recording_inner(
                     app_for_stop,
                     RecordingArgs {
-                        save_path: String::new(),
+                        save_path: String::new(), expected: None,
                     },
                     true,
                 )
@@ -187,6 +187,8 @@ fn start_windows_audio_route_monitor<R: Runtime>(
 #[derive(Debug, Deserialize)]
 pub struct RecordingArgs {
     pub save_path: String,
+    #[serde(default)]
+    pub expected: Option<super::recording_ownership::RecordingLease>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -208,7 +210,7 @@ pub struct TranscriptionStatus {
 // ============================================================================
 
 /// Start recording with default devices
-pub async fn start_recording<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
+pub async fn start_recording<R: Runtime>(app: AppHandle<R>) -> Result<super::recording_ownership::RecordingLease, String> {
     start_recording_with_meeting_name(app, None).await
 }
 
@@ -216,7 +218,7 @@ pub async fn start_recording<R: Runtime>(app: AppHandle<R>) -> Result<(), String
 pub async fn start_recording_with_meeting_name<R: Runtime>(
     app: AppHandle<R>,
     meeting_name: Option<String>,
-) -> Result<(), String> {
+) -> Result<super::recording_ownership::RecordingLease, String> {
     info!(
         "Starting recording with default devices, meeting: {:?}",
         meeting_name
@@ -427,6 +429,7 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
     // Live audio-level meter: forward per-source (mic + system) levels to the UI visualizer
     let level_sender = spawn_level_forwarder(&app);
 
+    manager.prepare_source_provenance();
     start_live_diarization(&app).await;
     // Start recording with resolved devices (replaces start_recording_with_defaults_and_auto_save call)
     #[cfg(target_os = "windows")]
@@ -449,6 +452,7 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
 
     // Set recording flag and reset speech detection flag
     info!("ðŸ” Setting IS_RECORDING to true and resetting SPEECH_DETECTED_EMITTED");
+    let recording_lease = super::recording_ownership::begin(None);
     IS_RECORDING.store(true, Ordering::SeqCst);
 
     // Live speaker identification: label transcript segments with individual
@@ -532,7 +536,7 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
     info!("âœ… Recording started successfully with async-first approach");
     drop(engine_lifecycle_guard);
 
-    Ok(())
+    Ok(recording_lease)
 }
 
 /// Start recording with specific devices
@@ -540,7 +544,7 @@ pub async fn start_recording_with_devices<R: Runtime>(
     app: AppHandle<R>,
     mic_device_name: Option<String>,
     system_device_name: Option<String>,
-) -> Result<(), String> {
+) -> Result<super::recording_ownership::RecordingLease, String> {
     start_recording_with_devices_and_meeting(app, mic_device_name, system_device_name, None).await
 }
 
@@ -550,7 +554,7 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
     mic_device_name: Option<String>,
     system_device_name: Option<String>,
     meeting_name: Option<String>,
-) -> Result<(), String> {
+) -> Result<super::recording_ownership::RecordingLease, String> {
     start_recording_with_lifecycle(app, mic_device_name, system_device_name, meeting_name, None).await
 }
 
@@ -560,10 +564,17 @@ pub async fn start_recording_with_lifecycle<R: Runtime>(
     system_device_name: Option<String>,
     meeting_name: Option<String>,
     lifecycle_session: Option<String>,
-) -> Result<(), String> {
+) -> Result<super::recording_ownership::RecordingLease, String> {
     if let Some(session) = &lifecycle_session {
         crate::meeting_detection::lifecycle::validate_start(session)?;
     }
+    // Freeze ownership before any awaited setup. A call can end while streams
+    // start; its owner must not vanish just because the tracker removes it.
+    let lifecycle_owner = match lifecycle_session.as_deref() {
+        Some(session) => Some(crate::meeting_detection::lifecycle::session_owner(session)
+            .ok_or("The automated call ended before recording initialization.")?),
+        None => None,
+    };
     info!(
         "Starting recording with specific devices: mic={:?}, system={:?}, meeting={:?}",
         mic_device_name, system_device_name, meeting_name
@@ -684,6 +695,7 @@ pub async fn start_recording_with_lifecycle<R: Runtime>(
     }
     let auto_save = preferences.auto_save;
     manager.set_in_person(preferences.in_person);
+    manager.set_automatic_zoom(lifecycle_owner.as_ref().is_some_and(|owner| owner.source == "zoom"));
     manager.set_recordings_folder(preferences.save_folder);
     manager.set_per_app_config(
         preferences.per_app_recording_enabled,
@@ -705,6 +717,7 @@ pub async fn start_recording_with_lifecycle<R: Runtime>(
     // Live audio-level meter: forward per-source (mic + system) levels to the UI visualizer
     let level_sender = spawn_level_forwarder(&app);
 
+    manager.prepare_source_provenance();
     start_live_diarization(&app).await;
     // Start recording with specified devices and auto_save setting
     #[cfg(target_os = "windows")]
@@ -735,6 +748,7 @@ pub async fn start_recording_with_lifecycle<R: Runtime>(
 
     // Set recording flag and reset speech detection flag
     info!("ðŸ” Setting IS_RECORDING to true and resetting SPEECH_DETECTED_EMITTED");
+    let recording_lease = super::recording_ownership::begin(lifecycle_owner);
     IS_RECORDING.store(true, Ordering::SeqCst);
 
     // Live speaker identification: label transcript segments with individual
@@ -819,7 +833,7 @@ pub async fn start_recording_with_lifecycle<R: Runtime>(
     info!("âœ… Recording started with custom devices using async-first approach");
     drop(engine_lifecycle_guard);
 
-    Ok(())
+    Ok(recording_lease)
 }
 
 /// Stop recording with optimized graceful shutdown ensuring NO transcript chunks are lost
@@ -843,7 +857,7 @@ pub async fn stop_recording_from_compact<R: Runtime>(
 
 async fn stop_recording_inner<R: Runtime>(
     app: AppHandle<R>,
-    _args: RecordingArgs,
+    args: RecordingArgs,
     restore_main: bool,
 ) -> Result<StopOutcome, String> {
     info!(
@@ -853,6 +867,14 @@ async fn stop_recording_inner<R: Runtime>(
     // Check if recording is active
     if !IS_RECORDING.load(Ordering::SeqCst) {
         info!("Recording was not active");
+        return Ok(StopOutcome::AlreadyStopped);
+    }
+
+    // Engine lifecycle lock is held by EVERY caller. This short authority
+    // claim linearizes the exact generation/owner and automation enablement
+    // against native disable/release. Reject before any event/UI/save effect.
+    if !super::recording_ownership::claim_stop(args.expected.as_ref()) {
+        log::info!("Rejected stale or disabled automated recording stop");
         return Ok(StopOutcome::AlreadyStopped);
     }
 
@@ -1485,6 +1507,7 @@ pub async fn get_recording_state() -> serde_json::Value {
         serde_json::json!({
             "is_recording": is_recording,
             "is_stopping": IS_STOPPING.load(Ordering::SeqCst),
+            "recording_lease": super::recording_ownership::current(),
             "in_person": super::recording_mode::in_person(),
             "is_paused": manager.is_paused(),
             "is_microphone_muted": manager.get_state().is_microphone_muted(),
@@ -1499,6 +1522,7 @@ pub async fn get_recording_state() -> serde_json::Value {
         serde_json::json!({
             "is_recording": is_recording,
             "is_stopping": IS_STOPPING.load(Ordering::SeqCst),
+            "recording_lease": super::recording_ownership::current(),
             "in_person": super::recording_mode::in_person(),
             "is_paused": false,
             "is_microphone_muted": false,

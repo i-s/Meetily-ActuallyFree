@@ -9,8 +9,9 @@ import { recordingService } from '@/services/recordingService';
 import { readPendingGroup } from '@/lib/groups';
 import { automaticTitle, beginLiveSession } from '@/lib/live-session';
 import { AUTO_START_KEY, START_RECORDING_EVENT, requestRecordingStop } from '@/lib/recording-launch';
-import { beginAutomatedRecording, endAutomatedRecording, takeAutomatedStart, releaseAutomatedStart } from '@/lib/meeting-automation';
+import { beginAutomatedRecording, endAutomatedRecording, takeAutomatedStart, releaseAutomatedStart, reservationCurrent, automatedStartInProgress } from '@/lib/meeting-automation';
 import { lifecycleCallCanStart, lifecycleCallEnded } from '@/lib/meeting-lifecycle';
+import { loadLabsPreferences } from '@/lib/labs';
 import Analytics from '@/lib/analytics';
 import { showRecordingNotification } from '@/lib/recordingNotification';
 import { toast } from 'sonner';
@@ -188,20 +189,23 @@ export function useRecordingStart(
   const startRecording = useCallback(async (source: StartSource): Promise<boolean> => {
     // A detected call asked for this start (Labs meeting automation). A start
     // from the record button is the user's own and is never stopped for them.
+    const hadAutomatedRequest = automatedStartInProgress() !== null;
     const automated = takeAutomatedStart();
+    // Old/invalid routed automation cannot turn into an unguarded manual start.
+    if (source !== 'home_page' && hadAutomatedRequest && !automated) return false;
     const call = source === 'home_page' ? null : automated;
     // Readying the model can take several seconds (it loads a large model
     // into memory), so say so from the first step.
     setStatus(RecordingStatus.STARTING, 'Preparing transcription model…');
     const sttReady = await prefetchSttModel();
     if (!sttReady) {
-      releaseAutomatedStart();
+      if (automated) releaseAutomatedStart(automated);
       await reportModelNotReady(source);
       return false;
     }
 
     try {
-      if (call && !lifecycleCallCanStart(call)) {
+      if (call && (!loadLabsPreferences().meetingAutomation || !reservationCurrent(call, 'inflight') || !lifecycleCallCanStart(call))) {
         setStatus(RecordingStatus.IDLE);
         return false;
       }
@@ -211,12 +215,17 @@ export function useRecordingStart(
       setMeetingTitle(title);
       setStatus(RecordingStatus.STARTING, 'Starting audio capture…');
 
-      await recordingService.startRecordingWithDevices(
+      const lease = await recordingService.startRecordingWithDevices(
         selectedDevices?.micDevice || null,
         selectedDevices?.systemDevice || null,
         title,
         call?.sessionId
       );
+
+      const native = await recordingService.getRecordingState();
+      // Return values identify THIS start, not whichever take is current after
+      // an awaited notification or a WebView reload. Never attach A to B.
+      if (!lease || native.recording_lease?.generation !== lease.generation) return false;
 
       // RECORDING status itself arrives from Rust via RecordingStateContext.
       beginLiveSession(title, startedAt);
@@ -226,17 +235,22 @@ export function useRecordingStart(
       markRecordingStarted(startedAt);
       Analytics.trackButtonClick('start_recording', source);
       if (call) {
+        call.recordingLease = lease;
         beginAutomatedRecording(call);
         // A leave can race native stream startup. Finish using the normal Stop
         // path, not a parallel backend shutdown that bypasses saving.
-        if (call.sessionId && lifecycleCallEnded(call)) {
-          requestRecordingStop(() => {});
+        if (call.sessionId && lifecycleCallEnded(call) && lease) {
+          requestRecordingStop(() => {}, lease);
           return true;
         }
         toast(`Recording your ${call.app} call`, {
           description: 'Meeting automation started it, and stops and saves it when the call ends.',
           duration: 10000,
-          action: { label: "Don't stop it", onClick: () => endAutomatedRecording() },
+          action: { label: "Don't stop it", onClick: () => {
+            if (lease) void invoke<boolean>('release_automated_recording', { expected: lease }).then(released => {
+              if (released) endAutomatedRecording();
+            });
+          } },
         });
       }
       await showRecordingNotification();
@@ -256,7 +270,7 @@ export function useRecordingStart(
       Analytics.trackButtonClick('start_recording_error', source);
       return false;
     } finally {
-      releaseAutomatedStart();
+      if (automated) releaseAutomatedStart(automated);
     }
   }, [
     prefetchSttModel,

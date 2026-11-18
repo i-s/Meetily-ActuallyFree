@@ -43,6 +43,7 @@ pub mod console_utils;
 pub mod crash_report;
 pub mod database;
 pub mod diarization;
+pub mod speaker_labels;
 mod optional_models;
 pub mod notifications;
 pub mod ollama;
@@ -103,6 +104,8 @@ fn set_check_updates_on_launch(enabled: bool) -> Result<(), String> {
 #[derive(Debug, Deserialize)]
 struct RecordingArgs {
     save_path: String,
+    #[serde(default)]
+    expected: Option<audio::recording_ownership::RecordingLease>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -188,6 +191,7 @@ async fn stop_recording<R: Runtime>(app: AppHandle<R>, args: RecordingArgs) -> R
         app.clone(),
         audio::recording_commands::RecordingArgs {
             save_path: args.save_path.clone(),
+            expected: args.expected.clone(),
         },
     )
     .await
@@ -361,7 +365,7 @@ async fn start_recording_with_devices<R: Runtime>(
     mic_device_name: Option<String>,
     system_device_name: Option<String>,
 ) -> Result<(), String> {
-    start_recording_with_devices_and_meeting(app, mic_device_name, system_device_name, None, None).await
+    start_recording_with_devices_and_meeting(app, mic_device_name, system_device_name, None, None).await.map(|_| ())
 }
 
 #[tauri::command]
@@ -371,7 +375,7 @@ async fn start_recording_with_devices_and_meeting<R: Runtime>(
     system_device_name: Option<String>,
     meeting_name: Option<String>,
     lifecycle_session: Option<String>,
-) -> Result<(), String> {
+) -> Result<audio::recording_ownership::RecordingLease, String> {
     log_info!("ðŸš€ CALLED start_recording_with_devices_and_meeting - Mic: {:?}, System: {:?}, Meeting: {:?}",
              mic_device_name, system_device_name, meeting_name);
 
@@ -412,7 +416,7 @@ async fn start_recording_with_devices_and_meeting<R: Runtime>(
     };
 
     match recording_result {
-        Ok(_) => {
+        Ok(lease) => {
             log_info!("Recording started successfully via tauri command");
 
             // Show recording started notification through NotificationManager
@@ -431,7 +435,7 @@ async fn start_recording_with_devices_and_meeting<R: Runtime>(
                 );
             }
 
-            Ok(())
+            Ok(lease)
         }
         Err(e) => {
             log_error!("Failed to start recording via tauri command: {}", e);
@@ -812,6 +816,13 @@ pub fn run() {
             database::repositories::meeting_notes::api_get_meeting_notes,
             database::repositories::meeting_notes::api_save_meeting_notes,
             api::api_get_meeting_audio,
+            audio::recording_ownership::set_meeting_automation_enabled,
+            audio::recording_ownership::release_automated_recording,
+            meeting_detection::zoom_observation::start_zoom_observation,
+            meeting_detection::zoom_observation::mark_zoom_observation,
+            meeting_detection::zoom_observation::stop_zoom_observation,
+            meeting_detection::zoom_observation::export_zoom_observation,
+            meeting_detection::zoom_observation::clear_zoom_observation,
             meeting_detection::lifecycle::get_meeting_lifecycle_snapshot,
             meeting_detection::get_meeting_detection_settings,
             meeting_detection::set_meeting_detection_settings,

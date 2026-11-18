@@ -10,7 +10,7 @@ release availability and qualification are separate facts documented below.
 | --- | --- | --- |
 | Transcription | Parakeet, Whisper, or configured provider | Produces words and transcript timing. |
 | Diarization | Selected Pyannote/WeSpeaker or Nemotron engine | Assigns meeting-local speaker labels to audio/transcript turns. |
-| Capture provenance | Independent microphone/system tracks | Preserves source, not acoustic identity; unqualified macOS mic stays `Microphone`. Never infer `You` from speaker channel 0. |
+| Capture provenance | Independent microphone/system tracks | Preserves source, not acoustic identity; identifiable/unqualified Zoom and room mic stays `Microphone`. Never infer `You` from speaker channel 0. |
 
 Nemotron is diarization, not voice isolation. Its overlapping activity predictions
 do not produce separate audio tracks for each remote voice. Names, voiceprints,
@@ -22,11 +22,16 @@ Zoom's source-specific AX candidate, composable lifecycle snapshots, session-bou
 start/Stop ownership, manual override and provisional timing are documented in
 [ISSUE10_ZOOM_AUTOMATION.md](ISSUE10_ZOOM_AUTOMATION.md). Read it before changing
 meeting automation or adding Discord's adapter. Prior physical AX **UNKNOWN** is
-unresolved; this software does not qualify a real detector. All new macOS mic
-speech is conservatively `Microphone`, with persisted
-`microphone_identity_unverified` disabling offline mic-to-You shortcuts until
-#6 supplies a qualified acoustic identity policy. Both source tracks/overlap stay
-intact; lifecycle and identity remain independent.
+unresolved. Real AX classes are observation-only and cannot authorize capture,
+including with old enabled preferences; timestamped read-only qualification is
+available in Settings. Shared token reservations and native recording generations/
+owners guard Stop atomically and restore ownership on WebView reload. Scoped native
+provenance (identified Zoom contexts, ambiguous global Zoom inventory, and room)
+sets persisted `microphone_identity_unverified`; unrelated capture keeps its prior
+behavior. Flagged offline calls bypass BOTH mic-to-You and legacy voiceprint/user-
+cluster inference; shared source-label predicates keep Microphone refinable rather
+than a person. Both source tracks/overlap stay intact; #6 acoustic identity remains
+pending and independent of lifecycle.
 
 Manual controls, explicit microphone-only in-person mode, fail-closed chosen-app
 capture, selected-process lifetime, FFmpeg checkpoint shutdown, storage failures,
@@ -59,7 +64,7 @@ recording_commands.rs: start command
               -> VAD speech turns -> transcription queue
         -> persist mic/system source tracks and mixed playback audio
      -> transcription/worker.rs: transcribe each source's speech turn
-        -> microphone: Microphone on unqualified macOS/in-person; otherwise legacy You
+        -> microphone: Microphone on scoped unverified Zoom/room; otherwise legacy You
         -> Pyannote selected: online embedding/centroid speaker matching
         -> Nemotron selected: query streaming timeline by turn start + duration
         -> transcript-update event
@@ -97,8 +102,8 @@ Paths below are relative to `frontend/src-tauri/src/` unless marked frontend.
 - Preserve silence and timeline gaps. Concatenating VAD speech turns without
   their gaps is not a continuous recording and corrupts streaming timing.
 - Mic and system audio must not be mixed before source attribution. Microphone
-  source is not identity: new macOS/in-person speech remains `Microphone` until
-  acoustically qualified; other platforms retain the legacy `You` convention.
+  source is not identity: scoped unverified Zoom/room speech remains `Microphone`;
+  unrelated paths retain the legacy `You` convention (not an acoustic proof).
   Remote model channels remain `Speaker N`.
 - Speaker channels are meeting-local. The live model/cache is recreated for each
   recording. Changing settings during a call affects the next live session.

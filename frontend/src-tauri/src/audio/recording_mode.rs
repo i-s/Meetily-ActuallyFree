@@ -1,21 +1,30 @@
 //! Session mode is frozen by native startup, not by a WebView preference edit.
 use std::sync::atomic::{AtomicBool, Ordering};
 
+static MIC_IDENTITY_UNVERIFIED: AtomicBool = AtomicBool::new(false);
 static IN_PERSON: AtomicBool = AtomicBool::new(false);
 
-pub fn start_session(in_person: bool) {
+pub fn start_session(in_person: bool, microphone_identity_unverified: bool) {
     IN_PERSON.store(in_person, Ordering::SeqCst);
+    MIC_IDENTITY_UNVERIFIED.store(microphone_identity_unverified, Ordering::SeqCst);
 }
 
 pub fn in_person() -> bool {
     IN_PERSON.load(Ordering::SeqCst)
 }
 
-/// macOS speaker leakage has not passed #6. Preserve both source tracks and
-/// local overlap, but never promote an unseparated microphone into identity.
-/// This is intentionally conservative even on a headset until route-specific
-/// acoustic qualification can supply a trustworthy native identity policy.
-pub fn microphone_identity_unverified() -> bool { cfg!(target_os = "macos") }
+/// Frozen native provenance, not a platform-wide identity switch.
+pub fn microphone_identity_unverified() -> bool { MIC_IDENTITY_UNVERIFIED.load(Ordering::SeqCst) }
+
+/// Zoom's speaker/headset route is not qualified. A selected Zoom source or
+/// Zoom present during global capture stays neutral even for manual recording.
+/// An unavailable inventory with global capture is ambiguous, not proof of You.
+pub fn zoom_identity_unverified(macos: bool, in_person: bool, per_app: bool,
+    executables: &[&str], zoom_present: Option<bool>, automatic_zoom: bool) -> bool {
+    if in_person { return true; }
+    macos && (automatic_zoom || if per_app { executables.contains(&"zoom.us") }
+        else { zoom_present != Some(false) })
+}
 
 pub fn microphone_label(in_person: bool) -> &'static str {
     microphone_label_for_policy(in_person, microphone_identity_unverified())
@@ -127,5 +136,20 @@ mod zoom_source_tests {
         assert!(validate_zoom_sources(false, true, &["zoom.us", "Discord"]).is_err());
         assert!(validate_zoom_sources(false, true, &["zoom.us"]).is_ok());
         assert!(validate_zoom_sources(false, false, &[]).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod scoped_zoom_tests {
+    use super::*;
+    #[test]
+    fn manual_zoom_and_ambiguous_global_routes_are_neutral_not_all_macos() {
+        assert!(zoom_identity_unverified(true, false, true, &["zoom.us"], Some(true), false));
+        assert!(zoom_identity_unverified(true, false, false, &[], Some(true), false));
+        assert!(zoom_identity_unverified(true, false, false, &[], None, false));
+        assert!(!zoom_identity_unverified(true, false, true, &["Discord"], Some(true), false));
+        assert!(!zoom_identity_unverified(true, false, false, &[], Some(false), false));
+        assert!(!zoom_identity_unverified(false, false, false, &[], Some(true), false));
+        assert!(zoom_identity_unverified(true, true, false, &[], Some(false), false));
     }
 }

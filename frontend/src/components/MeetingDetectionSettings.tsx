@@ -9,6 +9,7 @@ import { invoke } from "@tauri-apps/api/core"
 import { Radar, Workflow } from "lucide-react"
 import { toast } from "sonner"
 import { useLabs } from "@/hooks/useLabs"
+import { ZoomObservationPanel } from './ZoomObservationPanel'
 import { setLabsFeature } from "@/lib/labs-features"
 
 interface MeetingDetectionSettings {
@@ -147,14 +148,16 @@ export function MeetingDetectionSettings() {
 
       {lifecycle?.sources.map(source => (
         <div key={source.source} className="rounded-xl border border-af-border p-4 text-sm text-af-text-2" role="status">
-          <strong>{source.app}: {source.presence}</strong> — {source.reason}
+          <strong>{source.app}: {source.presence}</strong> — {source.reason} · {source.qualified ? 'qualified' : 'observation only, capture blocked'}
           {source.session_id ? ' · call session retained' : ' · no confirmed call'}
           {source.reason === 'accessibility_permission_required' && (
             <p>Allow Meetily in macOS System Settings → Privacy &amp; Security → Accessibility. No recording is inferred from permission alone.</p>
           )}
-          <p>Candidate detector, not a physical qualification pass. Microphone speech remains source-labeled; #6 acoustic identity is pending.</p>
+          <p>Candidate detector, not a physical qualification pass. Identifiable Zoom microphone speech remains source-labeled; #6 acoustic identity is pending.</p>
         </div>
       ))}
+
+      <ZoomObservationPanel enabled={md.enabled} />
 
       <div className="flex items-start gap-4 rounded-2xl border border-af-border bg-af-panel-2/40 p-5">
         <span className="mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-af-accent/[0.12] text-af-accent">
@@ -166,9 +169,10 @@ export function MeetingDetectionSettings() {
             <Badge variant="accent" size="xs">Labs</Badge>
           </h3>
           <p className="mt-0.5 text-[13px] leading-relaxed text-af-text-3">
-            On macOS, automatically record a positively observed Zoom call and save after confirmed exit.
-            Unknown evidence never starts or stops a call. Manual Stop suppresses that session; the next call can rearm.
-            Recordings you start yourself are never stopped. Zoom detection and speaker identity still require final Mac qualification.
+            Zoom remains observation-only until a real client class passes physical lifecycle qualification.
+            This switch cannot override that native gate, including previously saved settings.
+            Unknown never starts or stops a call. A future qualified adapter uses generation-guarded Stop;
+            recordings you start yourself remain under manual control. Speaker identity is a separate #6 gate.
           </p>
         </div>
         <Switch

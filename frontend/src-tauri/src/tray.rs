@@ -89,7 +89,7 @@ fn toggle_recording_handler<R: Runtime>(app: &AppHandle<R>) {
             let stop_result = crate::audio::recording_commands::stop_recording(
                 app_clone.clone(),
                 crate::audio::recording_commands::RecordingArgs {
-                    save_path: save_path.to_string_lossy().to_string(),
+                    save_path: save_path.to_string_lossy().to_string(), expected: None,
                 },
             )
             .await;
@@ -179,7 +179,7 @@ fn stop_recording_handler<R: Runtime>(app: &AppHandle<R>) {
         let stop_result = crate::audio::recording_commands::stop_recording(
             app_clone.clone(),
             crate::audio::recording_commands::RecordingArgs {
-                save_path: save_path.to_string_lossy().to_string(),
+                save_path: save_path.to_string_lossy().to_string(), expected: None,
             },
         )
         .await;
