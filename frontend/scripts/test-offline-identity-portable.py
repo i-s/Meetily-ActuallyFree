@@ -63,6 +63,11 @@ pub async fn asr_preflight(state:&crate::state::AppState,meeting_id:String,meeti
  Ok(sources.into_iter().map(|source|(source.source_id.to_string(),source.speaker_hint.map(str::to_string))).collect())
 }
 """
+        # The historical red target predates candidate APIs; keep its ordinary
+        # command repro runnable rather than failing to compile the new fixture.
+        if args.baseline:
+            preflight_adapter = ''
+        combined_tests = '' if args.baseline else f'#[cfg(test)]#[path="{ROOT}/frontend/tests/native/identity-versions.rs"] mod identity_versions_tests;'
         (work / 'src/retranscription.rs').write_text('use std::path::{Path,PathBuf}; use anyhow::{anyhow,Result}; use crate::state::AppState; const AUDIO_EXTENSIONS: &[&str] = &["mp4","wav","m4a"];\n' + source_policy + '\npub fn refinement_cancelled()->bool { false }' + preflight_adapter)
         for name in ('meeting_notes', 'notes_document'):
             text = (NATIVE / f'database/repositories/{name}.rs').read_text().replace('#[tauri::command]', '').replace('../../../migrations/20261118001200_recording_notes.sql', str(NATIVE.parent / 'migrations/20261118001200_recording_notes.sql'))
@@ -128,7 +133,7 @@ mod database{{#[path="{NATIVE}/database/transcript_versions.rs"]pub mod transcri
 #[path="{work}/src/notes_document.rs"]pub mod notes_document;
 pub mod person{{pub fn is_person_name(s:&str)->bool{{crate::speaker_labels::is_manual_label(s)}}pub struct PeopleRepository;impl PeopleRepository{{pub async fn reconcile_speaker_identity(_tx:&mut sqlx::Transaction<'_,sqlx::Sqlite>,_m:&str,_a:&str,_b:&str)->Result<(),sqlx::Error>{{Ok(())}}}}}}}}}}
 #[cfg(test)]#[path="{ROOT}/frontend/tests/native/offline-identity.rs"] mod tests;
-#[cfg(test)]#[path="{ROOT}/frontend/tests/native/identity-versions.rs"] mod identity_versions_tests;
+{combined_tests}
 #[cfg(test)]pub async fn test_migrate(pool:&sqlx::SqlitePool){{
  let mut files:Vec<_>=std::fs::read_dir("{NATIVE.parent}/migrations").unwrap().map(|f|f.unwrap().path()).filter(|p|p.extension().is_some_and(|s|s=="sql")).collect();files.sort();
  for path in files{{sqlx::raw_sql(&std::fs::read_to_string(path).unwrap()).execute(pool).await.unwrap();}}
