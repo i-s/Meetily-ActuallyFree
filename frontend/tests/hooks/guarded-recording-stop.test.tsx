@@ -5,8 +5,10 @@ import type { RecordingLease } from '../../src/lib/native-recording';
 
 const events = new EventTarget();
 const storage = new Map<string, string>();
+let writeFailures = 0;
+let failedWrites = 0;
 Object.assign(globalThis, { window: Object.assign(events, { location: { pathname: '/home' }, clearTimeout, setTimeout }),
-  sessionStorage: { getItem: (k: string) => storage.get(k) ?? null, setItem: (k: string, v: string) => storage.set(k, v), removeItem: (k: string) => storage.delete(k) } });
+  sessionStorage: { getItem: (k: string) => storage.get(k) ?? null, setItem: (k: string, v: string) => { if (writeFailures > 0) { writeFailures--; failedWrites++; throw new Error('Synthetic storage write failure'); } storage.set(k, v); }, removeItem: (k: string) => storage.delete(k) } });
 let enabled = true;
 let failStopOnce = false;
 let current: RecordingLease | null = null;
@@ -43,13 +45,13 @@ mock.module('@/components/ui/tooltip', () => ({ Hint: ({ children }: any) => chi
 mock.module('@/lib/analytics', () => ({ default: { trackTranscriptionSuccess: () => { successes++; }, trackButtonClick: noop, trackTranscriptionError: noop } }));
 mock.module('sonner', () => ({ toast: { error: noop } }));
 const { RecordingControls } = await import('../../src/components/RecordingControls');
-const { requestRecordingStop } = await import('../../src/lib/recording-launch');
+const { requestRecordingStop, takeRecordingStopRequest, completeRecordingStopRequest } = await import('../../src/lib/recording-launch');
 const a: RecordingLease = { generation: 'native-A', owner: { source: 'zoom', session_id: 'A', app: 'Zoom', process: 'us.zoom.xos' } };
 const b: RecordingLease = { generation: 'native-B', owner: null };
 const props = { isRecording: true, isRecordingDisabled: false, onRecordingStart: noop,
   onRecordingStop: () => { fallbackStops++; }, onStopInitiated: () => { stopInitiated++; } };
 const flush = async () => { for (let i = 0; i < 20; i++) await Promise.resolve(); };
-function reset() { failStopOnce = false; storage.clear(); calls.length = 0; enabled = true; successes = 0; stopInitiated = 0; fallbackStops = 0; dataGate = undefined; }
+function reset() { writeFailures = 0; failedWrites = 0; failStopOnce = false; storage.clear(); calls.length = 0; enabled = true; successes = 0; stopInitiated = 0; fallbackStops = 0; dataGate = undefined; }
 
 test('actual routed Controls preserve A lease and rejected stale stop has no UI/save effects on manual B', async () => {
   reset(); window.location.pathname = '/home'; current = a;
@@ -111,3 +113,57 @@ test('R2 explicit manual B is not dropped behind stale guarded A before initial 
     expect(current).toBeNull(); expect(successes).toBe(1); expect(stopInitiated).toBe(1);
   } finally { act(() => view.unmount()); }
 });
+
+
+test('failed durable acknowledgement does not release stale A for repeated helper claims', () => {
+  reset(); current = b; window.location.pathname = '/library';
+  requestRecordingStop(noop, a); writeFailures = Infinity;
+  const request = takeRecordingStopRequest()!;
+  expect(request.kind).toBe('automated');
+  completeRecordingStopRequest(request);
+  try {
+    for (let i = 0; i < 4; i++) expect(takeRecordingStopRequest()).toBeNull();
+  } finally {
+    writeFailures = 0; completeRecordingStopRequest(request);
+  }
+});
+
+for (const outcome of ['labs-disabled', 'stale-rejected', 'accepted'] as const) {
+  test(`mounted Controls bounds failed acknowledgement after ${outcome}, manual Stop and writable recovery work`, async () => {
+    reset(); window.location.pathname = '/library';
+    current = outcome === 'accepted' ? a : b;
+    enabled = outcome !== 'labs-disabled';
+    requestRecordingStop(noop, a);
+    // Finite fuse lets the OLD busy loop finish and fail an assertion rather
+    // than starve Bun's timeout. Fixed code never exhausts this failure budget.
+    writeFailures = 8;
+    let view!: ReturnType<typeof create>;
+    await act(async () => { view = create(<RecordingControls {...props} />); await flush(); });
+    try {
+      expect(failedWrites).toBeLessThanOrEqual(2);
+      expect(calls.filter(c => c.name === 'stop_recording')).toHaveLength(outcome === 'labs-disabled' ? 0 : 1);
+      expect(successes).toBe(outcome === 'accepted' ? 1 : 0);
+      if (outcome === 'accepted') expect(current).toBeNull();
+      else expect(current).toEqual(b);
+      // Keep failure permanent through repeated wakeups and a real manual click.
+      writeFailures = Infinity;
+      await act(async () => {
+        for (let i = 0; i < 4; i++) events.dispatchEvent(new CustomEvent('af-stop-recording', { detail: { kind: 'queued' } }));
+        await flush();
+      });
+      expect(calls.filter(c => c.name === 'stop_recording')).toHaveLength(outcome === 'labs-disabled' ? 0 : 1);
+      if (outcome !== 'accepted') {
+        await act(async () => { view.root.findByProps({ 'aria-label': 'Stop recording' }).props.onClick(); await flush(); });
+        expect(current).toBeNull(); expect(stopInitiated).toBe(1);
+      }
+      current = { generation: 'native-C', owner: null }; enabled = true;
+      writeFailures = 0;
+      await act(async () => { events.dispatchEvent(new CustomEvent('af-stop-recording', { detail: { kind: 'queued' } })); await flush(); });
+      expect(current.generation).toBe('native-C'); // ack recovery never redispatches A
+      expect(JSON.parse(storage.get('af-stop-requested')!).requests).toHaveLength(0);
+      await act(async () => { requestRecordingStop(noop); await flush(); });
+      expect(current).toBeNull();
+      expect(calls.filter(c => c.name === 'stop_recording').at(-1)?.args.args.manual_generation).toBe('native-C');
+    } finally { writeFailures = 0; act(() => view.unmount()); }
+  });
+}

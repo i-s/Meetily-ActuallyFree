@@ -29,6 +29,8 @@ initial state sync, including queued native-lock and remount regressions. Its R2
 section supersedes startup reconstruction/first-wins routing with provisional native
 admission continuity, non-restarting live Settings and distinct generation-bound
 manual Stop intents; it records the actual Settings command-path fixture limits.
+Its acknowledgement-failure correction bounds completed claims and pauses routed
+queue dispatch on failed durable writes without blocking the direct manual button.
 
 Zoom's source-specific AX candidate, composable lifecycle snapshots, session-bound
 start/Stop ownership, manual override and provisional timing are documented in

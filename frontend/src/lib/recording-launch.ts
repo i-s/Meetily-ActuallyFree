@@ -62,6 +62,22 @@ const MAX_STOP_REQUESTS = 16;
 const MAX_STOP_RECEIPTS = 64;
 const resolvingStops = new Set<string>();
 const claimedStops = new Set<string>();
+// Failed durable completion is a queue-wide barrier, not permission to retry
+// Stop. At most the bounded pending queue can complete concurrently.
+const pendingStopAcknowledgements = new Set<string>();
+function acknowledgeCompletedStops(): boolean {
+  if (!pendingStopAcknowledgements.size) return true;
+  try {
+    const queue = readStopQueue();
+    queue.requests = queue.requests.filter(item => !pendingStopAcknowledgements.has(item.id));
+    queue.done = [...queue.done.filter(id => !pendingStopAcknowledgements.has(id)),
+      ...pendingStopAcknowledgements].slice(-MAX_STOP_RECEIPTS);
+    if (!writeStopQueue(queue)) return false;
+    for (const id of pendingStopAcknowledgements) claimedStops.delete(id);
+    pendingStopAcknowledgements.clear();
+    return true;
+  } catch { return false; }
+}
 function guardedStopId(lease: RecordingLease): string {
   return JSON.stringify([lease.generation, lease.owner?.source, lease.owner?.session_id, lease.owner?.app, lease.owner?.process]);
 }
@@ -111,6 +127,7 @@ function notifyStopQueue() {
  * lease deduplicates. Capacity/storage failure cannot create an unbound Stop.
  */
 export function queueRecordingStopRequest(request: RecordingStopRequest): RecordingStopRequest | null {
+  if (!acknowledgeCompletedStops()) return null;
   try {
     const queue = readStopQueue();
     if (queue.done.includes(request.id)) return null;
@@ -167,6 +184,7 @@ export function requestRecordingStop(navigate: (href: string) => void, expected?
  * claim; an unresolved manual binding is dropped rather than rebound.
  */
 export function takeRecordingStopRequest(): RecordingStopRequest | null {
+  if (!acknowledgeCompletedStops()) return null;
   try {
     const queue = readStopQueue();
     const request = queue.requests.find(item => !queue.done.includes(item.id) && !claimedStops.has(item.id)
@@ -177,13 +195,12 @@ export function takeRecordingStopRequest(): RecordingStopRequest | null {
   } catch { return null; }
 }
 export function completeRecordingStopRequest(request: RecordingStopRequest) {
-  claimedStops.delete(request.id);
-  try {
-    const queue = readStopQueue();
-    queue.requests = queue.requests.filter(item => item.id !== request.id);
-    queue.done = [...queue.done.filter(id => id !== request.id), request.id].slice(-MAX_STOP_RECEIPTS);
-    writeStopQueue(queue);
-  } catch { /* Never retry by acquiring a different generation. */ }
+  // Retain the claim until durable acknowledgement succeeds. Drain/wakeup can
+  // retry only this write, never directory lookup/native Stop or target binding.
+  // Fail closed at the queue's capacity even for unexpected external callers.
+  if (pendingStopAcknowledgements.size >= MAX_STOP_REQUESTS && !pendingStopAcknowledgements.has(request.id)) return;
+  pendingStopAcknowledgements.add(request.id);
+  acknowledgeCompletedStops();
 }
 export function validRecordingLease(value: unknown): value is RecordingLease {
   if (!value || typeof value !== 'object') return false;

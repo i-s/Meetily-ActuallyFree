@@ -361,3 +361,45 @@ capture/save effects remain synthetic generated-file/count adapters; no private
 recordings or model fixtures were used. Both real source classes remain
 `qualified:false`; physical UNKNOWN and #6 acoustic qualification remain open.
 Author self-review is not an independent review. #12/#14 at `226ff98` stay separate.
+
+### R2 acknowledgement-failure correction on `04b50ab`
+
+Coordinator recheck found a narrow new queue-drain defect: completion released the
+module claim before a failed `sessionStorage.setItem`, leaving the same durable
+request immediately claimable by Controls' `while` loop. Labs-disabled rejection
+could spin without native IPC; enabled paths repeated directory/native calls.
+
+`recording-launch.ts` now retains completed claims behind a queue-wide durable
+acknowledgement barrier. At most 16 pending acknowledgement IDs are retained (the
+pending queue's own bound); successful acknowledgement removes their requests,
+merges receipts into the existing 64-ID durable history, and releases those claims.
+Failed acknowledgement prevents take/enqueue from proceeding. The drain therefore
+returns after a failed write, with no timer, poller or retry loop. Later explicit
+queue activity attempts only the acknowledgement write before proceeding, never
+rerunning Stop or rebinding a target. In-flight completions may join the bounded
+barrier; overflow fails closed. Direct mounted manual button/native controls do
+not depend on this storage path and remain available while storage is unwritable.
+When writable again, a wakeup or fresh routed manual action flushes the barrier;
+new manual intent resolves its own generation normally. WebView loss still loses
+in-memory acknowledgement state; persisted old guards remain generation-bound,
+not converted into manual intent. No new durable/native receipt protocol is added.
+
+Focused regression red: **4 pass, 4 fail**, 31 assertions. The actual helper repro
+uses permanently failing writes and four immediate attempts; all must return null
+after the original claim completes. Mounted Controls cover Labs-disabled,
+stale-native-rejected and accepted Stop. Their red-run failure budget of eight
+writes lets the old infinite drain terminate for a meaningful assertion rather
+than starving the runner; fixed code uses no more than two. Each then switches to
+permanently failing writes for repeated wakeups, verifies no additional Stop IPC,
+exercises direct manual usability where still recording, restores writes, verifies
+A is acknowledged without stopping C, and explicitly routes a fresh manual C Stop.
+Focused green: **8 pass, 0 fail**, **62 assertions**. Existing mounted native bridge
+rerun against the already-built Rust binary: **60 pass, 0 fail**, **513 assertions**.
+No native changes/rebuild, qualification changes, delegates, packaging, push or Mac
+operations. Local logs: `/tmp/issue1011-ack-{red,green,bridge,frontend,tsc}.log`.
+Full isolated frontend rerun: **43/43 files, 223 tests passed**; standalone
+TypeScript passed after splitting one nullable test expectation into explicit
+accepted/rejected branches. Expected injected transport failures still log in
+negative tests. Author self-review covered the 16-ID cap, acknowledgement-before-
+release ordering, rejection/success, reentrant wakeups, recovery and unchanged
+native generation guards; no independent delegate review was run.
