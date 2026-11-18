@@ -22,6 +22,11 @@ segment = '#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]\n' + ap
 r = (SRC / 'audio/retranscription.rs').read_text()
 owned = r[r.index('/// Global flag to track'):r.index('/// Find audio file')]
 queued = r[r.index('/// Awaited saved-meeting operation'):r.index('#[tauri::command]\npub async fn cancel_retranscription_command')]
+source_policy = r[r.index('pub(crate) fn find_audio_file'):r.index('#[cfg(test)]\nfn is_manual_speaker_label')]
+preflight = r[r.index('    let folder_path = PathBuf::from(&meeting_folder_path);'):r.index('    // Determine which provider to use')]
+di = (SRC / 'diarization/mod.rs').read_text()
+policy = di[di.index('pub(crate) async fn meeting_identity_policy('):di.index('/// Called under the native post-meeting operation guard.')]
+
 with tempfile.TemporaryDirectory(prefix='meetily-post-call-native-') as directory:
     work = Path(directory)
     (work / 'src').mkdir()
@@ -62,6 +67,7 @@ impl<R:Runtime> AppHandle<R>{{
 pub struct State<'a,T>(pub &'a T); impl<'a,T> std::ops::Deref for State<'a,T>{{type Target=T;fn deref(&self)->&T{{self.0}}}}
 pub mod async_runtime{{pub fn spawn<F>(f:F)->tokio::task::JoinHandle<F::Output> where F:std::future::Future+Send+'static,F::Output:Send+'static{{tokio::spawn(f)}}}}
 pub mod api{{{segment}}}
+#[path="{SRC}/speaker_labels.rs"]pub mod speaker_labels;
 pub mod config{{pub const DEFAULT_PARAKEET_MODEL:&str="synthetic";}}
 pub mod state{{pub struct AppState{{pub db_manager:DbManager}}pub struct DbManager(pub sqlx::SqlitePool);impl DbManager{{pub fn pool(&self)->&sqlx::SqlitePool{{&self.0}}}}}}
 pub mod database{{
@@ -79,6 +85,9 @@ pub mod codex_cli{{
  pub mod commands{{pub async fn codex_cli_get_path()->Result<Option<String>,String>{{Ok(Some(crate::ROOT.lock().unwrap().as_ref().unwrap().join("fake codex").to_string_lossy().into_owned()))}}pub async fn isolated_auth_home()->Result<std::path::PathBuf,String>{{Ok(crate::ROOT.lock().unwrap().as_ref().unwrap().join("isolated-auth"))}}}}
 }}
 pub mod diarization{{
+ use std::path::Path;
+ #[path="{SRC}/diarization/identity_policy.rs"]pub mod identity_policy;
+ {policy}
  static LOCK:tokio::sync::Mutex<()>=tokio::sync::Mutex::const_new(());
  pub async fn operation_guard()->tokio::sync::MutexGuard<'static,()>{{LOCK.lock().await}}
  #[derive(serde::Serialize)]pub struct Config{{pub engine:String,pub nemotron_max_speakers:usize}}
@@ -91,20 +100,23 @@ pub mod audio{{
  pub mod recording_commands{{use std::sync::atomic::{{AtomicBool,Ordering}};pub static LIVE:AtomicBool=AtomicBool::new(false);pub fn is_recording_active()->bool{{LIVE.load(Ordering::SeqCst)}}pub fn is_recording_stopping()->bool{{false}}}}
  pub mod retranscription{{
  use crate::{{AppHandle,Runtime,Manager,Emitter,state::AppState,database::repositories::vocabulary::VocabularyRepository}};
- use serde::{{Serialize,Deserialize}};use anyhow::{{anyhow,Result}};use std::sync::{{Mutex,atomic::{{AtomicBool,Ordering}}}};use std::path::Path;
+ use serde::{{Serialize,Deserialize}};use anyhow::{{anyhow,Result}};use std::sync::{{Mutex,atomic::{{AtomicBool,Ordering}}}};use std::path::{{Path,PathBuf}};
+ pub static WEAKEN_METADATA:AtomicBool=AtomicBool::new(false);
  pub static MUTATE_APPROVAL:AtomicBool=AtomicBool::new(false);
  pub static ASR_CALLS:std::sync::atomic::AtomicUsize=std::sync::atomic::AtomicUsize::new(0);
  {owned}
  {queued}
  fn emit_progress<R:Runtime>(_app:&AppHandle<R>,_meeting:&str,_stage:&str,_progress:u32,_message:&str){{}}
- fn saved_sources(_folder:&Path)->Result<()>{{Ok(())}}
- fn recording_metadata(_folder:&Path)->Result<serde_json::Value>{{Ok(serde_json::json!({{"in_person":true,"future_policy":"opaque"}}))}}
- fn recording_in_person(_folder:&Path)->Result<bool>{{Ok(true)}}
- async fn run_retranscription<R:Runtime>(app:AppHandle<R>,meeting_id:String,_folder:String,language:Option<String>,_model:Option<String>,_provider:Option<String>,_prompt:Option<String>,version_id:String)->Result<RetranscriptionResult>{{
+ const AUDIO_EXTENSIONS:&[&str]=&["mp4","wav"];
+ {source_policy}
+ async fn run_retranscription<R:Runtime>(app:AppHandle<R>,meeting_id:String,meeting_folder_path:String,language:Option<String>,_model:Option<String>,_provider:Option<String>,_prompt:Option<String>,version_id:String)->Result<RetranscriptionResult>{{
+  if WEAKEN_METADATA.swap(false,Ordering::SeqCst){{std::fs::write(Path::new(&meeting_folder_path).join("metadata.json"),b"{{}}").unwrap();}}
+  {preflight}
   ASR_CALLS.fetch_add(1,Ordering::SeqCst);
   if MUTATE_APPROVAL.swap(false,Ordering::SeqCst){{VocabularyRepository::confirm_global(app.state::<AppState>().db_manager.pool(),"LaterApproved").await.map_err(anyhow::Error::msg)?;}}
-  let row=crate::api::TranscriptSegment{{id:"candidate-room".into(),text:"Synthetic refined speech".into(),timestamp:"2026".into(),audio_start_time:Some(1.),audio_end_time:Some(2.),duration:Some(1.),speaker:Some("Microphone".into())}};
-  crate::database::transcript_versions::finish_with_sources(app.state::<AppState>().db_manager.pool(),&version_id,&[row],&std::collections::HashMap::from([("candidate-room".into(),"room".into())])).await.map_err(anyhow::Error::msg)?;
+  let mut rows=Vec::new();let mut source_map=std::collections::HashMap::new();
+  for source in sources{{let id=format!("candidate-{{}}",source.source_id);source_map.insert(id.clone(),source.source_id.to_string());rows.push(crate::api::TranscriptSegment{{id,text:"Synthetic refined speech".into(),timestamp:"2026".into(),audio_start_time:Some(1.),audio_end_time:Some(2.),duration:Some(1.),speaker:source.speaker_hint.map(str::to_owned)}});}}
+  crate::database::transcript_versions::finish_with_sources(app.state::<AppState>().db_manager.pool(),&version_id,&rows,&source_map).await.map_err(anyhow::Error::msg)?;
   Ok(RetranscriptionResult{{meeting_id,version_id,segments_count:1,duration_seconds:2.,language}})
  }}
  }}

@@ -45,6 +45,7 @@ pub mod console_utils;
 pub mod crash_report;
 pub mod database;
 pub mod diarization;
+pub mod speaker_labels;
 mod optional_models;
 pub mod notifications;
 pub mod ollama;
@@ -60,6 +61,7 @@ pub mod groq;
 pub mod openrouter;
 pub mod live_assistant;
 pub mod meeting_detection;
+mod discord_automation;
 pub mod minibar;
 pub mod parakeet_engine;
 pub mod paths;
@@ -105,6 +107,10 @@ fn set_check_updates_on_launch(enabled: bool) -> Result<(), String> {
 #[derive(Debug, Deserialize)]
 struct RecordingArgs {
     save_path: String,
+    #[serde(default)]
+    expected: Option<audio::recording_ownership::RecordingLease>,
+    #[serde(default)]
+    manual_generation: Option<String>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -190,6 +196,8 @@ async fn stop_recording<R: Runtime>(app: AppHandle<R>, args: RecordingArgs) -> R
         app.clone(),
         audio::recording_commands::RecordingArgs {
             save_path: args.save_path.clone(),
+            expected: args.expected.clone(),
+            manual_generation: args.manual_generation.clone(),
         },
     )
     .await
@@ -363,7 +371,7 @@ async fn start_recording_with_devices<R: Runtime>(
     mic_device_name: Option<String>,
     system_device_name: Option<String>,
 ) -> Result<(), String> {
-    start_recording_with_devices_and_meeting(app, mic_device_name, system_device_name, None).await
+    start_recording_with_devices_and_meeting(app, mic_device_name, system_device_name, None, None, None).await.map(|_| ())
 }
 
 #[tauri::command]
@@ -372,7 +380,9 @@ async fn start_recording_with_devices_and_meeting<R: Runtime>(
     mic_device_name: Option<String>,
     system_device_name: Option<String>,
     meeting_name: Option<String>,
-) -> Result<(), String> {
+    lifecycle_session: Option<String>,
+    expected_start: Option<audio::recording_start_authority::StartRequest>,
+) -> Result<audio::recording_ownership::RecordingLease, String> {
     log_info!("ðŸš€ CALLED start_recording_with_devices_and_meeting - Mic: {:?}, System: {:?}, Meeting: {:?}",
              mic_device_name, system_device_name, meeting_name);
 
@@ -380,34 +390,40 @@ async fn start_recording_with_devices_and_meeting<R: Runtime>(
     let meeting_name_for_notification = meeting_name.clone();
 
     // Call the recording module functions that support meeting names
-    let recording_result = match (mic_device_name.clone(), system_device_name.clone()) {
-        (None, None) => {
-            log_info!(
-                "No devices specified, starting with defaults and meeting: {:?}",
-                meeting_name
-            );
-            audio::recording_commands::start_recording_with_meeting_name(app.clone(), meeting_name)
+    let recording_result = if lifecycle_session.is_some() || expected_start.is_some() {
+        audio::recording_commands::start_recording_with_lifecycle(
+            app.clone(), mic_device_name.clone(), system_device_name.clone(), meeting_name.clone(), lifecycle_session, expected_start,
+        ).await
+    } else {
+        match (mic_device_name.clone(), system_device_name.clone()) {
+            (None, None) => {
+                log_info!(
+                    "No devices specified, starting with defaults and meeting: {:?}",
+                    meeting_name
+                );
+                audio::recording_commands::start_recording_with_meeting_name(app.clone(), meeting_name)
+                    .await
+            }
+            _ => {
+                log_info!(
+                    "Starting with specified devices: mic={:?}, system={:?}, meeting={:?}",
+                    mic_device_name,
+                    system_device_name,
+                    meeting_name
+                );
+                audio::recording_commands::start_recording_with_devices_and_meeting(
+                    app.clone(),
+                    mic_device_name,
+                    system_device_name,
+                    meeting_name,
+                )
                 .await
-        }
-        _ => {
-            log_info!(
-                "Starting with specified devices: mic={:?}, system={:?}, meeting={:?}",
-                mic_device_name,
-                system_device_name,
-                meeting_name
-            );
-            audio::recording_commands::start_recording_with_devices_and_meeting(
-                app.clone(),
-                mic_device_name,
-                system_device_name,
-                meeting_name,
-            )
-            .await
+            }
         }
     };
 
     match recording_result {
-        Ok(_) => {
+        Ok(lease) => {
             log_info!("Recording started successfully via tauri command");
 
             // Show recording started notification through NotificationManager
@@ -426,7 +442,7 @@ async fn start_recording_with_devices_and_meeting<R: Runtime>(
                 );
             }
 
-            Ok(())
+            Ok(lease)
         }
         Err(e) => {
             log_error!("Failed to start recording via tauri command: {}", e);
@@ -535,6 +551,7 @@ pub fn run() {
             // Meeting detection: load persisted settings and start the monitor
             // if the user enabled it (default off).
             crate::meeting_detection::initialize(&_app.handle());
+            crate::discord_automation::initialize(&_app.handle());
 
             // Free Whisper/Parakeet VRAM a couple minutes after last STT use.
             audio::common::start_stt_idle_unloader();
@@ -740,6 +757,9 @@ pub fn run() {
             onnx_runtime::check_transcription_runtime,
             start_recording_with_devices,
             start_recording_with_devices_and_meeting,
+            audio::recording_start_authority::get_recording_start_capability,
+            audio::recording_commands::resolve_automated_recording_start,
+            audio::recording_commands::cancel_automated_recording_start,
             start_audio_level_monitoring,
             stop_audio_level_monitoring,
             is_audio_level_monitoring,
@@ -810,7 +830,21 @@ pub fn run() {
             database::repositories::meeting_notes::api_get_meeting_notes,
             database::repositories::meeting_notes::api_save_meeting_notes,
             api::api_get_meeting_audio,
+            audio::recording_ownership::set_meeting_automation_enabled,
+            audio::recording_ownership::release_automated_recording,
+            meeting_detection::zoom_observation::start_zoom_observation,
+            meeting_detection::zoom_observation::mark_zoom_observation,
+            meeting_detection::zoom_observation::stop_zoom_observation,
+            meeting_detection::zoom_observation::export_zoom_observation,
+            meeting_detection::zoom_observation::clear_zoom_observation,
+            meeting_detection::lifecycle::get_meeting_lifecycle_snapshot,
             meeting_detection::get_meeting_detection_settings,
+            discord_automation::get_discord_automation_status,
+            discord_automation::start_discord_observation,
+            discord_automation::mark_discord_observation,
+            discord_automation::stop_discord_observation,
+            discord_automation::get_discord_observation,
+            discord_automation::clear_discord_observation,
             meeting_detection::set_meeting_detection_settings,
             meeting_detection::start_meeting_detection,
             meeting_detection::stop_meeting_detection,

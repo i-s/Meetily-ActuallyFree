@@ -147,6 +147,19 @@ pub async fn finish(
     Ok(())
 }
 
+/// Labels and the effective identity restriction commit together. The original
+/// metadata/source map remain unchanged; only running candidates may be enriched.
+pub async fn finish_with_identity(
+    pool: &SqlitePool, id: &str, segments: &[TranscriptSegment], policy: &serde_json::Value,
+) -> Result<(), String> {
+    let changed = sqlx::query("UPDATE transcript_versions SET segments_json = ?, settings_json = json_set(settings_json, '$.identity_policy', json(?)) WHERE id = ? AND status = 'running'")
+        .bind(serde_json::to_string(segments).map_err(|e| e.to_string())?)
+        .bind(serde_json::to_string(policy).map_err(|e| e.to_string())?).bind(id)
+        .execute(pool).await.map_err(|e| e.to_string())?.rows_affected();
+    if changed != 1 { return Err("Refinement is no longer running; identity result was not committed".into()); }
+    Ok(())
+}
+
 /// ASR commits words and capture origin together. This is not a speaker/name
 /// classification: the source map must survive every later label correction.
 pub async fn finish_with_sources(

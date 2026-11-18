@@ -227,26 +227,23 @@ struct RetranscriptionSource {
 }
 
 pub(crate) fn recording_metadata(folder: &Path) -> Result<serde_json::Value> {
-    match std::fs::read(folder.join("metadata.json")) {
-        Ok(bytes) => {
-            let metadata: serde_json::Value = serde_json::from_slice(&bytes)?;
-            if !metadata.is_object() { return Err(anyhow!("Recording metadata is not an object")); }
-            Ok(metadata)
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(serde_json::json!({})),
-        Err(error) => Err(error.into()),
-    }
+    crate::diarization::identity_policy::IdentityPolicy::metadata_for_folder(folder).map_err(|e| anyhow!(e))
 }
 
 pub(crate) fn recording_in_person(folder: &Path) -> Result<bool> {
-    match recording_metadata(folder)?.get("in_person") {
-        Some(value) => value.as_bool().ok_or_else(|| anyhow!("Invalid in_person recording provenance")),
-        None => Ok(false),
-    }
+    Ok(crate::diarization::identity_policy::IdentityPolicy::for_folder(folder).map_err(|e| anyhow!(e))?.in_person)
 }
 
 fn find_retranscription_sources(folder: &Path, fallback: &Path) -> Result<Vec<RetranscriptionSource>> {
-    let in_person = recording_in_person(folder)?;
+    let policy = crate::diarization::identity_policy::IdentityPolicy::for_folder(folder).map_err(|e| anyhow!(e))?;
+    find_retranscription_sources_with_policy(folder, fallback, policy)
+}
+
+fn find_retranscription_sources_with_policy(
+    folder: &Path, fallback: &Path, policy: crate::diarization::identity_policy::IdentityPolicy,
+) -> Result<Vec<RetranscriptionSource>> {
+    let in_person = policy.in_person;
+    let microphone_identity_unverified = !policy.trust_legacy_user;
     let mic_path = folder.join("mic.mp4");
     let system_path = folder.join("system.mp4");
     let mut sources = Vec::new();
@@ -275,7 +272,7 @@ fn find_retranscription_sources(folder: &Path, fallback: &Path) -> Result<Vec<Re
             path: mic_path,
             label: "microphone",
             source_id: "microphone",
-            speaker_hint: Some("You"),
+            speaker_hint: Some(if microphone_identity_unverified { "Microphone" } else { "You" }),
             positive_threshold: 0.20,
             negative_threshold: 0.10,
         });
@@ -308,6 +305,29 @@ pub(crate) fn saved_sources(folder: &Path) -> Result<()> {
     if sources.iter().all(|s| s.path.is_file()) { Ok(()) } else { Err(anyhow!("Saved audio is unavailable")) }
 }
 
+#[cfg(test)]
+fn is_manual_speaker_label(label: &str) -> bool { crate::speaker_labels::is_manual_label(label) }
+
+/// Keep named people across Enhance runs, never promote a source label into
+/// an identity. Legacy call-mic hints retain their existing You convention.
+#[cfg(test)]
+fn speaker_after_manual_ranges(hint: Option<&str>, start: f64, end: f64, ranges: &[(f64, f64, String)], trust_legacy_user: bool) -> Option<String> {
+    if trust_legacy_user && hint.is_some_and(|label| label.eq_ignore_ascii_case("you")) {
+        return hint.map(str::to_string);
+    }
+    let mut result = hint.map(|label| if trust_legacy_user { label.to_string() } else { crate::speaker_labels::without_unverified_user(label) });
+    let mut best_overlap = 0.05;
+    for (range_start, range_end, name) in ranges {
+        if !is_manual_speaker_label(name) { continue; }
+        let overlap = (end.min(*range_end) - start.max(*range_start)).max(0.0);
+        if overlap > best_overlap {
+            best_overlap = overlap;
+            result = Some(if trust_legacy_user { name.clone() } else { crate::speaker_labels::manual_names(name).join(" + ") });
+        }
+    }
+    result
+}
+
 fn create_source_labeled_segments(
     transcripts: &[(String, f64, f64)],
     speaker_hints: &[Option<&str>],
@@ -337,7 +357,13 @@ async fn run_retranscription<R: Runtime>(
     }
     let folder_path = PathBuf::from(&meeting_folder_path);
     let audio_path = find_audio_file(&folder_path)?;
-    let sources = find_retranscription_sources(&folder_path, &audio_path)?;
+    // Resolve both original-file and frozen version authority before decode/ASR.
+    // Neither a temporary path nor a weaker current file grants identity.
+    let identity_policy = {
+        let state = app.try_state::<AppState>().ok_or_else(|| anyhow!("App state not available"))?;
+        crate::diarization::meeting_identity_policy(state.db_manager.pool(), &meeting_id, &folder_path, Some(&version_id)).await.map_err(|e| anyhow!(e))?
+    };
+    let sources = find_retranscription_sources_with_policy(&folder_path, &audio_path, identity_policy)?;
 
     // Determine which provider to use (default to whisper)
     let use_parakeet = provider.as_deref() == Some("parakeet");
@@ -902,11 +928,13 @@ pub async fn start_retranscription_command<R: Runtime>(
     let stored_folder: Option<String> = sqlx::query_scalar("SELECT folder_path FROM meetings WHERE id = ?")
         .bind(&meeting_id).fetch_one(state.db_manager.pool()).await.map_err(|e| e.to_string())?;
     if stored_folder.as_deref() != Some(meeting_folder_path.as_str()) { return Err("Recording folder does not belong to this meeting".into()); }
+    let recording_metadata = recording_metadata(Path::new(&meeting_folder_path)).map_err(|e| e.to_string())?;
+    let identity_policy = crate::diarization::meeting_identity_policy(state.db_manager.pool(), &meeting_id, Path::new(&meeting_folder_path), None).await?;
     saved_sources(Path::new(&meeting_folder_path)).map_err(|e| e.to_string())?;
     if super::recording_commands::is_recording_active() || super::recording_commands::is_recording_stopping() {
         return Err("Finish the current recording before post-meeting refinement".into());
     }
-    if !recording_in_person(Path::new(&meeting_folder_path)).map_err(|e| e.to_string())? && !crate::diarization::diarization_models_available().await? { return Err("Download the selected local diarization model before refinement".into()); }
+    if !identity_policy.in_person && !crate::diarization::diarization_models_available().await? { return Err("Download the selected local diarization model before refinement".into()); }
 
     // Reserve before returning so duplicate requests and cancellation also see
     // jobs queued behind an offline diarization pass.
@@ -951,13 +979,12 @@ pub async fn start_retranscription_command<R: Runtime>(
         None if use_parakeet => get_configured_parakeet_model(&app).await.map_err(|e| e.to_string())?,
         None => get_configured_whisper_model(&app).await.map_err(|e| e.to_string())?,
     });
-    let recording_metadata = recording_metadata(Path::new(&meeting_folder_path)).map_err(|e| e.to_string())?;
     let mut diarization_config = crate::diarization::get_diarization_config();
     // Candidate auto-detection uses the supported eight-speaker capacity, never
     // a stale count preference which could suppress a remote track.
     diarization_config.nemotron_max_speakers = 8;
     let version_id = crate::database::transcript_versions::begin(state.db_manager.pool(), &meeting_id,
-        &serde_json::json!({"provider": provider, "model": model, "language": language, "vocabulary_prompt": initial_prompt, "recording_metadata": recording_metadata, "label_origin": "generated_asr", "diarization_engine": diarization_config.engine, "diarization_config": diarization_config})).await?;
+        &serde_json::json!({"provider": provider, "model": model, "language": language, "vocabulary_prompt": initial_prompt, "recording_metadata": recording_metadata, "identity_policy": identity_policy.snapshot(), "label_origin": "generated_asr", "diarization_engine": diarization_config.engine, "diarization_config": diarization_config})).await?;
     *ACTIVE_RETRANSCRIPTION.lock().unwrap_or_else(|e| e.into_inner()) = Some((meeting_id.clone(), version_id.clone()));
     let response_version = version_id.clone();
     drop(state);
@@ -1024,6 +1051,7 @@ pub(crate) async fn run_queued_refinement<R: Runtime>(
         .bind(&meeting_id).fetch_one(pool).await.map_err(|e|e.to_string())?;
     let folder=folder.ok_or("Saved recording folder is unavailable")?;
     saved_sources(Path::new(&folder)).map_err(|e|e.to_string())?;
+    let identity_policy = crate::diarization::meeting_identity_policy(pool, &meeting_id, Path::new(&folder), existing.as_ref().map(|_| id.as_str())).await?;
     let settings = if let Some((_,json))=existing {
         serde_json::from_str::<serde_json::Value>(&json).map_err(|e|e.to_string())?
     } else {
@@ -1038,9 +1066,9 @@ pub(crate) async fn run_queued_refinement<R: Runtime>(
         let mut config=crate::diarization::get_diarization_config();config.nemotron_max_speakers=8;
         serde_json::json!({"provider":provider,"model":model,"language":null,"vocabulary_prompt":vocabulary,
             "recording_metadata":recording_metadata(Path::new(&folder)).map_err(|e|e.to_string())?,
-            "label_origin":"generated_asr","diarization_engine":config.engine,"diarization_config":config,"post_call_job":meeting_id})
+            "identity_policy":identity_policy.snapshot(),"label_origin":"generated_asr","diarization_engine":config.engine,"diarization_config":config,"post_call_job":meeting_id})
     };
-    if !recording_in_person(Path::new(&folder)).map_err(|e|e.to_string())? && !crate::diarization::diarization_models_available().await? {
+    if !identity_policy.in_person && !crate::diarization::diarization_models_available().await? {
         return Err("Download the selected local diarization model before post-call processing".into());
     }
     let version=versions::begin_automatic(pool,&meeting_id,&settings).await?;
@@ -1380,6 +1408,13 @@ mod issue9_room_tests {
 mod issue9_label_retry_tests {
     use super::*;
     #[test]
+    fn repeated_enhance_preserves_real_names_not_room_source_labels() {
+        let ranges = vec![(0.0, 10.0, "Microphone".into()), (1.0, 3.0, "Alex".into()), (0.0, 10.0, "You".into())];
+        assert_eq!(speaker_after_manual_ranges(Some("Microphone"), 1.0, 3.0, &ranges, false).as_deref(), Some("Alex"));
+        assert_eq!(speaker_after_manual_ranges(Some("Microphone"), 4.0, 5.0, &ranges, false).as_deref(), Some("Microphone"));
+        assert_eq!(speaker_after_manual_ranges(Some("You"), 1.0, 3.0, &ranges, true).as_deref(), Some("You"));
+    }
+    #[test]
     fn legacy_call_sources_keep_their_hints_but_room_fallback_never_uses_you() {
         let dir = tempfile::tempdir().unwrap();
         let fallback = dir.path().join("audio.mp4");
@@ -1392,6 +1427,43 @@ mod issue9_label_retry_tests {
         assert_eq!(sources[0].speaker_hint, Some("Microphone"));
         std::fs::write(dir.path().join("metadata.json"), b"truncated").unwrap();
         assert!(find_retranscription_sources(dir.path(), &fallback).is_err());
+    }
+    #[test]
+    fn unqualified_macos_microphone_is_not_promoted_to_you_on_enhance() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("metadata.json"), br#"{"microphone_identity_unverified":true}"#).unwrap();
+        std::fs::write(dir.path().join("mic.mp4"), b"synthetic").unwrap();
+        std::fs::write(dir.path().join("system.mp4"), b"synthetic").unwrap();
+        let sources = find_retranscription_sources(dir.path(), &dir.path().join("audio.mp4")).unwrap();
+        assert_eq!(sources.len(), 2);
+        assert_eq!(sources[0].speaker_hint, Some("Microphone"));
+        assert_eq!(sources[1].speaker_hint, Some("Guest"));
+        std::fs::write(dir.path().join("metadata.json"), br#"{"microphone_identity_unverified":"bad"}"#).unwrap();
+        assert!(find_retranscription_sources(dir.path(), &dir.path().join("audio.mp4")).is_err());
+    }
+
+}
+
+#[cfg(test)]
+mod issue10_r2_identity_tests {
+    use super::*;
+    #[test]
+    fn enhance_keeps_evidenced_name_not_generated_user_component() {
+        let ranges = vec![(0., 2., "Alice + You".into())];
+        assert_eq!(speaker_after_manual_ranges(Some("Microphone"), 0., 2., &ranges, false).as_deref(), Some("Alice"));
+        assert_eq!(speaker_after_manual_ranges(Some("Guest"), 0., 2., &ranges, true).as_deref(), Some("Alice + You"));
+        let compact = vec![(0., 2., "Alice+You".into())];
+        assert_eq!(speaker_after_manual_ranges(None, 0., 2., &compact, false).as_deref(), Some("Alice"));
+        assert_eq!(speaker_after_manual_ranges(Some("You+Guest"), 3., 4., &ranges, false).as_deref(), Some("Guest"));
+    }
+    #[test]
+    fn enhance_rejects_non_object_provenance_instead_of_legacy_you() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["mic.mp4", "system.mp4", "audio.mp4"] { std::fs::write(dir.path().join(name), b"synthetic").unwrap(); }
+        for malformed in ["null", "[]", "true", "7", "\"scalar\""] {
+            std::fs::write(dir.path().join("metadata.json"), malformed).unwrap();
+            assert!(find_retranscription_sources(dir.path(), &dir.path().join("audio.mp4")).is_err(), "{malformed}");
+        }
     }
 }
 

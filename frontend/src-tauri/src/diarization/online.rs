@@ -124,9 +124,9 @@ pub fn start<R: tauri::Runtime>(app: tauri::AppHandle<R>) -> Result<()> {
     // Seed speaker 0 with the enrolled local-user voiceprint when one exists.
     // The mic path remains authoritative, but enrollment makes the identity
     // stable from the first utterance instead of relearning it every meeting.
-    let enrolled = super::voiceprint::load()
-        .map(|v| v.embedding)
-        .filter(|e| !e.is_empty());
+    let enrolled = if crate::audio::recording_mode::microphone_identity_unverified() {
+        None
+    } else { super::voiceprint::load().map(|v| v.embedding).filter(|e| !e.is_empty()) };
     let has_enrolled = enrolled.is_some();
     let profiles = match super::voice_profiles::load_for_matching() {
         Ok(profiles) => profiles,

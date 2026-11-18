@@ -16,6 +16,7 @@
 
 pub mod batch_control;
 pub mod clustering;
+pub mod identity_policy;
 pub mod download;
 pub mod dsp;
 pub mod models;
@@ -259,6 +260,14 @@ pub fn diarize_file_with_engine(
     num_speakers: Option<usize>,
     threshold: Option<f32>,
 ) -> Result<DiarizationResult> {
+    let policy = identity_policy::IdentityPolicy::for_recording(wav_path).map_err(|e| anyhow!(e))?;
+    policy.run(|trust| diarize_file_with_engine_policy(wav_path, engine, num_speakers, threshold, trust))
+        .map(|mut result| { result.user_speaker = policy.inferred_user(result.user_speaker); result })
+}
+
+fn diarize_file_with_engine_policy(
+    wav_path: &Path, engine: &str, num_speakers: Option<usize>, threshold: Option<f32>, trust_legacy_user: bool,
+) -> Result<DiarizationResult> {
     anyhow::ensure!(matches!(engine, "pyannote" | "nemotron"), "Unknown diarization engine");
     if engine == "nemotron" {
         if !nemotron_models_available() {
@@ -284,7 +293,7 @@ pub fn diarize_file_with_engine(
                 model_dir.display()
             ));
         }
-        diarize_file_with_models(wav_path, &model_dir, num_speakers, threshold)
+        diarize_file_with_models_policy(wav_path, &model_dir, num_speakers, threshold, trust_legacy_user)
     }
 }
 
@@ -322,6 +331,13 @@ pub fn diarize_file_with_models(
     model_dir: &Path,
     num_speakers: Option<usize>,
     threshold: Option<f32>,
+) -> Result<DiarizationResult> {
+    let policy = identity_policy::IdentityPolicy::for_recording(wav_path).map_err(|e| anyhow!(e))?;
+    policy.run(|trust| diarize_file_with_models_policy(wav_path, model_dir, num_speakers, threshold, trust))
+}
+
+fn diarize_file_with_models_policy(
+    wav_path: &Path, model_dir: &Path, num_speakers: Option<usize>, threshold: Option<f32>, trust_legacy_user: bool,
 ) -> Result<DiarizationResult> {
     if !wav_path.exists() {
         return Err(anyhow!("Recording not found: {}", wav_path.display()));
@@ -507,7 +523,7 @@ pub fn diarize_file_with_models(
     }
 
     // Voiceprint match when available (mixed-file path).
-    let user_speaker = {
+    let user_speaker = if !trust_legacy_user { None } else {
         let k = num_found;
         if k == 0 {
             None
@@ -894,42 +910,8 @@ fn find_meeting_audio(folder_path: Option<String>, meeting_title: Option<&str>) 
     newest_audio_in(&crate::paths::install_data_root())
 }
 
-fn is_manual_speaker_label(label: &str) -> bool {
-    let trimmed = label.trim();
-    if trimmed.is_empty() {
-        return false;
-    }
-    let is_generated = trimmed.split(" + ").all(|part| {
-        let p = part.trim();
-        p.eq_ignore_ascii_case("guest")
-            || p.eq_ignore_ascii_case("you")
-            || p.eq_ignore_ascii_case("unknown")
-            || (p.to_ascii_lowercase().starts_with("speaker ")
-                && p[8..].trim().chars().all(|c| c.is_ascii_digit()))
-    });
-    !is_generated
-}
-
-fn extract_manual_speaker_names(label: &str) -> Vec<String> {
-    let trimmed = label.trim();
-    if trimmed.is_empty() {
-        return Vec::new();
-    }
-    let mut names = Vec::new();
-    for part in trimmed.split(" + ") {
-        let p = part.trim();
-        if !p.is_empty()
-            && !p.eq_ignore_ascii_case("guest")
-            && !p.eq_ignore_ascii_case("you")
-            && !p.eq_ignore_ascii_case("unknown")
-            && !(p.to_ascii_lowercase().starts_with("speaker ")
-                && p[8..].trim().chars().all(|c| c.is_ascii_digit()))
-        {
-            names.push(p.to_string());
-        }
-    }
-    names
-}
+fn is_manual_speaker_label(label: &str) -> bool { crate::speaker_labels::is_manual_label(label) }
+fn extract_manual_speaker_names(label: &str) -> Vec<String> { crate::speaker_labels::manual_names(label) }
 
 /// Decode any supported audio container to a temporary 16 kHz mono WAV using
 /// the bundled ffmpeg. Returns the original path unchanged if it's already WAV.
@@ -996,14 +978,23 @@ pub async fn diarize_meeting(
     engine: Option<String>,
 ) -> Result<MeetingDiarizationResult, String> {
     let _operation_guard = operation_guard().await;
-    let folder: Option<String> = sqlx::query_scalar("SELECT folder_path FROM meetings WHERE id = ?").bind(&meeting_id).fetch_one(state.db_manager.pool()).await.map_err(|e| e.to_string())?;
-    if let Some(folder) = folder {
-        if crate::audio::retranscription::recording_in_person(std::path::Path::new(&folder)).map_err(|e| e.to_string())? {
-            return Err("Shared-room speaker identification is outside MVP. The room microphone remains a neutral source.".into());
-        }
-    }
-    crate::database::transcript_versions::checkpoint_current(state.db_manager.pool(), &meeting_id).await?;
     diarize_meeting_inner(&state, meeting_id, audio_path, num_speakers, threshold, engine, None).await
+}
+
+/// Resolve authority from the ORIGINAL meeting folder before decode. Neither
+/// a temporary WAV nor a weaker current file can override a frozen restriction.
+pub(crate) async fn meeting_identity_policy(
+    pool: &sqlx::SqlitePool, meeting: &str, folder: &Path, version: Option<&str>,
+) -> Result<identity_policy::IdentityPolicy, String> {
+    let mut policy = identity_policy::IdentityPolicy::for_folder(folder)?;
+    // Identity belongs to the session, not whichever historical version is
+    // selected. A ready snapshot's restriction survives restoring an older one.
+    let settings: Vec<String> = sqlx::query_scalar("SELECT settings_json FROM transcript_versions WHERE meeting_id = ? AND (status = 'ready' OR id = ?)")
+        .bind(meeting).bind(version).fetch_all(pool).await.map_err(|e| e.to_string())?;
+    for settings in settings {
+        policy = policy.with_settings(&serde_json::from_str(&settings).map_err(|e| format!("Invalid stored recording policy: {e}"))?)?;
+    }
+    Ok(policy)
 }
 
 /// Called under the native post-meeting operation guard. Candidate rows never
@@ -1014,17 +1005,6 @@ pub(crate) async fn diarize_version(state: &crate::state::AppState, meeting: &st
     let folder = folder.ok_or("Saved recording folder is unavailable")?;
     crate::audio::retranscription::saved_sources(std::path::Path::new(&folder)).map_err(|e| e.to_string())?;
     let source = crate::audio::retranscription::find_audio_file(std::path::Path::new(&folder)).map_err(|e| e.to_string())?;
-    {
-        let metadata_path = std::path::Path::new(&folder).join("metadata.json");
-        if metadata_path.exists() {
-            let metadata: serde_json::Value = serde_json::from_slice(&std::fs::read(metadata_path).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
-            if metadata.get("in_person").and_then(|v| v.as_bool()) == Some(true) {
-                // A room microphone is a source, not a person. Shared-room
-                // speaker identification/voice-profile matching is outside MVP.
-                return Ok(MeetingDiarizationResult { num_speakers: 0, labeled: 0, assignments: Vec::new() });
-            }
-        }
-    }
     let settings: String = sqlx::query_scalar("SELECT settings_json FROM transcript_versions WHERE id = ? AND meeting_id = ?").bind(version).bind(meeting).fetch_one(pool).await.map_err(|e| e.to_string())?;
     let settings: serde_json::Value = serde_json::from_str(&settings).map_err(|e| e.to_string())?;
     let engine = settings.get("diarization_engine").and_then(|v| v.as_str()).ok_or("Missing selected diarization engine")?.to_string();
@@ -1069,22 +1049,48 @@ async fn diarize_meeting_inner(
     };
     log::info!("🧑‍🤝‍🧑 Diarizing meeting {} with {} using {}", meeting_id, selected_engine, source.display());
 
+    let origin_folder = folder_path.as_deref().map(PathBuf::from)
+        .or_else(|| source.parent().map(Path::to_path_buf)).ok_or("Recording has no provenance folder")?;
+    let identity_policy = meeting_identity_policy(pool, &meeting_id, &origin_folder, version).await?;
+    let candidate_sources = if let Some(version) = version {
+        crate::database::transcript_versions::version_sources(pool, &meeting_id, version).await?
+    } else { std::collections::HashMap::new() };
+    let candidate_has_source_rows = candidate_sources.values().any(|source| matches!(source.as_str(), "microphone" | "system"));
+    if identity_policy.in_person {
+        let Some(version) = version else {
+            return Err("Shared-room speaker identification is outside MVP. The room microphone remains a neutral source.".into());
+        };
+        // Policy may have tightened since ASR. Keep source rows/text intact and
+        // neutralize generated user hints without running room identity inference.
+        let mut segments = crate::database::transcript_versions::segments(pool, &meeting_id, version).await?;
+        for segment in &mut segments {
+            segment.speaker = match candidate_sources.get(&segment.id).map(String::as_str) {
+                Some("room" | "microphone") => Some("Microphone".into()),
+                _ => segment.speaker.as_deref().map(crate::speaker_labels::without_unverified_user),
+            };
+        }
+        crate::database::transcript_versions::finish_with_identity(pool, version, &segments, &identity_policy.snapshot()).await?;
+        let assignments: Vec<_> = segments.into_iter().filter_map(|segment| segment.speaker.map(|label| (segment.id, label))).collect();
+        return Ok(MeetingDiarizationResult { num_speakers: 0, labeled: assignments.len(), assignments });
+    }
+    if candidate_has_source_rows && !(origin_folder.join("mic.mp4").is_file() && origin_folder.join("system.mp4").is_file()) {
+        return Err("Call source tracks became unavailable during refinement; candidate was not applied".into());
+    }
+    if version.is_none() {
+        crate::database::transcript_versions::checkpoint_current(pool, &meeting_id).await?;
+    }
     let voiceprint_source = meeting_id.clone();
     let engine_for_blocking = selected_engine.clone();
     let is_candidate = version.is_some();
     let (result, used_source_tracks, profile_names) = tokio::task::spawn_blocking(move || -> Result<(DiarizationResult, bool, std::collections::HashMap<usize, String>)> {
         let _cancellation = batch_control::Scope::new(is_candidate.then_some(crate::audio::retranscription::refinement_cancelled as fn() -> bool));
         batch_control::check()?;
-        let parent = source.parent().map(Path::to_path_buf);
-        // A room microphone is not a user identity. Older recordings retain
-        // their source-track convention; explicit in-person recordings use the
-        // ordinary whole-room diarization path, never collapse mic to "You".
-        let in_person = parent.as_ref()
-            .and_then(|p| std::fs::read(p.join("metadata.json")).ok())
-            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-            .and_then(|value| value.get("in_person").and_then(|v| v.as_bool()))
-            .unwrap_or(false);
-        let mic_source = parent.as_ref().filter(|_| !in_person).map(|p| p.join("mic.mp4"));
+        let parent = Some(origin_folder);
+        // Candidates require separate capture routing, but never infer a named
+        // person from the mic cluster. Ordinary unverified reruns retain #10's
+        // mixed clustering: collapsing the mic could spread a manual remote name
+        // over leaked/room voices. Neither path gains permission to call it You.
+        let mic_source = parent.as_ref().filter(|_| is_candidate || identity_policy.trust_legacy_user).map(|p| p.join("mic.mp4"));
         let system_source = parent.as_ref().map(|p| p.join("system.mp4"));
 
         if let (Some(mic), Some(system)) = (mic_source, system_source) {
@@ -1170,9 +1176,9 @@ async fn diarize_meeting_inner(
 
                     // Pyannote dual track path
                     let model_dir = diarization_model_dir();
-                    let mic_embeddings = if is_candidate { None } else { embeddings_for_debug(&mic_wav, &model_dir).ok() };
+                    let mic_embeddings = if is_candidate || !identity_policy.trust_legacy_user { None } else { embeddings_for_debug(&mic_wav, &model_dir).ok() };
 
-                    let mic_result = diarize_file_with_models(&mic_wav, &model_dir, Some(1), threshold)?;
+                    let mic_result = diarize_file_with_models_policy(&mic_wav, &model_dir, Some(1), threshold, false)?;
                     let system_result = if num_speakers == Some(1) {
                         DiarizationResult {
                             segments: Vec::new(),
@@ -1181,7 +1187,7 @@ async fn diarize_meeting_inner(
                             user_speaker: None,
                         }
                     } else {
-                        diarize_file_with_models(&system_wav, &model_dir, remote_count, threshold)?
+                        diarize_file_with_models_policy(&system_wav, &model_dir, remote_count, threshold, false)?
                     };
                     if let Some(embeddings) = mic_embeddings {
                         let labels = clustering::agglomerative(
@@ -1247,7 +1253,7 @@ async fn diarize_meeting_inner(
                 })();
 
                 let profile_names = match &dual_result {
-                    Ok(_) if is_candidate => std::collections::HashMap::new(),
+                    Ok(_) if is_candidate || !identity_policy.trust_legacy_user => std::collections::HashMap::new(),
                     Ok(result) => match voice_profiles::match_offline_speakers(&system_wav, &result.segments.iter()
                         .filter(|segment| segment.speaker != 0).cloned().collect::<Vec<_>>()) {
                         Ok(names) => names,
@@ -1269,7 +1275,9 @@ async fn diarize_meeting_inner(
         }
 
         let (wav, is_temp) = ensure_wav(&source)?;
-        let out = diarize_file_with_engine(&wav, &engine_for_blocking, num_speakers, threshold);
+        let out = identity_policy.run(|trust_legacy_user| {
+            diarize_file_with_engine_policy(&wav, &engine_for_blocking, num_speakers, threshold, trust_legacy_user && !is_candidate)
+        });
         if is_temp {
             let _ = std::fs::remove_file(&wav);
         }
@@ -1299,10 +1307,6 @@ async fn diarize_meeting_inner(
     .await
     .map_err(|e| format!("Failed to read transcripts: {}", e))? };
 
-    let candidate_sources = if let Some(version) = version {
-        crate::database::transcript_versions::version_sources(pool, &meeting_id, version).await?
-    } else { std::collections::HashMap::new() };
-    let candidate_has_source_rows = candidate_sources.values().any(|source| matches!(source.as_str(), "microphone" | "system"));
     if version.is_some() && !used_source_tracks && candidate_has_source_rows {
         return Err("Call source tracks became unavailable during refinement; candidate was not applied".into());
     }
@@ -1314,7 +1318,7 @@ async fn diarize_meeting_inner(
     let user_ranges: Vec<(f32, f32)> = rows
         .iter()
         .filter(|(_, _, _, spk, _, _)| {
-            spk.as_deref()
+            identity_policy.trust_legacy_user && spk.as_deref()
                 .map(|s| s.eq_ignore_ascii_case("you"))
                 .unwrap_or(false)
         })
@@ -1324,7 +1328,9 @@ async fn diarize_meeting_inner(
         })
         .collect();
 
-    let user_speaker: Option<usize> = if result.user_speaker.is_some() {
+    let user_speaker: Option<usize> = if !identity_policy.trust_legacy_user {
+        None
+    } else if result.user_speaker.is_some() {
         result.user_speaker
     } else if user_ranges.is_empty() {
         None
@@ -1458,15 +1464,13 @@ async fn diarize_meeting_inner(
         if let Some(ref live) = existing.as_ref().filter(|_| version.is_none()) {
             let live_trim = live.trim();
             if !live_trim.is_empty() {
-                let is_generated = live_trim.split(" + ").all(|part| {
-                    part.eq_ignore_ascii_case("guest")
-                        || part.eq_ignore_ascii_case("you")
-                        || part.to_ascii_lowercase().starts_with("speaker ")
-                });
-                let is_named = !is_generated;
+                let is_named = crate::speaker_labels::is_manual_label(live_trim);
                 if is_named {
                     preserved += 1;
-                    assignments.push((id, live_trim.to_string()));
+                    let retained = if identity_policy.trust_legacy_user { live_trim.to_string() }
+                        else { crate::speaker_labels::manual_names(live_trim).join(" + ") };
+                    if retained != live_trim { updates.push((id.clone(), Some(retained.clone()))); }
+                    assignments.push((id, retained));
                     continue;
                 }
             }
@@ -1530,7 +1534,7 @@ async fn diarize_meeting_inner(
 
                 speakers.sort_unstable();
                 let mut labels: Vec<_> = speakers.into_iter().map(&speaker_label).collect();
-                apply_source_track_hint(existing.as_deref(), used_source_tracks, num_speakers != Some(1), &mut labels);
+                apply_source_track_hint(existing.as_deref(), used_source_tracks && identity_policy.trust_legacy_user, num_speakers != Some(1), &mut labels);
                 labels.dedup();
                 labels.truncate(3);
                 let final_label = labels.join(" + ");
@@ -1540,13 +1544,15 @@ async fn diarize_meeting_inner(
                 // No voice overlaps this line: keep the source hint, or else the
                 // label it already had, rather than clearing it.
                 let mut labels = Vec::new();
-                apply_source_track_hint(existing.as_deref(), used_source_tracks, num_speakers != Some(1), &mut labels);
+                apply_source_track_hint(existing.as_deref(), used_source_tracks && identity_policy.trust_legacy_user, num_speakers != Some(1), &mut labels);
                 let fallback = (!labels.is_empty()).then(|| labels.join(" + ")).or_else(|| {
                     existing
                         .as_deref()
                         .map(str::trim)
                         .filter(|label| !label.is_empty())
-                        .map(str::to_string)
+                        .map(|label| if !identity_policy.trust_legacy_user {
+                            crate::speaker_labels::without_unverified_user(label)
+                        } else { label.to_string() })
                 });
                 if let Some(label) = &fallback {
                     preserved += 1;
@@ -1569,7 +1575,7 @@ async fn diarize_meeting_inner(
         for segment in &mut segments {
             segment.speaker = refinement_candidate_label(candidate_sources.get(&segment.id).map(String::as_str), user_speaker, segment.speaker.as_deref());
         }
-        crate::database::transcript_versions::finish(pool, version, &segments).await?;
+        crate::database::transcript_versions::finish_with_identity(pool, version, &segments, &identity_policy.snapshot()).await?;
         let assignments: Vec<_> = segments.iter().filter_map(|segment| segment.speaker.as_ref().map(|label| (segment.id.clone(), label.clone()))).collect();
         return Ok(MeetingDiarizationResult { num_speakers: result.num_speakers, labeled: assignments.len(), assignments });
     }
@@ -1802,7 +1808,7 @@ fn refinement_local_cluster(used_tracks: bool, has_source_rows: bool, cluster: O
 /// shared native policy or its label assignment withheld that identity. It does
 /// not interpret #10 session flags, classify legacy labels, or match voiceprints.
 fn refinement_candidate_label(source: Option<&str>, native_user: Option<usize>, inferred: Option<&str>) -> Option<String> {
-    let parts: Vec<&str> = inferred.unwrap_or("").split(" + ").map(str::trim).filter(|label| !label.is_empty()).collect();
+    let parts: Vec<&str> = inferred.unwrap_or("").split('+').map(str::trim).filter(|label| !label.is_empty()).collect();
     match source {
         Some("room") => Some("Microphone".into()),
         Some("microphone") => Some(if native_user.is_some() && parts.iter().any(|label| label.eq_ignore_ascii_case("you")) { "You" } else { "Microphone" }.into()),

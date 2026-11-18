@@ -61,6 +61,7 @@ fn sent_prompts(root: &std::path::Path) -> Vec<String> {
 #[tokio::test]
 async fn native_queue_two_saved_meetings_fake_cli_failure_retry_and_revision_fencing() {
     use std::os::unix::fs::PermissionsExt;
+    crate::audio::retranscription::ASR_CALLS.store(0,Ordering::SeqCst);
     let dir = tempfile::tempdir().unwrap();
     *crate::ROOT.lock().unwrap() = Some(dir.path().to_owned());
     let binary = dir.path().join("fake codex");
@@ -89,7 +90,10 @@ else:
     let p = SqlitePool::connect_with(options).await.unwrap();
     migrate(&p).await;
     for id in ["a", "b"] {
-        sqlx::query("INSERT INTO meetings(id,title,created_at,updated_at,folder_path) VALUES(?,?,datetime('now'),datetime('now'),?)").bind(id).bind(format!("Synthetic {id}")).bind(format!("/synthetic/{id}")).execute(&p).await.unwrap();
+        let folder=dir.path().join(id);std::fs::create_dir(&folder).unwrap();
+        std::fs::write(folder.join("metadata.json"),br#"{"in_person":true,"future_policy":"opaque"}"#).unwrap();
+        std::fs::write(folder.join("audio.mp4"),b"synthetic decode boundary").unwrap();
+        sqlx::query("INSERT INTO meetings(id,title,created_at,updated_at,folder_path) VALUES(?,?,datetime('now'),datetime('now'),?)").bind(id).bind(format!("Synthetic {id}")).bind(folder.to_string_lossy().as_ref()).execute(&p).await.unwrap();
         sqlx::query("INSERT INTO transcripts(id,meeting_id,transcript,timestamp,audio_start_time,audio_end_time,duration,speaker) VALUES(?,?,?,datetime('now'),1,2,1,'Microphone')").bind(format!("live-{id}")).bind(id).bind(format!("Selected original {id}")).execute(&p).await.unwrap();
         let mut tx = p.begin().await.unwrap();
         crate::database::transcript_versions::ensure(&mut tx, id)
@@ -342,6 +346,8 @@ async fn native_queue_invalid_asr_checkpoint_is_not_left_running() {
     let p = SqlitePool::connect(":memory:").await.unwrap();
     migrate(&p).await;
     sqlx::query("INSERT INTO meetings(id,title,created_at,updated_at,folder_path) VALUES('invalid','Synthetic',datetime('now'),datetime('now'),'/synthetic/invalid')").execute(&p).await.unwrap();
+    let folder=tempfile::tempdir().unwrap();std::fs::write(folder.path().join("audio.mp4"),b"synthetic").unwrap();
+    sqlx::query("UPDATE meetings SET folder_path=? WHERE id='invalid'").bind(folder.path().to_str().unwrap()).execute(&p).await.unwrap();
     let settings = serde_json::json!({"provider":"whisper","model":"synthetic","diarization_engine":"nemotron"});
     let id = crate::database::transcript_versions::begin_automatic(&p, "invalid", &settings)
         .await
@@ -363,4 +369,26 @@ async fn native_queue_invalid_asr_checkpoint_is_not_left_running() {
         .await
         .unwrap();
     assert_eq!(status, "failed");
+}
+
+#[tokio::test]
+async fn native_queue_freezes_original_identity_before_asr_preflight_and_explicit_selection() {
+    let dir=tempfile::tempdir().unwrap();
+    for name in ["audio.mp4","mic.mp4","system.mp4"] {std::fs::write(dir.path().join(name),b"synthetic decode boundary").unwrap();}
+    std::fs::write(dir.path().join("metadata.json"),br#"{"microphone_identity_unverified":true}"#).unwrap();
+    let p=SqlitePool::connect(":memory:").await.unwrap();migrate(&p).await;
+    sqlx::query("INSERT INTO meetings(id,title,created_at,updated_at,folder_path) VALUES('policy','Synthetic','2026','2026',?)").bind(dir.path().to_str().unwrap()).execute(&p).await.unwrap();
+    sqlx::query("INSERT INTO transcript_settings(id,provider,model,postCallProvider,postCallModel) VALUES('1','whisper','synthetic','whisper','synthetic') ON CONFLICT(id) DO UPDATE SET provider='whisper',model='synthetic',postCallProvider='whisper',postCallModel='synthetic'").execute(&p).await.unwrap();
+    sqlx::query("INSERT INTO transcripts(id,meeting_id,transcript,timestamp,speaker) VALUES('manual','policy','Exact manual correction','2026','Alice')").execute(&p).await.unwrap();
+    let before=crate::database::transcript_versions::selected(&p,"policy").await.unwrap();
+    *crate::STATE.lock().unwrap()=Some(Arc::new(AppState{db_manager:DbManager(p.clone())}));
+    crate::audio::retranscription::WEAKEN_METADATA.store(true,Ordering::SeqCst);
+    let id=crate::audio::retranscription::run_queued_refinement(AppHandle::<()>(std::marker::PhantomData),"policy".into(),&tokio_util::sync::CancellationToken::new()).await.unwrap();
+    let (settings,rows):(String,String)=sqlx::query_as("SELECT settings_json,segments_json FROM transcript_versions WHERE id=?").bind(&id).fetch_one(&p).await.unwrap();
+    let settings:serde_json::Value=serde_json::from_str(&settings).unwrap();
+    assert_eq!(settings["identity_policy"]["microphone_identity_unverified"],true,"queued reservation did not freeze original authority");
+    let rows:Vec<crate::api::TranscriptSegment>=serde_json::from_str(&rows).unwrap();
+    assert_eq!(rows[0].speaker.as_deref(),Some("Microphone"));assert_eq!(rows[1].speaker.as_deref(),Some("Guest"));
+    let after=crate::database::transcript_versions::selected(&p,"policy").await.unwrap();
+    assert_eq!(serde_json::to_string(&before).unwrap(),serde_json::to_string(&after).unwrap(),"queue must not select or overwrite manual corrections");
 }
