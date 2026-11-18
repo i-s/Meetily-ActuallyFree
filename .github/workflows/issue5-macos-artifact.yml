@@ -1,6 +1,6 @@
-name: Issue 5 - pinned macOS artifact only
+name: Issue 20 - final pinned macOS artifact only
 
-# Retrigger after owner enabled Actions; executable workflow is unchanged.
+# Reuse PR21 once, after coordinator review; no intermediate packaging runs.
 # PR-scoped artifact build; never uses pull_request_target or release credentials.
 on:
   pull_request:
@@ -18,9 +18,10 @@ concurrency:
 env:
   # Candidate source metadata; update SOURCE_SHA after the authorized remote import
   # and keep ORIGINAL_LOCAL_SHA equal to the local approved commit below.
-  SOURCE_SHA: aa97cdf06c5c99c16f43994f3af104e007911a25
-  SOURCE_TREE: 8a75052991eaebdaa82f6ccf69f64cbcdffec9ab
-  ORIGINAL_LOCAL_SHA: 91bd839947b60f339b8f835a1a22ba10fd17f37c
+  SOURCE_SHA: 4eee1282792b3d6213870ee8383c20dc6d9f6bf7
+  SOURCE_TREE: 9aeca6832be9b4d267dcb137b1ddfc5b3a7e1034
+  ORIGINAL_LOCAL_SHA: e37be614bcf286c0c401fb5edf64efa93282be03
+  ACCEPTED_BASE_SHA: 50f6e973a637f8da9239df058d7df6d0bece2730
   MACOSX_DEPLOYMENT_TARGET: '14.2'
   PNPM_CONFIG_ENABLE_GLOBAL_VIRTUAL_STORE: 'false'
   NEXT_TELEMETRY_DISABLED: '1'
@@ -48,6 +49,8 @@ jobs:
           test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
           test "$(git rev-parse HEAD^{tree})" = "$SOURCE_TREE"
           test -z "$(git status --porcelain)"
+          python3 -I -B scripts/verify_macos_candidate.py source . > /tmp/issue20-source.json
+          python3 -I -B -m unittest discover -s tests -p 'test_macos_candidate.py' -v
       - uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa
         with:
           version: 11.9.0
@@ -69,6 +72,7 @@ jobs:
           set -euo pipefail
           brew install cmake pkg-config openssl@3
           mkdir -p dist
+          cp /tmp/issue20-source.json dist/source-identity.json
           {
             sw_vers
             uname -m
@@ -100,6 +104,7 @@ jobs:
           export CMAKE_PREFIX_PATH="$OPENSSL_PREFIX"
           export PKG_CONFIG_PATH="$OPENSSL_PREFIX/lib/pkgconfig"
           (cd frontend && pnpm build)
+          python3 -I -B scripts/verify_macos_candidate.py export frontend/out | tee dist/frontend-export.json
           cargo build --locked --release --package llama-helper --target "$TARGET" --features metal
           mkdir -p frontend/src-tauri/binaries
           cp "target/$TARGET/release/llama-helper" "frontend/src-tauri/binaries/llama-helper-$TARGET"
@@ -119,6 +124,7 @@ jobs:
         run: |
           set -euo pipefail
           bash frontend/scripts/build-macos-apple-silicon.sh 2>&1 | tee dist/build.log
+          python3 -I -B scripts/verify_macos_candidate.py export frontend/out | tee dist/bundled-frontend-export.json
       - name: Verify and identify the exact DMG
         run: |
           set -euo pipefail
@@ -126,14 +132,16 @@ jobs:
           find "target/$TARGET/release/bundle/dmg" -maxdepth 1 -name '*.dmg' -type f > dist/dmg-paths.txt
           test "$(wc -l < dist/dmg-paths.txt | tr -d ' ')" = 1
           DMG=$(cat dist/dmg-paths.txt)
-          cp "$DMG" dist/Meetily-issue5-aarch64.dmg
-          (cd dist && shasum -a 256 Meetily-issue5-aarch64.dmg > SHA256SUMS.txt)
-          MOUNT="$RUNNER_TEMP/issue5-dmg"
+          cp "$DMG" dist/Meetily-issue20-aarch64.dmg
+          (cd dist && shasum -a 256 Meetily-issue20-aarch64.dmg > SHA256SUMS.txt)
+          MOUNT="$RUNNER_TEMP/issue20-dmg"
           mkdir -p "$MOUNT"
           hdiutil attach "$DMG" -readonly -nobrowse -mountpoint "$MOUNT"
           trap 'hdiutil detach "$MOUNT" >/dev/null 2>&1 || true' EXIT
           APP="$MOUNT/Meetily - Actually Free.app"
           codesign --verify --deep --strict "$APP"
+          codesign -dvvv --entitlements :- "$APP" > dist/signature.txt 2>&1
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Contents/Info.plist")" = com.meetily.ai
           test "$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$APP/Contents/Info.plist")" = 14.2
           for name in meetily llama-helper ffmpeg; do
             BIN="$APP/Contents/MacOS/$name"
@@ -155,25 +163,30 @@ jobs:
           grep -q '"type":"pong"' dist/llama-smoke.txt
           grep -q '"type":"goodbye"' dist/llama-smoke.txt
           for model in segmentation-3.0-fp16.onnx wespeaker-resnet34-LM.onnx xvec_transform.npz; do
-            test -s "$APP/Contents/Resources/resources/diarization/$model"
+            SOURCE_MODEL="frontend/src-tauri/resources/diarization/$model"
+            BUNDLED_MODEL="$APP/Contents/Resources/resources/diarization/$model"
+            test -s "$BUNDLED_MODEL"
+            cmp "$SOURCE_MODEL" "$BUNDLED_MODEL"
+            shasum -a 256 "$BUNDLED_MODEL" >> dist/bundled-models.txt
           done
           VERSION=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Contents/Info.plist")
-          DMG_SHA=$(shasum -a 256 dist/Meetily-issue5-aarch64.dmg | awk '{print $1}')
+          test "$VERSION" = "$(jq -r .version dist/source-identity.json)"
+          DMG_SHA=$(shasum -a 256 dist/Meetily-issue20-aarch64.dmg | awk '{print $1}')
           jq -n --arg source_sha "$(git rev-parse HEAD)" --arg source_tree "$(git rev-parse HEAD^{tree})" \
-            --arg original_local_sha "$ORIGINAL_LOCAL_SHA" --arg workflow_sha "$WORKFLOW_SHA" \
+            --arg accepted_base_sha "$ACCEPTED_BASE_SHA" --arg original_local_sha "$ORIGINAL_LOCAL_SHA" --arg workflow_sha "$WORKFLOW_SHA" \
             --arg workflow_head_sha "$WORKFLOW_HEAD_SHA" --arg event_sha "$GITHUB_SHA" \
             --arg run_id "$GITHUB_RUN_ID" --arg run_attempt "$GITHUB_RUN_ATTEMPT" \
             --arg run_url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
             --arg version "$VERSION" --arg dmg_sha256 "$DMG_SHA" \
-            '{source_sha:$source_sha,source_tree:$source_tree,original_local_sha:$original_local_sha,
+            '{source_sha:$source_sha,source_tree:$source_tree,accepted_base_sha:$accepted_base_sha,original_local_sha:$original_local_sha,
               workflow_sha:$workflow_sha,workflow_head_sha:$workflow_head_sha,event_sha:$event_sha,run_id:$run_id,run_attempt:$run_attempt,run_url:$run_url,
               version:$version,dmg_sha256:$dmg_sha256,notarized:false,physical_test_attested:false}' \
-            > dist/issue5-provenance.json
-          cat dist/issue5-provenance.json >> "$GITHUB_STEP_SUMMARY"
+            > dist/issue20-provenance.json
+          cat dist/issue20-provenance.json >> "$GITHUB_STEP_SUMMARY"
       - name: Upload artifact only
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: issue5-macos-${{ github.run_id }}-${{ github.run_attempt }}
+          name: issue20-macos-${{ github.run_id }}-${{ github.run_attempt }}
           path: dist/
           if-no-files-found: error
           retention-days: 14
@@ -181,7 +194,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: issue5-failure-${{ github.run_id }}-${{ github.run_attempt }}
+          name: issue20-failure-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             dist/*.txt
             dist/*.log
