@@ -1,7 +1,8 @@
+import { commitAutomatedFixture as beginAutomatedRecording } from '../helpers/automated-recording';
 import { beforeEach, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createDiscordAutomation, type DiscordCallStatus } from '../../src/lib/discord-automation';
-import { markAutomatedStart, takeAutomatedStart, beginAutomatedRecording, endAutomatedRecording, automatedRecording } from '../../src/lib/meeting-automation';
+import { markAutomatedStart, takeAutomatedStart, endAutomatedRecording, automatedRecording } from '../../src/lib/meeting-automation';
 const store = new Map<string, string>();
 Object.assign(globalThis, {
   sessionStorage: { getItem: (k: string) => store.get(k) ?? null, setItem: (k: string, v: string) => store.set(k, v), removeItem: (k: string) => store.delete(k) },
@@ -12,7 +13,8 @@ const call = { app: 'Discord', process: 'discord-macos:one', source: 'discord', 
 const zoom = { app: 'Zoom', process: 'us.zoom.xos', source: 'zoom', sessionId: 'z1' };
 const tick = () => new Promise((r) => setTimeout(r, 0));
 function seed() {
-  endAutomatedRecording(); markAutomatedStart(call);
+  store.clear(); // External native-owner replacement fixture; R2 admission has separate fenced tests.
+  markAutomatedStart(call);
   const owner = takeAutomatedStart()!; beginAutomatedRecording(owner); return owner;
 }
 beforeEach(() => store.clear());

@@ -1,10 +1,11 @@
+import { commitAutomatedFixture as beginAutomatedRecording } from '../helpers/automated-recording';
 import { beforeEach, describe, test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   createDiscordAutomation, discordMayStart, discordProcess,
   type DiscordCallStatus,
 } from '../../src/lib/discord-automation';
-import { automatedRecording, beginAutomatedRecording, endAutomatedRecording, takeAutomatedStart, markAutomatedStart } from '../../src/lib/meeting-automation';
+import { automatedRecording, endAutomatedRecording, takeAutomatedStart, markAutomatedStart } from '../../src/lib/meeting-automation';
 
 const store = new Map<string, string>();
 Object.assign(globalThis, {
@@ -14,7 +15,8 @@ Object.assign(globalThis, {
 const active: DiscordCallStatus = { enabled: true, qualified: true, state: 'active', reason: 'test_fixture_not_mac_qualification', session_id: 'epoch:1', transition: 'start' };
 const ended: DiscordCallStatus = { ...active, state: 'inactive', transition: 'end' };
 function seed(call: { app: string; process: string }) {
-  const tagged = call.process.startsWith('discord-macos:') ? { ...call, source: 'discord', sessionId: call.process.slice('discord-macos:'.length) } : call;
+  store.clear(); // Seed an independent externally committed native-owner fixture, not admission/retry.
+  const tagged = call.process.startsWith('discord-macos:') ? { ...call, source: 'discord', sessionId: call.process.slice('discord-macos:'.length) } : { ...call, source: 'zoom', sessionId: call.process };
   assert.equal(markAutomatedStart(tagged), true);
   const reserved = takeAutomatedStart()!;
   assert.equal(beginAutomatedRecording(reserved), true);

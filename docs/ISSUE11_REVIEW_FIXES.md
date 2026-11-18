@@ -1,5 +1,10 @@
 # Issue #11 R1 review fixes and integration obligations
 
+R2 supersedes this historical note's pending/inflight expiry and promotion API:
+see [ISSUE11_START_RECOVERY.md](ISSUE11_START_RECOVERY.md) for explicit preparation,
+persisted native uncertainty, rejected automated intent and the exact coordinated
+#10 native v1 settling-barrier contract. The R1 counts below remain historical.
+
 ## Attribution and safety boundary
 
 - Assigned accepted software base: `4269de67c6747b2f5fce72596826c05dadbb3e1c`.

@@ -10,6 +10,7 @@ import { useLabs } from "@/hooks/useLabs"
 import { setLabsFeature } from "@/lib/labs-features"
 import { listen } from "@tauri-apps/api/event"
 import { DiscordObservation } from "./DiscordObservation"
+import { automationUnavailableMessage, AUTOMATION_CHANGED_EVENT } from "@/lib/meeting-automation"
 import type { DiscordCallStatus } from "@/lib/discord-automation"
 
 interface MeetingDetectionSettings {
@@ -31,6 +32,13 @@ export function MeetingDetectionSettings() {
   const [ignoredInput, setIgnoredInput] = useState('');
   const { labs } = useLabs();
   const [automationBusy, setAutomationBusy] = useState(false);
+  const [automationUnavailable, setAutomationUnavailable] = useState<string | null>(null);
+  useEffect(() => {
+    const update = () => setAutomationUnavailable(automationUnavailableMessage());
+    update();
+    window.addEventListener(AUTOMATION_CHANGED_EVENT, update);
+    return () => window.removeEventListener(AUTOMATION_CHANGED_EVENT, update);
+  }, []);
   const [discord, setDiscord] = useState<DiscordCallStatus | null>(null);
 
   useEffect(() => {
@@ -172,6 +180,8 @@ export function MeetingDetectionSettings() {
         </p>
         <DiscordObservation status={discord} automationOn={labs.meetingAutomation} />
       </section>
+
+      {automationUnavailable && <p role="status" className="text-sm text-af-text-2">{automationUnavailable}</p>}
 
       <div className="flex items-start gap-4 rounded-2xl border border-af-border bg-af-panel-2/40 p-5">
         <span className="mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-af-accent/[0.12] text-af-accent">

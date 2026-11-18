@@ -8,10 +8,11 @@ Object.assign(globalThis, {
   IS_REACT_ACT_ENVIRONMENT: true,
   sessionStorage: { getItem: (k: string) => data.get(k) ?? null, setItem: (k: string, v: string) => data.set(k, v), removeItem: (k: string) => data.delete(k) },
   window: Object.assign(target, { location: { pathname: '/' } }),
-  CustomEvent: class extends Event {},
+  CustomEvent: class extends Event { detail: unknown; constructor(name: string, options?: CustomEventInit) { super(name); this.detail = options?.detail; } },
 });
 let status: any = { enabled: true, qualified: true, state: 'active', session_id: 'fixture:1', transition: 'start', reason: 'synthetic_not_qualified' };
 let starts = 0;
+let capabilityAvailable = true;
 let afterModelReady = () => {};
 const noop = () => {};
 const messages: string[] = [];
@@ -28,7 +29,7 @@ mock.module('@/contexts/TranscriptContext', () => ({ useTranscripts: () => ({ cl
 mock.module('@/components/Sidebar/SidebarProvider', () => ({ useSidebar: () => ({ setIsMeetingActive: noop, meetings: [] }) }));
 mock.module('@/contexts/ConfigContext', () => ({ useConfig: () => ({ selectedDevices: { micDevice: 'synthetic-mic', systemDevice: 'synthetic-output' }, transcriptModelConfig: { provider: 'parakeet' } }) }));
 mock.module('@/contexts/RecordingStateContext', () => ({ useRecordingState: () => ({ setStatus: noop }), RecordingStatus: { IDLE: 'idle', STARTING: 'starting', ERROR: 'error' } }));
-mock.module('@/services/recordingService', () => ({ recordingService: { startRecordingWithDevices: async (mic: string, output: string) => { expect(mic).toBe('synthetic-mic'); expect(output).toBe('synthetic-output'); starts++; } } }));
+mock.module('@/services/recordingService', () => ({ recordingService: { getRecordingStartCapability: async () => { if (!capabilityAvailable) throw new Error('Native recording start authority v1 is unavailable'); return { version: 1, epoch: 'fixture-native', next_sequence: '1' }; }, startRecordingWithDevices: async (mic: string, output: string, _title: string, session?: string, expected?: any) => { expect(mic).toBe('synthetic-mic'); expect(output).toBe('synthetic-output'); starts++; if (session) { expect(expected.session_id).toBe(session); expect(expected.token).toBeTruthy(); return { generation: 'fixture:lease', owner: { source: 'discord', session_id: session, app: 'Discord', process: `discord-macos:${session}` } }; } } } }));
 mock.module('@/lib/groups', () => ({ readPendingGroup: () => null, writePendingGroup: noop }));
 mock.module('@/lib/live-session', () => ({ automaticTitle: () => 'Synthetic Discord entrypoint test', beginLiveSession: noop }));
 mock.module('@/lib/labs', () => ({ loadLabsPreferences: () => ({ meetingAutomation: true }) }));
@@ -46,7 +47,7 @@ function Recorder() { manualStart = useRecordingStart(false, noop).handleRecordi
 
 function bridge() {
   return createDiscordAutomation({ allowed: () => true, status: async () => status, recording: async () => ({ is_recording: !!automatedRecording() }),
-    start: () => launchRecording(() => { throw new Error('already on recorder'); }), stop: () => requestRecordingStop(() => { throw new Error('already on recorder'); }), error: (e) => { throw e; } });
+    start: (call) => launchRecording(() => { throw new Error('already on recorder'); }, { automated: call }), stop: () => requestRecordingStop(() => { throw new Error('already on recorder'); }), error: (e) => { throw e; } });
 }
 const settle = () => new Promise((resolve) => setTimeout(resolve, 10));
 
@@ -97,4 +98,19 @@ test('Discord event bridge drives ordinary launcher and real useRecordingStart; 
     expect(starts).toBe(2);
     expect(automatedRecording()).toBeNull();
   } finally { controller.dispose(); await act(async () => view?.unmount()); }
+}, 120_000);
+
+
+test('missing native v1 support fails closed before automatic capture, without disabling explicit manual Start', async () => {
+  data.clear(); afterModelReady = noop; capabilityAvailable = false;
+  status = { ...status, session_id: 'no-native-capability', qualified: true, state: 'active', transition: 'start' };
+  const initial = starts; const controller = bridge();
+  let view: ReturnType<typeof create> | undefined;
+  try {
+    await act(async () => { view = create(<Recorder />); });
+    await act(async () => { controller.update(status); await settle(); });
+    expect(starts).toBe(initial); expect(automatedRecording()).toBeNull();
+    await act(async () => { await manualStart(); });
+    expect(starts).toBe(initial + 1); expect(automatedRecording()).toBeNull();
+  } finally { capabilityAvailable = true; controller.dispose(); await act(async () => view?.unmount()); }
 }, 120_000);

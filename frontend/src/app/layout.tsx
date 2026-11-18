@@ -30,7 +30,7 @@ import { RecordingPostProcessingProvider } from '@/contexts/RecordingPostProcess
 import { ImportDialogProvider } from '@/contexts/ImportDialogContext'
 import { isAudioExtension, getAudioFormatsDisplayList } from '@/constants/audioFormats'
 import { loadLabsPreferences } from '@/lib/labs'
-import { automatedRecording, endAutomatedRecording, markAutomatedStart, AUTOMATION_CHANGED_EVENT, reservationCurrent } from '@/lib/meeting-automation'
+import { automatedRecording, endAutomatedRecording, markAutomatedStart, AUTOMATION_CHANGED_EVENT, reservationCurrent, automatedStartInProgress, type AutomatedCall } from '@/lib/meeting-automation'
 import { createDiscordAutomation, type DiscordCallStatus } from '@/lib/discord-automation'
 import { getPendingCrashReport, type PendingCrashReport } from '@/services/crashReportService'
 import { WorkspaceProvider } from '@/contexts/WorkspaceContext'
@@ -154,7 +154,7 @@ export default function RootLayout({
   const pathname = usePathname()
   const router = useRouter()
   // Tray, notification and meeting-detection starts work from any page.
-  const startRecordingAnywhere = useRef<() => void>(() => undefined)
+  const startRecordingAnywhere = useRef<(call?: AutomatedCall) => void>(() => undefined)
   const isMinibar = (pathname ?? '').startsWith('/minibar')
   const [showOnboarding, setShowOnboarding] = useState(false)
   const [onboardingCompleted, setOnboardingCompleted] = useState(false)
@@ -165,9 +165,9 @@ export default function RootLayout({
   const [pendingCrashReport, setPendingCrashReport] = useState<PendingCrashReport | null>(null)
   const [recordingNoticeAcknowledged, setRecordingNoticeAcknowledged] = useState(false)
   const acknowledgeRecordingNotice = useCallback(() => setRecordingNoticeAcknowledged(true), [])
-  startRecordingAnywhere.current = () => {
+  startRecordingAnywhere.current = (call) => {
     if (!recordingNoticeAcknowledged) return
-    launchRecording((href) => router.push(href))
+    launchRecording((href) => router.push(href), call ? { automated: call } : {})
   }
 
   // Import audio state
@@ -319,20 +319,23 @@ export default function RootLayout({
         const { app, notify, active_media, process } = event.payload;
         console.log('[Layout] meeting-detected:', event.payload);
 
-        const startRecording = () => {
+        const startRecording = (call?: AutomatedCall) => {
           if (showOnboarding) {
             toast.error('Please complete setup first', {
               description: 'Finish onboarding before you can start recording.',
             });
             return;
           }
-          startRecordingAnywhere.current();
+          startRecordingAnywhere.current(call);
         };
 
         if (loadLabsPreferences().meetingAutomation && active_media && !showOnboarding) {
           void invoke<{ is_recording?: boolean }>('get_recording_state').then((state) => {
             if (state.is_recording) return;
-            if (markAutomatedStart({ app, process })) startRecording();
+            if (markAutomatedStart({ app, process })) {
+              const call = automatedStartInProgress();
+              if (call) startRecording(call);
+            }
           }).catch((error) => console.error('Could not check recording state for meeting automation:', error));
           return;
         }
@@ -351,7 +354,7 @@ export default function RootLayout({
           duration: 20000,
           action: {
             label: 'Start recording',
-            onClick: startRecording,
+            onClick: () => startRecording(),
           },
         });
       }
@@ -398,7 +401,7 @@ export default function RootLayout({
       allowed: () => loadLabsPreferences().meetingAutomation,
       status: () => invoke<DiscordCallStatus>('get_discord_automation_status'),
       recording: () => invoke<{ is_recording?: boolean }>('get_recording_state'),
-      start: () => startRecordingAnywhere.current(),
+      start: (call) => startRecordingAnywhere.current(call),
       // No unguarded Stop dispatcher on this standalone base. Coordinator wires
       // stop(expectedLease) -> #10 requestRecordingStop(push, expectedLease)
       // only with native atomic generation/owner validation in the combined tree.

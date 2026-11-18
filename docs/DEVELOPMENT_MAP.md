@@ -237,6 +237,11 @@ R1's stale-observation gap reset, busy-call tombstones, common token reservation
 and required #10 native generation/guarded-Stop integration are recorded in
 [ISSUE11_REVIEW_FIXES.md](ISSUE11_REVIEW_FIXES.md). A standalone missing lease or
 missing guarded dispatcher cannot silently become an unguarded Discord Stop.
+R2's expirable preparation versus persisted native-start uncertainty, exact #10
+v1 expectedStart/settling-barrier transport, explicit automated launch intent,
+consumed-session capacity/recovery and race/serialization fixtures are mapped in
+[ISSUE11_START_RECOVERY.md](ISSUE11_START_RECOVERY.md). An expired JS token or idle
+snapshot cannot clear a dispatched start; missing native authority fails closed.
 
 Issue #5 artifact-only Actions build (pinned source/tree vs workflow SHA),
 sidecar ordering, locked dependencies, model provenance, same-account backup/

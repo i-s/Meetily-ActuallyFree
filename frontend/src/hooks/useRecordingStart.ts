@@ -8,8 +8,8 @@ import { useRecordingState, RecordingStatus } from '@/contexts/RecordingStateCon
 import { recordingService } from '@/services/recordingService';
 import { readPendingGroup } from '@/lib/groups';
 import { automaticTitle, beginLiveSession } from '@/lib/live-session';
-import { AUTO_START_KEY, START_RECORDING_EVENT } from '@/lib/recording-launch';
-import { beginAutomatedRecording, endAutomatedRecording, takeAutomatedStart, automatedStartInProgress, releaseAutomatedStart, reservationCurrent, type AutomatedCall } from '@/lib/meeting-automation';
+import { START_RECORDING_EVENT, readRecordingLaunchIntent, takeRecordingLaunchIntent, type RecordingLaunchIntent } from '@/lib/recording-launch';
+import { beginAutomatedRecording, endAutomatedRecording, takeAutomatedStartResult, freezeAutomatedStart, releaseAutomatedStart, reservationCurrent, type AutomatedCall } from '@/lib/meeting-automation';
 import { discordMayStart, isDiscordProcess, type DiscordCallStatus } from '@/lib/discord-automation';
 import { loadLabsPreferences } from '@/lib/labs';
 import Analytics from '@/lib/analytics';
@@ -195,16 +195,14 @@ export function useRecordingStart(
   }, [checkIfModelDownloading, setStatus, showModal]);
 
   /** The one start sequence. Returns false when recording did not start. */
-  const startRecording = useCallback(async (source: StartSource): Promise<boolean> => {
+  const startRecording = useCallback(async (source: StartSource, intent: RecordingLaunchIntent = { kind: 'manual' }): Promise<boolean> => {
     // A detected call asked for this start (Labs meeting automation). A start
     // from the record button is the user's own and is never stopped for them.
-    const requested = automatedStartInProgress();
-    const automated = source === 'home_page' ? null : takeAutomatedStart();
-    if (source === 'home_page') endAutomatedRecording();
-    const call = automated;
-    if (source !== 'home_page' && requested && (!call || !reservationCurrent(call, 'inflight'))) {
-      return false; // Expired/replaced automation is never a manual capture.
-    }
+    if (intent.kind === 'rejected' || intent.kind === 'absent') return false;
+    const result = intent.kind === 'automated' ? takeAutomatedStartResult(intent.call) : null;
+    if (result && result.kind !== 'accepted') return false;
+    const call = result?.kind === 'accepted' ? result.call : null;
+    if (!call) endAutomatedRecording();
     // Readying the model can take several seconds (it loads a large model
     // into memory), so say so from the first step.
     setStatus(RecordingStatus.STARTING, 'Preparing transcription model…');
@@ -238,15 +236,23 @@ export function useRecordingStart(
       setMeetingTitle(title);
       setStatus(RecordingStatus.STARTING, 'Starting audio capture…');
 
-      await recordingService.startRecordingWithDevices(
-        selectedDevices?.micDevice || null,
-        selectedDevices?.systemDevice || null,
-        title
-      );
+      let lease;
+      if (call) {
+        const capability = await recordingService.getRecordingStartCapability();
+        const expected = freezeAutomatedStart(call, capability);
+        if (!expected) throw new Error('Automated recording start authority is unavailable or revoked');
+        lease = await recordingService.startRecordingWithDevices(
+          selectedDevices?.micDevice || null, selectedDevices?.systemDevice || null, title, call.sessionId, expected
+        );
+        // A lost/late response does not erase native uncertainty. Full reload
+        // settlement and guarded native controls are integrated by #10's hook.
+        if (!reservationCurrent(call, 'inflight') || !lease || !beginAutomatedRecording(call, lease)) return false;
+      } else {
+        await recordingService.startRecordingWithDevices(
+          selectedDevices?.micDevice || null, selectedDevices?.systemDevice || null, title
+        );
+      }
 
-      // Never let a delayed completion label a replacement take as this call.
-      // Final native admission/generation validation is owned by integrated #10.
-      if (call && !reservationCurrent(call, 'inflight')) return false;
       // RECORDING status itself arrives from Rust via RecordingStateContext.
       beginLiveSession(title, startedAt);
       setIsRecording(true);
@@ -254,7 +260,7 @@ export function useRecordingStart(
       setIsMeetingActive(true);
       markRecordingStarted(startedAt);
       Analytics.trackButtonClick('start_recording', source);
-      if (call && beginAutomatedRecording(call)) {
+      if (call && reservationCurrent(call, 'recording')) {
         toast(`Recording your ${call.app} call`, {
           description: isDiscordProcess(call.process)
             ? 'Experimental Discord evidence. Automatic Stop requires integrated native owner/lease validation; stop manually when needed.'
@@ -303,24 +309,19 @@ export function useRecordingStart(
 
   // Sent here with the autoStartRecording flag (e.g. "Start" on a group).
   useEffect(() => {
-    let shouldAutoStart = false;
-    try {
-      shouldAutoStart = sessionStorage.getItem(AUTO_START_KEY) === 'true';
-    } catch {
-      shouldAutoStart = false;
-    }
-    if (!shouldAutoStart || isRecording || isAutoStarting) return;
-    sessionStorage.removeItem(AUTO_START_KEY);
+    if (isRecording || isAutoStarting) return;
+    const intent = takeRecordingLaunchIntent();
+    if (intent.kind === 'absent' || intent.kind === 'rejected') return;
     setIsAutoStarting(true);
-    void startRecording('sidebar_auto').finally(() => setIsAutoStarting(false));
+    void startRecording('sidebar_auto', intent).finally(() => setIsAutoStarting(false));
   }, [isRecording, isAutoStarting, startRecording]);
 
   // Tray, detected meetings, and start buttons elsewhere on this page.
   useEffect(() => {
-    const handleDirectStart = () => {
+    const handleDirectStart = (event: Event) => {
       if (isRecording || isAutoStarting) return;
       setIsAutoStarting(true);
-      void startRecording('sidebar_direct').finally(() => setIsAutoStarting(false));
+      void startRecording('sidebar_direct', readRecordingLaunchIntent((event as CustomEvent).detail)).finally(() => setIsAutoStarting(false));
     };
     window.addEventListener(START_RECORDING_EVENT, handleDirectStart);
     return () => window.removeEventListener(START_RECORDING_EVENT, handleDirectStart);

@@ -49,7 +49,7 @@ interface Dependencies {
   allowed: () => boolean;
   status: () => Promise<DiscordCallStatus>;
   recording: () => Promise<RecordingSnapshot>;
-  start: () => void;
+  start: (expectedCall: AutomatedCall) => void;
   /** Must route this exact lease through #10's guarded normal Stop boundary.
    * A caller without that integrated boundary must provide no stop dispatcher.
    */
@@ -106,7 +106,7 @@ export function createDiscordAutomation(deps: Dependencies) {
       if (current.is_recording || current.is_stopping || automatedRecording() || disposed || latest !== status ||
           !deps.allowed() || !reservationCurrent(reserved, 'pending')) return;
       stopping = null;
-      deps.start();
+      deps.start(reserved);
       dispatched = true;
     } finally { if (!dispatched) releaseAutomatedStart(reserved); }
   }

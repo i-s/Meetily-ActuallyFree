@@ -3,7 +3,7 @@ import { act, create } from 'react-test-renderer';
 import { expect, mock, test } from 'bun:test';
 let settings: any = { enabled: true, interval_secs: 15, meeting_apps: ['zoom'], ignored_apps: [], notify: true, discord_automation: false };
 let listener: (event: any) => void;
-Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
+Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true, window: new EventTarget(), sessionStorage: { getItem: () => null } });
 mock.module('@tauri-apps/api/core', () => ({ invoke: async (name: string, args?: any) => {
   if (name === 'get_meeting_detection_settings') return settings;
   if (name === 'set_meeting_detection_settings') { settings = args.settings; return; }
@@ -32,4 +32,18 @@ test('normal settings opt in to read-only observation and display Unknown/qualif
     expect(text).toContain('blocked until the signal is qualified');
     expect(text).toContain('Guild voice, DM and group DM are each unqualified');
   } finally { await act(async () => view?.unmount()); }
+}, 120_000);
+
+test('full consumed-session history is visibly unavailable with safe recovery, not a qualification/reset override', async () => {
+  const getItem = sessionStorage.getItem;
+  sessionStorage.getItem = (key: string) => key === 'labsAutoStartConsumed' ? JSON.stringify(Array.from({ length: 256 }, (_, i) => `consumed-${i}`)) : null;
+  let view: ReturnType<typeof create> | undefined;
+  try {
+    await act(async () => { view = create(<MeetingDetectionSettings />); });
+    const text = JSON.stringify(view!.toJSON());
+    expect(text).toContain('256-session safety history is full');
+    expect(text).toContain('fully quit and reopen Meetily');
+    expect(text).toContain('Manual controls remain available');
+    expect(text).toContain('blocked until the signal is qualified');
+  } finally { sessionStorage.getItem = getItem; await act(async () => view?.unmount()); }
 }, 120_000);
