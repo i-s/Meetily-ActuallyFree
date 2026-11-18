@@ -9,8 +9,8 @@ import { recordingService } from '@/services/recordingService';
 import { readPendingGroup } from '@/lib/groups';
 import { automaticTitle, beginLiveSession } from '@/lib/live-session';
 import { AUTO_START_KEY, START_RECORDING_EVENT } from '@/lib/recording-launch';
-import { beginAutomatedRecording, endAutomatedRecording, takeAutomatedStart } from '@/lib/meeting-automation';
-import { takeDiscordStartRequest, discordMayStart, isDiscordProcess, type DiscordCallStatus } from '@/lib/discord-automation';
+import { beginAutomatedRecording, endAutomatedRecording, takeAutomatedStart, automatedStartInProgress, releaseAutomatedStart, reservationCurrent, type AutomatedCall } from '@/lib/meeting-automation';
+import { discordMayStart, isDiscordProcess, type DiscordCallStatus } from '@/lib/discord-automation';
 import { loadLabsPreferences } from '@/lib/labs';
 import Analytics from '@/lib/analytics';
 import { showRecordingNotification } from '@/lib/recordingNotification';
@@ -92,11 +92,19 @@ export function useRecordingStart(
 
   // Prefer Parakeet for live (fast). Whisper is for post-call enhance/retranscribe.
   // Prefetch the configured provider so Start Recording feels snappy after idle unload.
-  const prefetchSttModel = useCallback(async (): Promise<boolean> => {
+  const prefetchSttModel = useCallback(async (expected?: AutomatedCall): Promise<boolean> => {
+    const current = () => !expected || reservationCurrent(expected, 'inflight');
+    const ownedInvoke = async <T,>(command: string, args?: Record<string, unknown>): Promise<T> => {
+      if (!current()) throw new Error('Automation reservation revoked');
+      const result = await invoke<T>(command, args);
+      if (!current()) throw new Error('Automation reservation revoked');
+      return result;
+    };
     runtimeErrorRef.current = null;
     try {
-      await invoke('check_transcription_runtime');
+      await ownedInvoke('check_transcription_runtime');
     } catch (error) {
+      if (!current()) return false;
       const message = transcriptionRuntimeMessage(error) || 'Could not check the speech runtime. Restart Meetily and try again.';
       runtimeErrorRef.current = message;
       toast.error('Speech recognition unavailable', { description: message });
@@ -107,12 +115,12 @@ export function useRecordingStart(
 
     try {
       if (preferParakeet) {
-        await invoke('parakeet_init');
-        const hasModels = await invoke<boolean>('parakeet_has_available_models');
+        await ownedInvoke('parakeet_init');
+        const hasModels = await ownedInvoke<boolean>('parakeet_has_available_models');
         if (!hasModels) return false;
-        const alreadyLoaded = await invoke<boolean>('parakeet_is_model_loaded');
+        const alreadyLoaded = await ownedInvoke<boolean>('parakeet_is_model_loaded');
         if (!alreadyLoaded) {
-          const models = await invoke<any[]>('parakeet_get_available_models');
+          const models = await ownedInvoke<any[]>('parakeet_get_available_models');
           const configured = transcriptModelConfig?.model;
           const ready =
             (configured && models.find((m: any) => m?.name === configured)) ||
@@ -123,23 +131,24 @@ export function useRecordingStart(
             ) ||
             models[0];
           if (ready?.name) {
-            await invoke('parakeet_load_model', { modelName: ready.name });
+            await ownedInvoke('parakeet_load_model', { modelName: ready.name });
           }
         }
         return true;
       }
 
       // Whisper path (only if user explicitly chose localWhisper)
-      await invoke('whisper_init');
-      const hasModels = await invoke<boolean>('whisper_has_available_models');
+      await ownedInvoke('whisper_init');
+      const hasModels = await ownedInvoke<boolean>('whisper_has_available_models');
       if (!hasModels) return false;
-      const alreadyLoaded = await invoke<boolean>('whisper_is_model_loaded');
+      const alreadyLoaded = await ownedInvoke<boolean>('whisper_is_model_loaded');
       if (!alreadyLoaded) {
         const modelName = transcriptModelConfig?.model || 'large-v3';
-        await invoke('whisper_load_model', { modelName });
+        await ownedInvoke('whisper_load_model', { modelName });
       }
       return true;
     } catch (error) {
+      if (!current()) return false;
       console.error('Failed to prefetch STT model:', error);
       return false;
     }
@@ -189,24 +198,35 @@ export function useRecordingStart(
   const startRecording = useCallback(async (source: StartSource): Promise<boolean> => {
     // A detected call asked for this start (Labs meeting automation). A start
     // from the record button is the user's own and is never stopped for them.
-    const automated = takeAutomatedStart();
-    const discordRequest = takeDiscordStartRequest();
-    const call = source === 'home_page' ? null : discordRequest ? { app: 'Discord', process: discordRequest.process } : automated;
+    const requested = automatedStartInProgress();
+    const automated = source === 'home_page' ? null : takeAutomatedStart();
+    if (source === 'home_page') endAutomatedRecording();
+    const call = automated;
+    if (source !== 'home_page' && requested && (!call || !reservationCurrent(call, 'inflight'))) {
+      return false; // Expired/replaced automation is never a manual capture.
+    }
     // Readying the model can take several seconds (it loads a large model
     // into memory), so say so from the first step.
     setStatus(RecordingStatus.STARTING, 'Preparing transcription model…');
-    const sttReady = await prefetchSttModel();
+    const sttReady = await prefetchSttModel(call ?? undefined);
+    if (call && !reservationCurrent(call, 'inflight')) { releaseAutomatedStart(call); return false; }
     if (!sttReady) {
-      await reportModelNotReady(source);
+      if (call) {
+        setStatus(RecordingStatus.IDLE);
+        toast.error('Automatic recording did not start', { description: 'Speech model is not ready. Check the model and start manually when ready.' });
+        releaseAutomatedStart(call);
+      } else await reportModelNotReady(source);
       return false;
     }
 
     try {
-      if (call && isDiscordProcess(call.process)) {
+      if (call && !reservationCurrent(call, 'inflight')) return false;
+      if (call && call.source === 'discord') {
         // Navigation/model loading may outlive the observed join. Revalidate
         // immediately before normal capture; Unknown is never permission to start.
         const status = await invoke<DiscordCallStatus>('get_discord_automation_status');
-        if (!discordRequest || Date.now() - discordRequest.at > 60_000 || !loadLabsPreferences().meetingAutomation || !discordMayStart(status, call.process)) {
+        if (!reservationCurrent(call, 'inflight')) return false;
+        if (!loadLabsPreferences().meetingAutomation || !discordMayStart(status, call.process)) {
           setStatus(RecordingStatus.IDLE);
           toast('Discord automatic start cancelled', { description: 'A connected call is no longer confirmed. You can still start recording manually.' });
           return false;
@@ -224,6 +244,9 @@ export function useRecordingStart(
         title
       );
 
+      // Never let a delayed completion label a replacement take as this call.
+      // Final native admission/generation validation is owned by integrated #10.
+      if (call && !reservationCurrent(call, 'inflight')) return false;
       // RECORDING status itself arrives from Rust via RecordingStateContext.
       beginLiveSession(title, startedAt);
       setIsRecording(true);
@@ -231,19 +254,19 @@ export function useRecordingStart(
       setIsMeetingActive(true);
       markRecordingStarted(startedAt);
       Analytics.trackButtonClick('start_recording', source);
-      if (call) {
-        beginAutomatedRecording(call);
+      if (call && beginAutomatedRecording(call)) {
         toast(`Recording your ${call.app} call`, {
           description: isDiscordProcess(call.process)
-            ? 'Experimental Discord automation. Client exit can stop this take; leaving with the client open is unqualified. Stop manually if needed.'
+            ? 'Experimental Discord evidence. Automatic Stop requires integrated native owner/lease validation; stop manually when needed.'
             : 'Meeting automation started it, and stops and saves it when the call ends.',
           duration: 10000,
-          action: { label: "Don't stop it", onClick: () => endAutomatedRecording() },
+          action: { label: "Don't stop it", onClick: () => endAutomatedRecording(call) },
         });
       }
       await showRecordingNotification();
       return true;
     } catch (error) {
+      if (call && !reservationCurrent(call, 'inflight')) return false;
       console.error('Failed to start recording:', error);
       setIsRecording(false);
       const runtimeMessage = transcriptionRuntimeMessage(error);
@@ -257,6 +280,8 @@ export function useRecordingStart(
       toast.error(title, { description: message, duration: 8000 });
       Analytics.trackButtonClick('start_recording_error', source);
       return false;
+    } finally {
+      if (call) releaseAutomatedStart(call);
     }
   }, [
     prefetchSttModel,

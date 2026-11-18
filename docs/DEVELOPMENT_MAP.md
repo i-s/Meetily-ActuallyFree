@@ -233,6 +233,10 @@ export and exact guild/DM/GDM comparison/promotion protocol are documented in
 [ISSUE11_DISCORD_OBSERVATION.md](ISSUE11_DISCORD_OBSERVATION.md). Reader availability,
 observation enablement, client absence, candidate Active and qualified call support
 are distinct; no diagnostic setting can unlock unqualified recording.
+R1's stale-observation gap reset, busy-call tombstones, common token reservation
+and required #10 native generation/guarded-Stop integration are recorded in
+[ISSUE11_REVIEW_FIXES.md](ISSUE11_REVIEW_FIXES.md). A standalone missing lease or
+missing guarded dispatcher cannot silently become an unguarded Discord Stop.
 
 Issue #5 artifact-only Actions build (pinned source/tree vs workflow SHA),
 sidecar ordering, locked dependencies, model provenance, same-account backup/

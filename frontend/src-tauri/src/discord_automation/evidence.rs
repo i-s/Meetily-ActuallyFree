@@ -160,10 +160,22 @@ pub struct Tracker {
     next: u64,
     candidate_since: Option<u64>,
     inactive_since: Option<u64>,
+    last_sample_ms: Option<u64>,
 }
 impl Tracker {
+    /// 3s poll + bounded AX scan + scheduling margin; stalled/sleeping workers
+    /// have no evidence of continuity. Preserve the session, reset only timers.
+    pub const MAX_SAMPLE_GAP_MS: u64 = 10_000;
     /// Monotonic milliseconds, supplied by the worker (never wall clock).
     pub fn observe(&mut self, presence: Presence, now_ms: u64) -> Transition {
+        if self
+            .last_sample_ms
+            .is_some_and(|last| now_ms < last || now_ms - last > Self::MAX_SAMPLE_GAP_MS)
+        {
+            self.candidate_since = None;
+            self.inactive_since = None;
+        }
+        self.last_sample_ms = Some(now_ms);
         match presence {
             Presence::Active => {
                 self.inactive_since = None;
@@ -201,6 +213,44 @@ impl Tracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn observation_gaps_cannot_supply_join_or_leave_elapsed_evidence() {
+        let mut t = Tracker::default();
+        assert_eq!(t.observe(Presence::Active, 0), Transition::None);
+        assert_eq!(t.observe(Presence::Active, 3_600_000), Transition::None);
+        assert_eq!(t.observe(Presence::Active, 3_603_000), Transition::Start(1));
+        assert_eq!(t.observe(Presence::Inactive, 3_604_000), Transition::None);
+        assert_eq!(t.observe(Presence::Inactive, 7_200_000), Transition::None);
+        assert_eq!(t.session, Some(1));
+        for offset in (3_000..45_000).step_by(3_000) {
+            assert_eq!(
+                t.observe(Presence::Inactive, 7_200_000 + offset),
+                Transition::None
+            );
+        }
+        assert_eq!(t.observe(Presence::Inactive, 7_245_000), Transition::End(1));
+    }
+    #[test]
+    fn observation_gaps_inactive_after_stall_is_not_confirmed_exit() {
+        let mut t = Tracker::default();
+        t.observe(Presence::Active, 0);
+        t.observe(Presence::Active, 3_000);
+        t.observe(Presence::Inactive, 4_000);
+        assert_eq!(t.observe(Presence::Inactive, 3_600_000), Transition::None);
+        assert_eq!(t.session, Some(1));
+    }
+    #[test]
+    fn observation_gaps_backwards_time_restarts_evidence_but_retains_session() {
+        let mut t = Tracker::default();
+        t.observe(Presence::Active, 10_000);
+        assert_eq!(t.observe(Presence::Active, 1_000), Transition::None);
+        assert_eq!(t.observe(Presence::Active, 4_000), Transition::Start(1));
+        t.observe(Presence::Inactive, 5_000);
+        assert_eq!(t.observe(Presence::Inactive, 500), Transition::None);
+        assert_eq!(t.session, Some(1));
+        assert_eq!(t.observe(Presence::Unknown, 9_000_000), Transition::None);
+        assert_eq!(t.session, Some(1));
+    }
     #[test]
     fn observation_retains_only_finite_cues_and_specific_unknown_reasons() {
         assert!(!observation_cue("Private unrelated channel name"));
@@ -298,6 +348,9 @@ mod tests {
         assert_eq!(t.observe(Presence::Active, 90_000), Transition::None);
         assert_eq!(t.session, Some(1));
         t.observe(Presence::Inactive, 91_000);
+        for time in (94_000..136_000).step_by(3_000) {
+            t.observe(Presence::Inactive, time);
+        }
         assert_eq!(t.observe(Presence::Inactive, 136_000), Transition::End(1));
         t.observe(Presence::Active, 140_000);
         assert_eq!(t.observe(Presence::Active, 143_000), Transition::Start(2));
@@ -312,6 +365,9 @@ mod tests {
         t.observe(Presence::Inactive, 8_000);
         t.observe(Presence::Unknown, 40_000);
         assert_eq!(t.observe(Presence::Inactive, 80_000), Transition::None);
+        for time in (83_000..124_999).step_by(3_000) {
+            t.observe(Presence::Inactive, time);
+        }
         assert_eq!(t.observe(Presence::Inactive, 124_999), Transition::None);
         assert_eq!(t.observe(Presence::Inactive, 125_000), Transition::End(1));
     }

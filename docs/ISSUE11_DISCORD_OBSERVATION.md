@@ -174,6 +174,13 @@ are local acceptance artifacts, not committed private recordings/user data.
   command-wrapper compilation was not run. No physical source was qualified,
   no real audio/model tests, app install or combined build performed here.
 
+R1 additionally resets tracker debounce/grace after a sample gap over 10 seconds
+or backwards timestamp, retaining the active session. The journal's explicit
+scan intervals expose gaps; they are not continuous leave evidence. See
+[ISSUE11_REVIEW_FIXES.md](ISSUE11_REVIEW_FIXES.md) for shared source/session/token
+ownership and the required integrated native generation guard. Qualification
+promotion must preserve those guards as well as signal evidence.
+
 ## 5. Concrete promotion gate — code change, NOT user override
 
 No setting, journal marker, selected scenario, environment variable or CLI output

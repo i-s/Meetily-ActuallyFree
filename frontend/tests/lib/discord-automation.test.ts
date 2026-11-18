@@ -1,10 +1,10 @@
 import { beforeEach, describe, test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  createDiscordAutomation, discordMayStart, discordProcess, takeDiscordStartRequest,
+  createDiscordAutomation, discordMayStart, discordProcess,
   type DiscordCallStatus,
 } from '../../src/lib/discord-automation';
-import { automatedRecording, beginAutomatedRecording, endAutomatedRecording, takeAutomatedStart } from '../../src/lib/meeting-automation';
+import { automatedRecording, beginAutomatedRecording, endAutomatedRecording, takeAutomatedStart, markAutomatedStart } from '../../src/lib/meeting-automation';
 
 const store = new Map<string, string>();
 Object.assign(globalThis, {
@@ -13,6 +13,13 @@ Object.assign(globalThis, {
 });
 const active: DiscordCallStatus = { enabled: true, qualified: true, state: 'active', reason: 'test_fixture_not_mac_qualification', session_id: 'epoch:1', transition: 'start' };
 const ended: DiscordCallStatus = { ...active, state: 'inactive', transition: 'end' };
+function seed(call: { app: string; process: string }) {
+  const tagged = call.process.startsWith('discord-macos:') ? { ...call, source: 'discord', sessionId: call.process.slice('discord-macos:'.length) } : call;
+  assert.equal(markAutomatedStart(tagged), true);
+  const reserved = takeAutomatedStart()!;
+  assert.equal(beginAutomatedRecording(reserved), true);
+  return reserved;
+}
 const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
 
 function fixture() {
@@ -24,7 +31,10 @@ function fixture() {
   const errors: unknown[] = [];
   const bridge = createDiscordAutomation({
     allowed: () => allowed, status: async () => current,
-    recording: async () => ({ is_recording: recording }),
+    recording: async () => {
+      const owner = automatedRecording();
+      return { is_recording: recording, recording_lease: owner ? { generation: `fixture:${owner.token}`, owner: { source: owner.source!, session_id: owner.sessionId!, app: owner.app, process: owner.process } } : null };
+    },
     start: () => { starts++; }, stop: () => { stops++; }, error: (e) => errors.push(e),
   });
   return { bridge, set current(v: DiscordCallStatus) { current = v; }, set recording(v: boolean) { recording = v; }, set allowed(v: boolean) { allowed = v; }, get starts() { return starts; }, get stops() { return stops; }, errors };
@@ -43,9 +53,11 @@ describe('Discord production automation bridge', () => {
     const f = fixture(); f.bridge.update(active); await tick();
     assert.equal(f.starts, 1);
     const call = takeAutomatedStart();
-    assert.deepEqual(call, { app: 'Discord', process: discordProcess('epoch:1') });
-    assert.equal(takeDiscordStartRequest()?.process, call!.process);
-    assert.equal(takeDiscordStartRequest(), null);
+    assert.equal(call?.process, discordProcess('epoch:1'));
+    assert.equal(call?.source, 'discord');
+    assert.equal(call?.sessionId, 'epoch:1');
+    assert.ok(call?.token);
+    assert.equal(store.has('discordAutomationRequest'), false);
     beginAutomatedRecording(call!); f.recording = true;
     f.bridge.update({ ...active, transition: 'none' }); await tick();
     assert.equal(f.starts, 1); assert.equal(f.stops, 0);
@@ -57,7 +69,7 @@ describe('Discord production automation bridge', () => {
   });
   test('unknown, mute and reconnect do not stop; confirmed end stops only its owner once', async () => {
     const f = fixture();
-    beginAutomatedRecording({ app: 'Discord', process: discordProcess('epoch:1') }); f.recording = true;
+    seed({ app: 'Discord', process: discordProcess('epoch:1') }); f.recording = true;
     f.bridge.update({ ...active, state: 'unknown', reason: 'reconnecting', transition: 'none' }); await tick();
     assert.equal(f.stops, 0);
     f.bridge.update(active); await tick(); assert.equal(f.stops, 0);
@@ -68,7 +80,7 @@ describe('Discord production automation bridge', () => {
   test('manual recordings, Zoom owner and another Discord session are never stopped', async () => {
     for (const owner of [null, { app: 'Zoom', process: 'zoom' }, { app: 'Discord', process: discordProcess('epoch:2') }]) {
       store.clear(); const f = fixture(); f.recording = true;
-      if (owner) beginAutomatedRecording(owner);
+      if (owner) seed(owner);
       f.current = ended; f.bridge.update(ended); await tick(); assert.equal(f.stops, 0);
     }
   });
@@ -81,12 +93,12 @@ describe('Discord production automation bridge', () => {
   });
   test('fresh native snapshot rejects stale join, and disable does not stop', async () => {
     const f = fixture(); f.current = ended; f.bridge.update(active); await tick(); assert.equal(f.starts, 0);
-    beginAutomatedRecording({ app: 'Discord', process: discordProcess('epoch:1') }); f.recording = true;
+    seed({ app: 'Discord', process: discordProcess('epoch:1') }); f.recording = true;
     f.allowed = false; f.current = ended; f.bridge.update(ended); await tick(); assert.equal(f.stops, 0);
   });
   test('a stale end cannot stop after native observation was disabled or call returned', async () => {
     const f = fixture(); f.recording = true;
-    beginAutomatedRecording({ app: 'Discord', process: discordProcess('epoch:1') });
+    seed({ app: 'Discord', process: discordProcess('epoch:1') });
     f.current = { ...ended, enabled: false };
     f.bridge.update({ ...ended }); await tick(); assert.equal(f.stops, 0);
     f.current = active;

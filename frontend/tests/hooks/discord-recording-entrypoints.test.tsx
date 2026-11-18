@@ -37,7 +37,7 @@ mock.module('@/lib/recordingNotification', () => ({ showRecordingNotification: a
 
 const { useRecordingStart } = await import('../../src/hooks/useRecordingStart');
 const { createDiscordAutomation } = await import('../../src/lib/discord-automation');
-const { automatedRecording, endAutomatedRecording } = await import('../../src/lib/meeting-automation');
+const { automatedRecording, endAutomatedRecording, markAutomatedStart, automatedStartInProgress } = await import('../../src/lib/meeting-automation');
 const { launchRecording, requestRecordingStop, STOP_RECORDING_EVENT } = await import('../../src/lib/recording-launch');
 let stopRequests = 0;
 window.addEventListener(STOP_RECORDING_EVENT, () => { stopRequests++; endAutomatedRecording(); });
@@ -63,6 +63,9 @@ test('Discord event bridge drives ordinary launcher and real useRecordingStart; 
     expect(starts).toBe(1);
     expect(automatedRecording()?.process).toBe('discord-macos:fixture:1');
     await act(async () => { status = { ...status, state: 'inactive', transition: 'end' }; controller.update(status); await settle(); });
+    expect(stopRequests).toBe(0); // No native lease on the assigned base: auto-Stop is blocked.
+    expect(automatedRecording()?.source).toBe('discord');
+    await act(async () => requestRecordingStop(() => {})); // Explicit manual Stop remains ordinary.
     expect(stopRequests).toBe(1);
     expect(automatedRecording()).toBeNull();
     endAutomatedRecording(); // Same ownership revocation used by manual Stop / Don't stop it.
@@ -80,6 +83,14 @@ test('Discord event bridge drives ordinary launcher and real useRecordingStart; 
     expect(messages).toContain('Discord automatic start cancelled');
     expect(automatedRecording()).toBeNull();
 
+    // Revocation while STT loads must not clear/override a replacement Zoom request.
+    data.clear(); status = { ...status, session_id: 'fixture:3', qualified: true };
+    afterModelReady = () => { endAutomatedRecording(); markAutomatedStart({ app: 'Zoom', process: 'us.zoom.xos', source: 'zoom', sessionId: 'z2' }); };
+    controller.dispose(); controller = bridge();
+    await act(async () => { controller.update(status); await settle(); });
+    expect(starts).toBe(1);
+    expect(automatedStartInProgress()?.source).toBe('zoom');
+    expect(automatedRecording()).toBeNull();
     // Manual Start remains available even though Discord evidence is unqualified.
     afterModelReady = noop;
     await act(async () => { await manualStart(); });

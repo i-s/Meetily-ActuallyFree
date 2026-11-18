@@ -165,7 +165,8 @@ export function MeetingDetectionSettings() {
         <p className="mt-2 text-sm text-af-text-3">
           Guild voice, DM and group DM are each unqualified; this adapter cannot identify the call type.
           Mute, silence, channel/device changes and hidden or unreadable controls do not prove leave.
-          Leaving with the client open has no qualified signal. Client exit has a 45-second reconnect grace.
+          Leaving with the client open has no qualified signal. Candidate client-exit tracking has a 45-second reconnect grace;
+          automatic Stop also requires integrated native ownership.
           PTB, Canary, browser Discord, Stage and Windows are unsupported here.
           Use manual Start, Pause, Resume and Stop. Manual Stop will not rearm the same detected session.
         </p>

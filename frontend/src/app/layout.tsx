@@ -30,7 +30,7 @@ import { RecordingPostProcessingProvider } from '@/contexts/RecordingPostProcess
 import { ImportDialogProvider } from '@/contexts/ImportDialogContext'
 import { isAudioExtension, getAudioFormatsDisplayList } from '@/constants/audioFormats'
 import { loadLabsPreferences } from '@/lib/labs'
-import { automatedRecording, endAutomatedRecording, markAutomatedStart, AUTOMATION_CHANGED_EVENT } from '@/lib/meeting-automation'
+import { automatedRecording, endAutomatedRecording, markAutomatedStart, AUTOMATION_CHANGED_EVENT, reservationCurrent } from '@/lib/meeting-automation'
 import { createDiscordAutomation, type DiscordCallStatus } from '@/lib/discord-automation'
 import { getPendingCrashReport, type PendingCrashReport } from '@/services/crashReportService'
 import { WorkspaceProvider } from '@/contexts/WorkspaceContext'
@@ -332,8 +332,7 @@ export default function RootLayout({
         if (loadLabsPreferences().meetingAutomation && active_media && !showOnboarding) {
           void invoke<{ is_recording?: boolean }>('get_recording_state').then((state) => {
             if (state.is_recording) return;
-            markAutomatedStart({ app, process });
-            startRecording();
+            if (markAutomatedStart({ app, process })) startRecording();
           }).catch((error) => console.error('Could not check recording state for meeting automation:', error));
           return;
         }
@@ -374,8 +373,9 @@ export default function RootLayout({
       const call = automatedRecording();
       if (!call || call.process !== event.payload.process || !loadLabsPreferences().meetingAutomation) return;
       void invoke<{ is_recording?: boolean }>('get_recording_state').then((state) => {
+        if (!reservationCurrent(call, 'recording') || !loadLabsPreferences().meetingAutomation) return;
         if (!state.is_recording) {
-          endAutomatedRecording();
+          endAutomatedRecording(call);
           return;
         }
         toast(`${call.app} call ended`, { description: 'Meeting automation is stopping and saving the recording.' });
@@ -399,10 +399,9 @@ export default function RootLayout({
       status: () => invoke<DiscordCallStatus>('get_discord_automation_status'),
       recording: () => invoke<{ is_recording?: boolean }>('get_recording_state'),
       start: () => startRecordingAnywhere.current(),
-      stop: () => {
-        toast('Discord client closed', { description: 'Stopping and saving the recording started for this Discord call.' });
-        requestRecordingStop((href) => router.push(href));
-      },
+      // No unguarded Stop dispatcher on this standalone base. Coordinator wires
+      // stop(expectedLease) -> #10 requestRecordingStop(push, expectedLease)
+      // only with native atomic generation/owner validation in the combined tree.
       error: (error) => console.error('Discord automation:', error),
     });
     const unlisten = listen<DiscordCallStatus>('discord-call-state', (event) => bridge.update(event.payload));

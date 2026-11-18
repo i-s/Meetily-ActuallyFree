@@ -105,8 +105,10 @@ unpauses it. Generic/Zoom monitor restarts do not recreate the Discord tracker.
    gives Unknown; no connected-status text is read from messages or AXValue.
 5. Production `Tracker` uses worker-supplied monotonic milliseconds. Candidate
    Active needs two observations at least 3 seconds apart. Inactive needs 45
-   continuous observed seconds to end a session. Unknown resets both evidence
-   timers and never ends an active session, no matter how long it lasts. A
+   continuous observed seconds to end a session. A backwards timestamp or sample
+   gap over 10 seconds restarts both timers; elapsed worker suspension is not
+   evidence of join/leave. Unknown resets both evidence timers and never ends an
+   active session, no matter how long it lasts. A
    reconnect returning before confirmed end retains the same session. Device,
    channel, mute/deafen and silence are not independent lifecycle inputs.
    App epoch UUID + incrementing session number prevent PID/session reuse.
@@ -125,16 +127,22 @@ unpauses it. Generic/Zoom monitor restarts do not recreate the Discord tracker.
    `markAutomatedStart` → `launchRecording` → `useRecordingStart` path. The hook
    rechecks qualification/session/enablement after STT preparation and before
    `recordingService.startRecordingWithDevices`. Thus a revoked/stale request
-   is not downgraded into a manual capture. The dedicated request marker also
-   survives expiry of the generic pending handoff until consumed/cancelled by
-   preflight; requests older than 60 seconds cannot authorize capture.
+   is not downgraded into a manual capture. There is no Discord private request
+   marker or source priority. One common source/session/token reservation transfers
+   pending → in-flight → recording. Requests older than 60 seconds cannot capture;
+   scoped release/promotion cannot clear or adopt a replacement request.
 9. Automation-owned process keys are opaque `discord-macos:<epoch>:<session>`;
    they are **not capture target IDs** and never alter the user's audio source
    selection or broaden selected-app capture. Start still obeys #9's fail-closed
    source/model checks. Other-app and manually started recordings are not stopped.
-   End uses `requestRecordingStop` (normal Stop/save), never a private capture
-   command. Existing Pause/Resume/Stop and Don't stop it remain available.
-10. A sessionStorage per-call claim is written before dispatch. Manual Stop,
+   Automated End requires an exact native generation/owner lease and a guarded
+   Stop dispatcher. This standalone base has neither native lease nor dispatcher,
+   so Discord auto-Stop is fail-closed. #10 owns guarded normal Stop integration;
+   do not restore an unguarded `requestRecordingStop`. Explicit manual
+   Pause/Resume/Stop and Don't stop it remain available.
+10. A sessionStorage per-call tombstone is written BEFORE any async admission,
+    including when a manual take, pending/in-flight request or other owner is busy.
+    This consumes rather than queues that observed session. Manual Stop,
     failed start, Don't stop it, route reload, mute/channel/device changes and
     disable/re-enable do not rearm the same detected call. Storage failure is
     fail-closed. A genuinely new confirmed session can start. Duplicate Stop
@@ -145,10 +153,20 @@ Shared conflict surfaces with Zoom are `lib.rs`, `meeting_detection.rs`,
 `layout.tsx`, `useRecordingStart.ts`, and `MeetingDetectionSettings.tsx` plus the
 additive development-map link. Keep both adapters' settings fields when merging;
 spread/round-trip settings instead of reconstructing only known fields. Do not
-let generic process/media events adopt a Discord session. The existing
-`meeting-automation` handoff format is unchanged. No capture/audio/diarization
-interfaces are changed. A future shared lifecycle owner can consume this typed
-snapshot, but must preserve qualification, Unknown, ownership and session claims.
+let generic process/media events adopt a Discord session. R1 extends the single
+`meeting-automation` format with source/sessionId/token/requestedAt and scoped
+phase operations. Keep ONE common implementation at integration, not parallel
+Zoom/Discord owners. No native capture/audio/diarization implementation is changed
+here; #10 owns native reservation/admission and guarded Stop. The exact remaining
+cross-branch assertions and red/green results are below.
+
+## R1 review follow-up
+
+[ISSUE11_REVIEW_FIXES.md](ISSUE11_REVIEW_FIXES.md) records the separately committed
+observation journal, all four findings' red/green results, 10-second observation
+gap reset, pre-await busy-call suppression, single shared source/session/token
+reservation and exact remaining #10 native lease/guarded Stop integration tests.
+The standalone Discord root deliberately has no unguarded auto-Stop dispatcher.
 
 ## Acceptance criteria disposition
 
@@ -189,14 +207,15 @@ Frontend files must run in separate Bun 1.3.10 processes:
   and manual Start remains available without adopting automation ownership.
 - `tests/hooks/discord-settings.test.tsx`: mounted normal settings, native settings
   command, independent opt-in, live permission/Unknown reason and qualification UI.
-- Existing `tests/lib/meeting-automation.test.ts`: unchanged generic handoff.
+- `tests/lib/meeting-automation.test.ts`: shared token reservation (R1 supersedes
+  the original unguarded handoff tests).
 
 No actual audio, models, Discord IPC, Mac AX or private call fixtures are used.
 No claim of full native/macOS build, installed app or physical acceptance follows
 from these tests. Final measured results are recorded in the implementation
 handoff, not inferred from the presence of tests.
 
-### Executed results on this Linux worktree
+### Original d4da3c0 verification (historical; R1 supersedes ownership behavior)
 
 - Exact production `evidence.rs`, Rust 1.85.1 standalone test compilation:
   **5 passed, 0 failed, 0 ignored** (final formatted source).
