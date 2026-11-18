@@ -4,6 +4,17 @@ Live issue read on 2026-11-18 (body and comments endpoint, zero comments):
 **[[macOS 07/16] Автостарт и автостоп Discord](https://github.com/i-s/Meetily-ActuallyFree/issues/11)**.
 Assigned/implemented base: `4269de67c6747b2f5fce72596826c05dadbb3e1c`.
 
+## Observation-only follow-up
+
+The same final combined build can now collect bounded native, timestamped
+candidate cues/transitions and manual truth for each guild/DM/GDM scenario.
+See [ISSUE11_DISCORD_OBSERVATION.md](ISSUE11_DISCORD_OBSERVATION.md) for exact
+normal-settings entrypoints, finite export/privacy schema, reproducible manual
+matrix/comparison command, explicit disabled/absent/unsupported/active distinctions,
+and the concrete evidence/native qualification-policy promotion step.
+Architectural replacement is **not established as required**; the current
+adapter is unqualified. No override or real capture enablement was added.
+
 ## Outcome: software path implemented, automatic recording NOT qualified
 
 No actual Mac observations exist for this adapter. **No supported Discord call

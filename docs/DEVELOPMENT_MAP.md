@@ -228,6 +228,11 @@ mapped in [ISSUE11_DISCORD_AUTOMATION.md](ISSUE11_DISCORD_AUTOMATION.md).
 and group DM are individually unqualified, and leave with the client open has no
 validated signal. Process/mic activity and missing UI never authorize capture or
 prove leave. This adapter does not alter the concurrent Zoom event path.
+Its observation-only native journal, finite manual-truth markers, privacy-safe
+export and exact guild/DM/GDM comparison/promotion protocol are documented in
+[ISSUE11_DISCORD_OBSERVATION.md](ISSUE11_DISCORD_OBSERVATION.md). Reader availability,
+observation enablement, client absence, candidate Active and qualified call support
+are distinct; no diagnostic setting can unlock unqualified recording.
 
 Issue #5 artifact-only Actions build (pinned source/tree vs workflow SHA),
 sidecar ordering, locked dependencies, model provenance, same-account backup/

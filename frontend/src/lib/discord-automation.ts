@@ -10,6 +10,11 @@ export interface DiscordCallStatus {
   session_id: string | null;
   transition: 'start' | 'end' | 'none';
   qualified: boolean;
+  platform_supported?: boolean;
+  client_present?: boolean | null;
+  recording_active?: boolean;
+  evidence?: { complete: boolean; connected: boolean; disconnect: boolean; reconnect: boolean; join: boolean; connected_pair: boolean };
+  cue_transition?: string;
 }
 const PREFIX = 'discord-macos:';
 const CLAIM_KEY = 'discordAutomationClaim';

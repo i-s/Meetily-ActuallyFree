@@ -11,6 +11,18 @@ pub enum Presence {
 pub struct Probe {
     pub presence: Presence,
     pub reason: &'static str,
+    pub client_present: Option<bool>,
+    pub facts: Facts,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct Facts {
+    pub complete: bool,
+    pub connected: bool,
+    pub disconnect: bool,
+    pub reconnect: bool,
+    pub join: bool,
+    pub connected_pair: bool,
 }
 
 #[derive(Default)]
@@ -43,9 +55,31 @@ fn normalized(label: &str) -> String {
         .to_lowercase()
 }
 
+/// Filter before snapshot retention: unrelated control labels never enter it.
+pub fn observation_cue(label: &str) -> bool {
+    matches!(
+        normalized(label).as_str(),
+        "voice connected"
+            | "голосовая связь подключена"
+            | "disconnect"
+            | "отключиться"
+            | "rtc connecting"
+            | "connecting"
+            | "reconnecting"
+            | "подключение"
+            | "переподключение"
+            | "join voice"
+            | "start voice call"
+            | "присоединиться к голосовому каналу"
+    )
+}
+
 pub fn classify(snapshot: &Snapshot) -> Probe {
-    // Exact control labels only, never channel titles, participants or messages.
-    // Do not broaden this to Disconnect alone: ringing can expose a hangup button.
+    let mut facts = Facts {
+        complete: snapshot.complete && snapshot.issues.is_empty(),
+        ..Facts::default()
+    };
+    // Only finite exact control cues survive this function. Labels are dropped.
     for window in &snapshot.windows {
         let labels: Vec<_> = window
             .iter()
@@ -68,22 +102,49 @@ pub fn classify(snapshot: &Snapshot) -> Probe {
                     | "переподключение"
             )
         });
-        if connected && disconnect && !reconnect && snapshot.complete {
-            return Probe {
-                presence: Presence::Active,
-                reason: "connected_controls_candidate",
-            };
-        }
+        facts.connected |= connected;
+        facts.disconnect |= disconnect;
+        facts.reconnect |= reconnect;
+        facts.join |= labels.iter().any(|s| {
+            matches!(
+                s.as_str(),
+                "join voice" | "start voice call" | "присоединиться к голосовому каналу"
+            )
+        });
+        facts.connected_pair |= connected && disconnect && !reconnect;
     }
-    // An absent toolbar is NOT leave. No idle AX shape has been qualified on a Mac.
-    // In particular, Join Voice/Start Call elsewhere in the client are not proof.
+    let reason = if let Some(issue) = snapshot.issues.first() {
+        match issue {
+            ScanIssue::Deadline => "ax_scan_timeout",
+            ScanIssue::NodeLimit => "ax_node_limit",
+            ScanIssue::ChildLimit => "ax_child_limit",
+            ScanIssue::DepthLimit => "ax_depth_limit",
+            ScanIssue::Ax(_, _) => "ax_read_failed",
+            ScanIssue::Missing(_) => "ax_attribute_missing",
+            ScanIssue::Invalid(_) => "ax_attribute_invalid",
+        }
+    } else if !snapshot.complete {
+        "ax_incomplete"
+    } else if facts.reconnect {
+        "reconnect_controls_candidate"
+    } else if facts.connected_pair {
+        "connected_controls_candidate"
+    } else if facts.disconnect {
+        "disconnect_without_connected_unknown"
+    } else if facts.join {
+        "join_controls_only_unknown"
+    } else {
+        "controls_not_confirmed"
+    };
     Probe {
-        presence: Presence::Unknown,
-        reason: if snapshot.issues.is_empty() {
-            "controls_not_confirmed"
+        presence: if facts.complete && facts.connected_pair && !facts.reconnect {
+            Presence::Active
         } else {
-            "ax_incomplete_or_limited"
+            Presence::Unknown
         },
+        reason,
+        client_present: Some(true),
+        facts,
     }
 }
 
@@ -140,6 +201,29 @@ impl Tracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn observation_retains_only_finite_cues_and_specific_unknown_reasons() {
+        assert!(!observation_cue("Private unrelated channel name"));
+        assert!(observation_cue("Voice Connected"));
+        let mut data = snapshot(&[&[
+            ("Private unrelated channel name", true),
+            ("Disconnect", true),
+        ]]);
+        let p = classify(&data);
+        assert_eq!(p.reason, "disconnect_without_connected_unknown");
+        assert!(p.facts.disconnect);
+        assert!(!p.facts.connected_pair);
+        for (issue, reason) in [
+            (ScanIssue::Deadline, "ax_scan_timeout"),
+            (ScanIssue::NodeLimit, "ax_node_limit"),
+            (ScanIssue::Ax("AXRole", -25204), "ax_read_failed"),
+        ] {
+            data.complete = false;
+            data.issues = vec![issue];
+            assert_eq!(classify(&data).reason, reason);
+            assert_eq!(classify(&data).presence, Presence::Unknown);
+        }
+    }
     fn snapshot(windows: &[&[(&str, bool)]]) -> Snapshot {
         Snapshot {
             complete: true,

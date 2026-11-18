@@ -9,6 +9,7 @@ import { toast } from "sonner"
 import { useLabs } from "@/hooks/useLabs"
 import { setLabsFeature } from "@/lib/labs-features"
 import { listen } from "@tauri-apps/api/event"
+import { DiscordObservation } from "./DiscordObservation"
 import type { DiscordCallStatus } from "@/lib/discord-automation"
 
 interface MeetingDetectionSettings {
@@ -168,6 +169,7 @@ export function MeetingDetectionSettings() {
           PTB, Canary, browser Discord, Stage and Windows are unsupported here.
           Use manual Start, Pause, Resume and Stop. Manual Stop will not rearm the same detected session.
         </p>
+        <DiscordObservation status={discord} automationOn={labs.meetingAutomation} />
       </section>
 
       <div className="flex items-start gap-4 rounded-2xl border border-af-border bg-af-panel-2/40 p-5">

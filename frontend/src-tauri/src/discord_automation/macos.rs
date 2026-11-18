@@ -175,7 +175,9 @@ unsafe fn tree(
             let mut labels = Vec::new();
             for name in ["AXTitle", "AXDescription", "AXHelp"] {
                 if let Some(label) = text(node.0, name, budget)? {
-                    labels.push(label);
+                    if observation_cue(&label) {
+                        labels.push(label);
+                    }
                 }
             }
             if !labels.is_empty() {
@@ -269,6 +271,8 @@ pub fn probe() -> Probe {
         return Probe {
             presence: Presence::Unknown,
             reason: "process_inventory_unavailable",
+            client_present: None,
+            facts: Facts::default(),
         };
     }
     let pids: Vec<_> = system
@@ -287,17 +291,23 @@ pub fn probe() -> Probe {
             return Probe {
                 presence: Presence::Unknown,
                 reason: "client_identity_unreadable",
+                client_present: None,
+                facts: Facts::default(),
             };
         }
         return Probe {
             presence: Presence::Inactive,
             reason: "stable_client_not_running",
+            client_present: Some(false),
+            facts: Facts::default(),
         };
     }
     if !accessibility_trusted() {
         return Probe {
             presence: Presence::Unknown,
             reason: "accessibility_permission_required",
+            client_present: Some(true),
+            facts: Facts::default(),
         };
     }
     let mut budget = Budget {
@@ -308,6 +318,8 @@ pub fn probe() -> Probe {
         return Probe {
             presence: Presence::Unknown,
             reason: "multiple_clients_unqualified",
+            client_present: Some(true),
+            facts: Facts::default(),
         };
     }
     classify(&unsafe { inspect(pids[0], &mut budget) })

@@ -7,7 +7,8 @@ Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
 mock.module('@tauri-apps/api/core', () => ({ invoke: async (name: string, args?: any) => {
   if (name === 'get_meeting_detection_settings') return settings;
   if (name === 'set_meeting_detection_settings') { settings = args.settings; return; }
-  if (name === 'get_discord_automation_status') return { enabled: false, qualified: false, state: 'unknown', reason: 'disabled', session_id: null, transition: 'none' };
+  if (name === 'get_discord_observation') return null;
+  if (name === 'get_discord_automation_status') return { enabled: false, qualified: false, platform_supported: false, client_present: null, state: 'unknown', reason: 'disabled', session_id: null, transition: 'none' };
   throw new Error(`unexpected ${name}`);
 } }));
 mock.module('@tauri-apps/api/event', () => ({ listen: async (_: string, callback: any) => { listener = callback; return () => {}; } }));
