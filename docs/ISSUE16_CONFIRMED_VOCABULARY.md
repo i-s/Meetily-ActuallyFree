@@ -223,3 +223,47 @@ gates. Coordinator owns independent review and any build/physical allocations.
   pressure. No cause/ownership was inferred and no unrelated process was stopped.
   A formatter version probe was stopped after stalling; no automated formatting
   completion is claimed.
+
+## R1: canonical-slot invalidation and upgrade (2026-11-18)
+
+Independent review reproduced stale approval with `recursive_triggers=OFF`:
+`INSERT OR REPLACE` of canonical `id='1'` with NULL/empty bypassed the old insert
+condition and its implicit conflict delete did not fire a delete trigger. Moving
+`id` into/out of the canonical slot did not fire the vocabulary-column-only
+update trigger either. Actual `approved_global` could still return old terms and
+revision after the canonical dictionary disappeared.
+
+Forward migration `20261118001601_vocabulary_canonical_slot.sql` leaves the
+already-applied `01600` file/checksum unchanged. Its replacement insert trigger
+invalidates every canonical insertion, including NULL/empty/equal-text REPLACE.
+The update trigger watches both `id` and `whisperVocabulary`, invalidating ID
+moves into/out of the canonical slot and NULL-aware actual value changes. Deletes
+retain their canonical invalidation. Unrelated rows and canonical no-op updates
+do not alter approval or revision. Explicit confirmation still restores its proof
+transactionally; a duplicate confirmation keeps its approved spelling/revision.
+Loaded-revision CAS rejects a stale save after invalidation, even if text matches.
+
+**Historical recovery limit:** `01600` has no event journal proving that a current
+matching dictionary was never removed/replaced/moved and restored. Membership or
+equal current text cannot establish continued approval. On upgrade, every
+nonempty old approval snapshot is therefore cleared once and its revision is
+incremented, including apparently valid snapshots. Empty snapshots need no reset.
+The migration never restores removed terms or rewrites canonical/noncanonical
+`transcript_settings` rows: current legacy ASR contents are preserved exactly.
+Users must review/Save or Remember again to establish new approval. Past model
+requests/results cannot be retroactively validated or reconstructed from this
+state. Normal SQLx startup applies this new migration after the existing one;
+there is no replay or checksum rewrite of `01600`.
+
+R1 verification: the original migration reproduced **6 failures / 1 passing
+unrelated-row control** before implementation. Final warm portable native suite:
+**45 passed / 0 failed / 0 ignored**, including 8 R1 tests for NULL/empty/equal-text
+REPLACE, out/back and into-slot ID moves, UPDATE OR REPLACE conflicts, unrelated
+writes/no-ops, stale revision CAS, reconfirmation/retry, and upgrade after intact,
+NULL-replaced, moved-out, and out/back historical states. Assertions call actual
+production `approved_global`; upgrade fixtures apply real `01600` then `01601`
+and compare all stored ASR row IDs/terms before/after. Existing persistence,
+ASR-dispatch, Notes/links/history tests run against both migrations. No frontend,
+Codex, desktop/Next, real-model/service or physical gate was rerun for this
+migration-only fix; previous qualification limits remain unchanged. No #15/#17
+work is included.

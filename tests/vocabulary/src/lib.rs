@@ -26,10 +26,15 @@ mod vocabulary;
 mod tests {
     use super::vocabulary::VocabularyRepository as V;
     use sqlx::sqlite::SqlitePoolOptions;
-    pub(super) async fn pool() -> sqlx::SqlitePool {
+    pub(super) async fn pool_01600() -> sqlx::SqlitePool {
         let p = SqlitePoolOptions::new().max_connections(1).connect("sqlite::memory:").await.unwrap();
         sqlx::query("CREATE TABLE transcript_settings(id TEXT PRIMARY KEY, provider TEXT, model TEXT, whisperVocabulary TEXT)").execute(&p).await.unwrap();
         sqlx::raw_sql(include_str!("../../../frontend/src-tauri/migrations/20261118001600_vocabulary_approval.sql")).execute(&p).await.unwrap();
+        p
+    }
+    pub(super) async fn pool() -> sqlx::SqlitePool {
+        let p = pool_01600().await;
+        sqlx::raw_sql(include_str!("../../../frontend/src-tauri/migrations/20261118001601_vocabulary_canonical_slot.sql")).execute(&p).await.unwrap();
         p
     }
     async fn replace(p:&sqlx::SqlitePool, expected:&str, raw:&str)->Result<Option<String>,String> {
@@ -110,6 +115,7 @@ mod tests {
         let p=SqlitePoolOptions::new().max_connections(1).connect_with(opts.clone()).await.unwrap();
         sqlx::query("CREATE TABLE transcript_settings(id TEXT PRIMARY KEY, provider TEXT, model TEXT, whisperVocabulary TEXT)").execute(&p).await.unwrap();
         sqlx::raw_sql(include_str!("../../../frontend/src-tauri/migrations/20261118001600_vocabulary_approval.sql")).execute(&p).await.unwrap();
+        sqlx::raw_sql(include_str!("../../../frontend/src-tauri/migrations/20261118001601_vocabulary_canonical_slot.sql")).execute(&p).await.unwrap();
         V::confirm_global(&p,"Елена OpenAPI").await.unwrap();
         let saved=V::approved_global(&p).await.unwrap(); p.close().await;
         let reopened=SqlitePoolOptions::new().max_connections(1).connect_with(opts).await.unwrap();
@@ -189,3 +195,6 @@ mod commands {
         assert_eq!(empty.global,""); assert_eq!(empty.approved_global,"");
     }
 }
+
+#[cfg(test)]
+mod approval_migration;
