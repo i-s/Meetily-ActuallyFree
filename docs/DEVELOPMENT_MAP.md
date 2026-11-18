@@ -115,6 +115,13 @@ source labels rather than guessing a speaker or switching engines.
 
 ## 3. Post-call processing and model selection
 
+Issue #12's live/library Notes editor, session-keyed autosave, transactional
+save/recovery association, independent data ownership, revisioned read interfaces
+for #13/#15/#18, portable coverage and deferred physical Mac gates are documented
+in [ISSUE12_NOTES.md](ISSUE12_NOTES.md). Read it before changing Notes or copying
+live data during Stop. A Notes draft is not speech, a title is not a session key,
+and a JS completion callback is not the owner of its native association.
+
 Summary-generated title ownership, placeholder rejection and completion refresh
 are documented in [SUMMARY_GENERATED_TITLES.md](SUMMARY_GENERATED_TITLES.md).
 

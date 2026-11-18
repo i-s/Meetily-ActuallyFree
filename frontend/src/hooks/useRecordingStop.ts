@@ -13,8 +13,8 @@ import {
   applyPinnedSummaryLanguageToMeeting,
   detectAndCacheSummaryLanguage,
 } from '@/lib/summary-language-preferences';
-import { endLiveSession, finalLiveTitle, readLiveNotes, writeLiveTitle } from '@/lib/live-session';
-import { announceChange, saveMeetingNotes } from '@/lib/workspace-api';
+import { endLiveSession, finalLiveTitle } from '@/lib/live-session';
+import { announceChange } from '@/lib/workspace-api';
 import { endAutomatedRecording } from '@/lib/meeting-automation';
 
 type SummaryStatus = 'idle' | 'processing' | 'summarizing' | 'regenerating' | 'completed' | 'error';
@@ -255,23 +255,9 @@ export function useRecordingStop(
             } catch (error) {
               console.warn('Could not file this meeting into its group', error);
             }
-            // Notes typed during the call become the meeting's notes. If that
-            // fails they stay in the draft rather than being dropped.
-            const liveNotes = readLiveNotes();
-            let notesSaved = true;
-            if (liveNotes?.markdown.trim()) {
-              try {
-                await saveMeetingNotes(meetingId, liveNotes.markdown, liveNotes.json);
-              } catch (error) {
-                notesSaved = false;
-                console.warn('Could not save the notes taken during the call', error);
-                toast.warning('Your call notes were not saved to the meeting', {
-                  description: 'Copy them from the Notes tab on the recorder before starting another recording.',
-                });
-              }
-            }
-            if (notesSaved) endLiveSession();
-            else writeLiveTitle(null);
+            // Native save/recovery attaches Notes by recording folder in the
+            // meeting transaction. Never copy an unscoped browser draft here.
+            endLiveSession();
           }
           if (!meetingId) {
             console.error('No meeting_id in response:', responseData);

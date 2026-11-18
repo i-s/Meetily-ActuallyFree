@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import tempfile
 import tomllib
+import sys
 
 ROOT = Path(__file__).resolve().parents[2]
 AUDIO = ROOT / 'frontend/src-tauri/src/audio'
@@ -47,6 +48,11 @@ serde={{version="={versions['serde']}",features=["derive"]}}
         shutil.copyfile(ROOT / 'Cargo.lock', work / 'Cargo.lock')
         (work / 'src/incremental_saver.rs').write_text((AUDIO / 'incremental_saver.rs').read_text().replace('#[tauri::command]', ''))
         (work / 'src/api.rs').write_text('use chrono::{DateTime,Utc}; use crate::{AppHandle,Runtime}; use crate::state::AppState; use crate::repository::TranscriptsRepository;\nuse log::{debug as log_debug,error as log_error,info as log_info,warn as log_warn};\n' + data_type('TranscriptSegment') + '\n' + data_type('TranscriptSearchResult') + '\n' + command)
+        notes_dir = ROOT / 'frontend/src-tauri/src/database/repositories'
+        for name in ('meeting_notes', 'notes_document'):
+            source = (notes_dir / f'{name}.rs').read_text().replace('#[tauri::command]', '')
+            source = source.replace('../../../migrations/20261118001200_recording_notes.sql', str(ROOT / 'frontend/src-tauri/migrations/20261118001200_recording_notes.sql'))
+            (work / f'src/{name}.rs').write_text(source)
         (work / 'src/lib.rs').write_text(f'''#![allow(dead_code)]
 extern crate self as tauri;
 pub trait Runtime {{}}
@@ -60,7 +66,11 @@ mod state {{
     impl DbManager {{ pub fn pool(&self)->&sqlx::SqlitePool{{&self.0}} }}
 }}
 mod api;
-mod database {{ pub mod repositories {{ pub mod person {{
+pub use database::repositories::notes_document;
+mod database {{ pub mod repositories {{
+    #[path="{work}/src/meeting_notes.rs"] pub mod meeting_notes;
+    #[path="{work}/src/notes_document.rs"] pub mod notes_document;
+    pub mod person {{
     pub struct PeopleRepository;
     impl PeopleRepository {{ pub async fn link_named_speakers(_tx:&mut sqlx::Transaction<'_,sqlx::Sqlite>,_meeting:&str)->Result<(),sqlx::Error>{{Ok(())}} }}
 }} }} }}
@@ -77,7 +87,7 @@ mod audio {{
 }}
 #[cfg(test)] #[path="{ROOT}/frontend/tests/native/recovery-api.rs"] mod recovery_api_tests;
 '''.replace(repr(ffmpeg), '"' + ffmpeg + '"'))
-        subprocess.run(['cargo', 'test', '--manifest-path', str(work / 'Cargo.toml'), 'recovery', '--', '--test-threads=1'], check=True)
+        subprocess.run(['cargo', 'test', '--manifest-path', str(work / 'Cargo.toml'), *(sys.argv[1:] or ['recovery']), '--', '--test-threads=1'], check=True)
         allowed = {(p['name'], p['version'], p.get('source')) for p in lock['package']}
         actual = tomllib.loads((work / 'Cargo.lock').read_text())
         assert all(p['name'] == 'meetily-recovery-db' or (p['name'], p['version'], p.get('source')) in allowed for p in actual['package'])

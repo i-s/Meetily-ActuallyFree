@@ -8,28 +8,32 @@ use sqlx::SqlitePool;
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MeetingNotes {
+    pub source: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub markdown: Option<String>,
     /// BlockNote document, kept so formatting round-trips exactly.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub json: Option<serde_json::Value>,
     pub updated_at: String,
+    pub revision: i64,
 }
 
 pub struct MeetingNotesRepository;
 
 impl MeetingNotesRepository {
     pub async fn get(pool: &SqlitePool, meeting_id: &str) -> Result<Option<MeetingNotes>, sqlx::Error> {
-        let row = sqlx::query_as::<_, (Option<String>, Option<String>, String)>(
-            "SELECT notes_markdown, notes_json, updated_at FROM meeting_notes WHERE meeting_id = ?",
+        let row = sqlx::query_as::<_, (Option<String>, Option<String>, String, i64)>(
+            "SELECT notes_markdown, notes_json, updated_at, revision FROM meeting_notes WHERE meeting_id = ?",
         )
         .bind(meeting_id)
         .fetch_optional(pool)
         .await?;
-        Ok(row.map(|(markdown, json, updated_at)| MeetingNotes {
+        Ok(row.map(|(markdown, json, updated_at, revision)| MeetingNotes {
+            source: "user_notes",
             markdown,
             json: json.and_then(|raw| serde_json::from_str(&raw).ok()),
             updated_at,
+            revision,
         }))
     }
 
@@ -52,7 +56,7 @@ impl MeetingNotesRepository {
             "INSERT INTO meeting_notes (meeting_id, notes_markdown, notes_json, created_at, updated_at) \
              VALUES (?, ?, ?, datetime('now'), datetime('now')) \
              ON CONFLICT(meeting_id) DO UPDATE SET notes_markdown = excluded.notes_markdown, \
-                 notes_json = excluded.notes_json, updated_at = excluded.updated_at",
+                 notes_json = excluded.notes_json, updated_at = excluded.updated_at, revision = meeting_notes.revision + 1",
         )
         .bind(meeting_id)
         .bind(markdown)

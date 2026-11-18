@@ -15,6 +15,7 @@ async fn state() -> AppState {
         .unwrap();
     sqlx::raw_sql("CREATE TABLE meetings (id TEXT PRIMARY KEY, title TEXT, created_at TEXT, updated_at TEXT, folder_path TEXT, title_is_manual INTEGER); CREATE TABLE transcripts (id TEXT PRIMARY KEY, meeting_id TEXT, transcript TEXT, timestamp TEXT, audio_start_time REAL, audio_end_time REAL, duration REAL, speaker TEXT);")
         .execute(&pool).await.unwrap();
+    crate::notes_document::tests::create_notes_schema(&pool).await;
     AppState {
         db_manager: DbManager(pool),
     }
@@ -134,4 +135,24 @@ async fn recovery_command_then_real_database_failure_and_retry_keeps_audio_and_r
         std::fs::read(dir.path().join("audio.mp4")).unwrap(),
         audio_before
     );
+}
+
+#[tokio::test]
+async fn notes_commands_survive_native_stop_save_and_recovery_retry() {
+    let state = state().await;
+    let dir = tempfile::tempdir().unwrap();
+    let folder = dir.path().to_str().unwrap();
+    finalized_audio(dir.path()).await;
+    let target = format!("recording:{folder}");
+    let json = Some(serde_json::json!([{ "type": "paragraph", "content": "My own idea" }]));
+    assert_eq!(crate::notes_document::api_write_notes_document(State(&state), target.clone(), "My own idea".into(), json.clone(), 0).await.unwrap(), 1);
+    let saved = save(&state, folder, "notes-command-recovery").await.unwrap();
+    let meeting_id = saved["meeting_id"].as_str().unwrap().to_string();
+    assert_eq!(crate::notes_document::api_notes_recording_target(State(&state), meeting_id.clone()).await.unwrap(), Some(target.clone()));
+    let notes = crate::notes_document::api_read_notes_document(State(&state), format!("meeting:{meeting_id}")).await.unwrap().unwrap();
+    assert_eq!(notes.markdown.as_deref(), Some("My own idea"));
+    assert_eq!(notes.json, json);
+    crate::notes_document::api_write_notes_document(State(&state), target, "After Stop".into(), None, 1).await.unwrap();
+    save(&state, folder, "notes-command-recovery").await.unwrap();
+    assert_eq!(crate::notes_document::api_read_notes_document(State(&state), format!("meeting:{meeting_id}")).await.unwrap().unwrap().markdown.as_deref(), Some("After Stop"));
 }
