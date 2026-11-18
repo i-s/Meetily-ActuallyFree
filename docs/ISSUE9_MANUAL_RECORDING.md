@@ -223,6 +223,70 @@ Actual 2026-11-18 checks:
   initially exposed a Rust iterator ownership compile error; it was corrected
   and both recovery suites rerun successfully.
 
+## R2 follow-up: linear checkpoint cleanup (2026-11-18)
+
+R2 confirmed the four R1 fixes, then found a cleanup I/O regression: the full
+playback SHA-256 was recalculated before each checkpoint unlink. Normal awaited
+Stop and recovery both reach `incremental_saver::cleanup_checkpoints` →
+`track_commit::cleanup_checkpoint_track`. The follow-up changes only this track
+module and this note; commit-proof format and capture/recovery interfaces stay
+unchanged.
+
+Cleanup now hashes the output once and each remaining checkpoint once, proving
+**all inputs before deleting any**. Reads use open file handles, bracketed by
+identity/metadata checks. A retained output handle pins its identity; checkpoint
+handles are short-lived to bound open descriptors. Before each unlink, bounded
+metadata checks compare regular-file type, length, modification time and stable
+identity (Unix device/inode plus nanosecond ctime; Windows volume/file index and
+write time, with deny-write/delete validation handles). Any mismatch, missing
+file, metadata/open error or unsupported identity preserves remaining inputs.
+Unknown artifacts and pending tails remain outside deletion authority. Existing
+proof validation in the command adds one other full pass; there is no full-output
+hash in either deletion loop.
+
+Deterministic tests count **actual bytes fed to SHA-256**, not elapsed time or
+inferred file sizes. Folder-scoped accounting crosses `spawn_blocking` and
+excludes setup/encoding and other fixtures. With real FFmpeg 7.0.2 MP4 fixtures:
+
+| Checkpoints | Output bytes O | Remaining input bytes I | Old cleanup helper | New helper (limit O+I) | Old command | New command (limit 2×(O+I)) |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | 18,059 | 18,059 | 72,236 | 36,118 | 108,354 | 72,236 |
+| 4 | 69,830 | 72,236 | 493,622 | 142,066 | 635,688 | 284,132 |
+| 12 | 207,886 | 216,708 | 3,135,934 | 424,594 | **3,560,528** | **849,188** |
+| 24 | 414,970 | 433,416 | 11,241,082 | 848,386 | 12,089,468 | 1,696,772 |
+
+Both scaling tests fail against the original `ed96efa` cleanup routine and pass
+with this patch; every green measurement equals its linear upper bound. These
+are hash-I/O counts, not a macOS Stop-duration benchmark. Per-file metadata work
+and stored stamps are O(checkpoint count), with bounded descriptors. Summed over
+tracks, content work is linear in total output and remaining checkpoint bytes.
+
+Controls cover changed last input before deletion (nothing deleted), absent
+proof (nothing deleted/hashed), same-content output/input inode replacement
+after validation, same-length input mutation with restored mtime (ctime catches
+it), output mutation after the first unlink, and partial retry. The latter keeps
+three inputs, restores/revalidates output and hashes exactly **124,007 bytes**
+(output plus only those three inputs). Existing conflict, interrupted promotion,
+pending-tail, partial-cleanup, normal Stop and recovery/database tests remain.
+
+Affected portable production-path runs pass: **43 shutdown/storage/Stop/recovery
+Rust tests**, and **13 native recovery-command/SQLite/FFmpeg tests**. No frontend,
+model, device or physical qualification is implied; unrelated suites were not
+rerun for this native-only patch. Evidence logs are
+`/tmp/issue9-r2-command-scaling-red.log`, `/tmp/issue9-r2-cleanup-green.log` and
+`/tmp/issue9-r2-recovery-green.log` in the task environment.
+
+Concurrency limit: the application must finish checkpoint writing before
+cleanup, and ordinary filesystem identity/mtime/ctime reporting must be reliable.
+The final metadata check and unlink are not a portable atomic compare-and-unlink;
+a hostile/external writer racing that gap, coarse/stale network metadata, or
+privileged metadata manipulation is not excluded. Detected ambiguity stops
+cleanup; retry always obtains fresh content proof. Windows denies writes while
+validation handles are open, but checkpoint handles must close before unlink,
+so no universal external-writer exclusion is claimed. Linux production-module
+tests exercised the Unix guards. The macOS and Windows branches have not been
+compiled or physically exercised in this environment.
+
 ## Remaining limits and final combined gate
 
 - No physical audio, real speech/model, two-Mac latency, acoustic separation,

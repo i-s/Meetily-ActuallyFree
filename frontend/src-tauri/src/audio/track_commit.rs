@@ -28,6 +28,39 @@ pub(super) struct ValidatedTrack {
     pub duration_seconds: f64,
 }
 
+#[cfg(test)]
+static HASH_WORK: std::sync::Mutex<Vec<(PathBuf, u64)>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+struct HashWork(PathBuf);
+
+#[cfg(test)]
+impl HashWork {
+    fn start(folder: &Path) -> Self {
+        HASH_WORK.lock().unwrap().push((folder.to_path_buf(), 0));
+        Self(folder.to_path_buf())
+    }
+    fn bytes(&self) -> u64 {
+        HASH_WORK
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(folder, _)| folder == &self.0)
+            .unwrap()
+            .1
+    }
+}
+
+#[cfg(test)]
+impl Drop for HashWork {
+    fn drop(&mut self) {
+        HASH_WORK
+            .lock()
+            .unwrap()
+            .retain(|(folder, _)| folder != &self.0);
+    }
+}
+
 fn fingerprint(path: &Path) -> Result<Fingerprint, String> {
     let metadata =
         std::fs::symlink_metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -38,12 +71,26 @@ fn fingerprint(path: &Path) -> Result<Fingerprint, String> {
         ));
     }
     let mut file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    fingerprint_file(path, &mut file, metadata.len())
+}
+
+fn fingerprint_file(
+    path: &Path,
+    file: &mut std::fs::File,
+    bytes: u64,
+) -> Result<Fingerprint, String> {
     let mut digest = Sha256::new();
     let mut buffer = [0u8; 64 * 1024];
     loop {
         let count = file.read(&mut buffer).map_err(|e| e.to_string())?;
         if count == 0 {
             break;
+        }
+        #[cfg(test)]
+        for (folder, bytes) in HASH_WORK.lock().unwrap().iter_mut() {
+            if path.starts_with(folder) {
+                *bytes += count as u64;
+            }
         }
         digest.update(&buffer[..count]);
     }
@@ -53,7 +100,7 @@ fn fingerprint(path: &Path) -> Result<Fingerprint, String> {
             .ok_or("Missing audio basename")?
             .to_string_lossy()
             .into_owned(),
-        bytes: metadata.len(),
+        bytes,
         sha256: format!("{:x}", digest.finalize()),
     })
 }
@@ -406,20 +453,180 @@ pub(super) fn commit_checkpoint_track(
     Ok(proof.inputs.len() as u32)
 }
 
+// Metadata is a change guard, not content proof. Hash once through an open
+// handle, bracket that read with identity/version checks, then retain the stamp
+// for constant-size checks before unlink. Ordinary external writes/replacements
+// invalidate the stamp; hostile writers racing the final check are not excluded
+// by filesystem metadata (there is no portable compare-and-unlink operation).
+#[derive(Debug, PartialEq)]
+struct FileStamp {
+    bytes: u64,
+    modified: std::time::SystemTime,
+    identity: (u64, u64),
+    changed: (i64, i64),
+}
+
+impl FileStamp {
+    fn from_file(file: &std::fs::File) -> Result<Self, String> {
+        Self::from_metadata(&file.metadata().map_err(|e| e.to_string())?, file)
+    }
+
+    fn from_metadata(metadata: &std::fs::Metadata, _file: &std::fs::File) -> Result<Self, String> {
+        if !metadata.file_type().is_file() || metadata.len() == 0 {
+            return Err("Cleanup requires a nonempty regular file".into());
+        }
+        #[cfg(unix)]
+        let (identity, changed) = {
+            use std::os::unix::fs::MetadataExt;
+            (
+                (metadata.dev(), metadata.ino()),
+                (metadata.ctime(), metadata.ctime_nsec()),
+            )
+        };
+        #[cfg(windows)]
+        let (identity, changed) = {
+            use std::os::windows::io::AsRawHandle;
+            // Stable Win32 handle identity; std's file-index metadata API is
+            // not stable on the project's Rust baseline. Open handles exclude
+            // concurrent writers on Windows until their validation finishes.
+            #[repr(C)]
+            #[derive(Default)]
+            struct FileInformation {
+                attributes: u32,
+                created: [u32; 2],
+                accessed: [u32; 2],
+                written: [u32; 2],
+                volume: u32,
+                size_high: u32,
+                size_low: u32,
+                links: u32,
+                index_high: u32,
+                index_low: u32,
+            }
+            #[link(name = "kernel32")]
+            extern "system" {
+                fn GetFileInformationByHandle(
+                    handle: *mut std::ffi::c_void,
+                    info: *mut FileInformation,
+                ) -> i32;
+            }
+            let mut info = FileInformation::default();
+            // The live File owns this handle; repr(C) matches the Win32
+            // BY_HANDLE_FILE_INFORMATION layout and info is writable here.
+            if unsafe { GetFileInformationByHandle(_file.as_raw_handle(), &mut info) } == 0 {
+                return Err(std::io::Error::last_os_error().to_string());
+            }
+            (
+                (
+                    info.volume as u64,
+                    ((info.index_high as u64) << 32) | info.index_low as u64,
+                ),
+                (info.written[1] as i64, info.written[0] as i64),
+            )
+        };
+        #[cfg(not(any(unix, windows)))]
+        return Err("Stable cleanup file identity is unavailable on this platform".into());
+        #[cfg(any(unix, windows))]
+        Ok(Self {
+            bytes: metadata.len(),
+            modified: metadata.modified().map_err(|e| e.to_string())?,
+            identity,
+            changed,
+        })
+    }
+
+    fn at(path: &Path) -> Result<Self, String> {
+        let metadata = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+        if !metadata.file_type().is_file() {
+            return Err("Cleanup path is not a regular file".into());
+        }
+        let file = open_cleanup_file(path)?;
+        let stamp = Self::from_file(&file)?;
+        #[cfg(unix)]
+        if stamp != Self::from_metadata(&metadata, &file)? {
+            return Err("Cleanup path changed while opening".into());
+        }
+        Ok(stamp)
+    }
+
+    fn check(&self, path: &Path) -> Result<(), String> {
+        if *self != Self::at(path)? {
+            return Err(
+                "Audio identity or metadata changed; remaining checkpoints preserved".into(),
+            );
+        }
+        Ok(())
+    }
+}
+
+fn open_cleanup_file(path: &Path) -> Result<std::fs::File, String> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.share_mode(1); // FILE_SHARE_READ: no writes/replacement while held.
+    }
+    options.open(path).map_err(|e| e.to_string())
+}
+
+fn validate_cleanup_file(
+    path: &Path,
+    expected: &Fingerprint,
+) -> Result<(std::fs::File, FileStamp), String> {
+    let mut file = open_cleanup_file(path)?;
+    let before = FileStamp::from_file(&file)?;
+    before.check(path)?;
+    if !same_content(&fingerprint_file(path, &mut file, before.bytes)?, expected) {
+        return Err("Audio content changed; remaining checkpoints preserved".into());
+    }
+    if before != FileStamp::from_file(&file)? {
+        return Err("Audio changed during validation; remaining checkpoints preserved".into());
+    }
+    before.check(path)?;
+    Ok((file, before))
+}
+
+#[cfg(test)]
+thread_local! {
+    static BEFORE_CLEANUP_DELETE: std::cell::RefCell<Option<Box<dyn FnMut(usize)>>> = const { std::cell::RefCell::new(None) };
+}
+
 /// Remove only proven inputs. Uncommitted .pending files and unknown artifacts
 /// are not covered by the output proof and must survive automatic cleanup.
 pub(super) fn cleanup_checkpoint_track(directory: &Path, output: &Path) -> Result<(), String> {
-    if validate_committed_track(Some(directory), output)?.is_none() {
+    let Some(proof) = read_record(output)? else {
+        return Ok(());
+    };
+    if !output.exists() {
         return Ok(());
     }
-    let proof = read_record(output)?.ok_or("Track proof disappeared during cleanup")?;
+    // Full content work is O(output bytes + remaining checkpoint bytes), once
+    // per call, not once per deletion. Validate ALL inputs before deleting any.
+    // Keep output open to pin its identity throughout cleanup; checkpoint
+    // handles are short-lived so a long take cannot exhaust file descriptors.
+    let (_output_file, output_stamp) = validate_cleanup_file(output, &proof.output)?;
+    let expected: std::collections::HashMap<_, _> =
+        proof.inputs.iter().map(|p| (p.name.as_str(), p)).collect();
+    let mut validated = Vec::new();
     for path in checkpoint_files(directory)? {
-        if !proof.inputs.contains(&fingerprint(&path)?) {
-            return Err("Checkpoint changed during cleanup; remaining inputs preserved".into());
-        }
-        if !same_content(&fingerprint(output)?, &proof.output) {
-            return Err("Output changed during cleanup; remaining inputs preserved".into());
-        }
+        let input = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .and_then(|name| expected.get(name))
+            .ok_or("Unproven checkpoint; remaining inputs preserved")?;
+        let (_, stamp) = validate_cleanup_file(&path, input)?;
+        validated.push((path, stamp));
+    }
+    for (_index, (path, stamp)) in validated.into_iter().enumerate() {
+        #[cfg(test)]
+        BEFORE_CLEANUP_DELETE.with(|hook| {
+            if let Some(callback) = hook.borrow_mut().as_mut() {
+                callback(_index);
+            }
+        });
+        output_stamp.check(output)?;
+        stamp.check(&path)?;
         std::fs::remove_file(path).map_err(|e| e.to_string())?;
     }
     let marker = directory.join(".recovered");
@@ -499,5 +706,201 @@ mod tests {
         std::fs::remove_file(record_path(&output).unwrap()).unwrap();
         assert_eq!(commit_checkpoint_track(&inputs, &output, None).unwrap(), 1);
         assert_eq!(std::fs::read(&output).unwrap(), bytes);
+    }
+    fn many_checkpoints(count: usize) -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let (dir, inputs, output) = fixture();
+        for index in 1..count {
+            std::fs::copy(
+                inputs.join("audio_chunk_000.mp4"),
+                inputs.join(format!("audio_chunk_{index:03}.mp4")),
+            )
+            .unwrap();
+        }
+        commit_checkpoint_track(&inputs, &output, None).unwrap();
+        (dir, inputs, output)
+    }
+
+    #[test]
+    fn cleanup_hash_work_is_linear_in_output_and_checkpoint_bytes() {
+        let mut measurements = Vec::new();
+        for count in [1, 4, 12, 24] {
+            let (_dir, inputs, output) = many_checkpoints(count);
+            let output_bytes = std::fs::metadata(&output).unwrap().len();
+            let input_bytes: u64 = checkpoint_files(&inputs)
+                .unwrap()
+                .iter()
+                .map(|p| std::fs::metadata(p).unwrap().len())
+                .sum();
+            let work = HashWork::start(_dir.path());
+            cleanup_checkpoint_track(&inputs, &output).unwrap();
+            let hashed = work.bytes();
+            println!("cleanup checkpoints={count} output_bytes={output_bytes} checkpoint_bytes={input_bytes} hashed_bytes={hashed} limit={}", output_bytes + input_bytes);
+            measurements.push((count, hashed, output_bytes + input_bytes));
+        }
+        for (count, hashed, limit) in measurements {
+            assert!(
+                hashed <= limit,
+                "{count} checkpoints: {hashed} hashed bytes exceed linear limit {limit}"
+            );
+        }
+    }
+
+    struct CleanupHook;
+    impl Drop for CleanupHook {
+        fn drop(&mut self) {
+            BEFORE_CLEANUP_DELETE.with(|hook| *hook.borrow_mut() = None);
+        }
+    }
+    fn before_delete(callback: impl FnMut(usize) + 'static) -> CleanupHook {
+        BEFORE_CLEANUP_DELETE.with(|hook| *hook.borrow_mut() = Some(Box::new(callback)));
+        CleanupHook
+    }
+
+    #[test]
+    fn cleanup_validates_every_input_before_deleting_any() {
+        let (_dir, inputs, output) = many_checkpoints(4);
+        std::fs::write(
+            inputs.join("audio_chunk_003.mp4"),
+            b"changed last checkpoint",
+        )
+        .unwrap();
+        assert!(cleanup_checkpoint_track(&inputs, &output).is_err());
+        assert_eq!(checkpoint_files(&inputs).unwrap().len(), 4);
+    }
+
+    #[test]
+    fn cleanup_never_deletes_without_a_commit_proof() {
+        let (_dir, inputs, output) = many_checkpoints(4);
+        std::fs::remove_file(record_path(&output).unwrap()).unwrap();
+        let work = HashWork::start(_dir.path());
+        cleanup_checkpoint_track(&inputs, &output).unwrap();
+        assert_eq!(work.bytes(), 0);
+        assert_eq!(checkpoint_files(&inputs).unwrap().len(), 4);
+    }
+
+    // Windows validation holds a deny-write/delete output handle; these Unix
+    // controls exercise writes/replacements that are allowed while it is open.
+    #[cfg(unix)]
+    #[test]
+    fn changed_output_stops_cleanup_and_partial_retry_hashes_only_remaining_inputs() {
+        let (_dir, inputs, output) = many_checkpoints(4);
+        let original = std::fs::read(&output).unwrap();
+        let mutate = output.clone();
+        let hook = before_delete(move |index| {
+            if index == 1 {
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&mutate)
+                    .unwrap()
+                    .write_all(b"changed")
+                    .unwrap();
+            }
+        });
+        assert!(cleanup_checkpoint_track(&inputs, &output).is_err());
+        drop(hook);
+        assert!(!inputs.join("audio_chunk_000.mp4").exists());
+        assert_eq!(checkpoint_files(&inputs).unwrap().len(), 3);
+        std::fs::write(&output, &original).unwrap();
+        let remaining_bytes: u64 = checkpoint_files(&inputs)
+            .unwrap()
+            .iter()
+            .map(|p| std::fs::metadata(p).unwrap().len())
+            .sum();
+        let work = HashWork::start(_dir.path());
+        cleanup_checkpoint_track(&inputs, &output).unwrap();
+        let hashed = work.bytes();
+        assert_eq!(hashed, original.len() as u64 + remaining_bytes);
+        println!(
+            "cleanup partial_retry remaining=3 hashed_bytes={hashed} limit={}",
+            original.len() as u64 + remaining_bytes
+        );
+        assert!(!inputs.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identical_replacement_after_validation_is_not_authority_to_delete() {
+        for replace_output in [true, false] {
+            let (_dir, inputs, output) = many_checkpoints(4);
+            let target = if replace_output {
+                output.clone()
+            } else {
+                inputs.join("audio_chunk_000.mp4")
+            };
+            let replacement = target.with_extension("replacement");
+            std::fs::copy(&target, &replacement).unwrap();
+            let hook = before_delete(move |index| {
+                if index == 0 {
+                    std::fs::rename(&replacement, &target).unwrap();
+                }
+            });
+            assert!(cleanup_checkpoint_track(&inputs, &output).is_err());
+            drop(hook);
+            assert_eq!(checkpoint_files(&inputs).unwrap().len(), 4);
+            // A fresh call can prove byte-identical replacement, never trust
+            // stale validation from before its inode changed.
+            cleanup_checkpoint_track(&inputs, &output).unwrap();
+            assert!(!inputs.exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn same_length_input_mutation_with_restored_mtime_stops_remaining_deletions() {
+        let (_dir, inputs, output) = many_checkpoints(4);
+        let target = inputs.join("audio_chunk_001.mp4");
+        let before = std::fs::metadata(&target).unwrap().modified().unwrap();
+        let mut bytes = std::fs::read(&target).unwrap();
+        bytes[0] ^= 1;
+        let hook = before_delete(move |index| {
+            if index == 1 {
+                let mut file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&target)
+                    .unwrap();
+                file.write_all(&bytes).unwrap();
+                file.set_modified(before).unwrap();
+            }
+        });
+        assert!(cleanup_checkpoint_track(&inputs, &output).is_err());
+        drop(hook);
+        assert_eq!(checkpoint_files(&inputs).unwrap().len(), 3);
+        assert!(inputs.join("audio_chunk_001.mp4").exists());
+        assert!(cleanup_checkpoint_track(&inputs, &output).is_err());
+        assert_eq!(checkpoint_files(&inputs).unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn cleanup_command_hash_work_is_linear_across_blocking_worker() {
+        let mut measurements = Vec::new();
+        for count in [1, 4, 12, 24] {
+            let (dir, inputs, output) = many_checkpoints(count);
+            let output_bytes = std::fs::metadata(&output).unwrap().len();
+            let input_bytes: u64 = checkpoint_files(&inputs)
+                .unwrap()
+                .iter()
+                .map(|p| std::fs::metadata(p).unwrap().len())
+                .sum();
+            // Folder-scoped actual read accounting crosses spawn_blocking, but
+            // excludes other tests/fixtures and the preceding commit work.
+            let work = HashWork::start(dir.path());
+            super::super::incremental_saver::cleanup_checkpoints(
+                dir.path().to_string_lossy().into_owned(),
+            )
+            .await
+            .unwrap();
+            let hashed = work.bytes();
+            let limit = 2 * (output_bytes + input_bytes);
+            println!("cleanup command checkpoints={count} output_bytes={output_bytes} checkpoint_bytes={input_bytes} hashed_bytes={hashed} limit={limit}");
+            measurements.push((count, hashed, limit));
+        }
+        // The command's existing preflight performs one additional full pass;
+        // neither pass may multiply output reads by the checkpoint count.
+        for (count, hashed, limit) in measurements {
+            assert!(
+                hashed <= limit,
+                "command {count} checkpoints: {hashed} hashed bytes exceed {limit}"
+            );
+        }
     }
 }
