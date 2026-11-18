@@ -4,17 +4,16 @@
  * The right-hand panel while recording: who is talking (and naming them),
  * notes typed during the call, and Ask AI about the call so far.
  */
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { invoke } from '@tauri-apps/api/core';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { NotebookPen, Sparkles, UserCheck, Users } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Hint } from '@/components/ui/tooltip';
 import { MeetingNotesEditor } from '@/components/meeting/MeetingNotesEditor';
-import { ChatThread } from '@/components/chat/ChatThread';
+import { LiveCodexChat } from '@/components/recording/LiveCodexChat';
 import { useUserName } from '@/hooks/useUserName';
 import { displaySpeaker, isUserSpeaker, speakerDot, speakerKey } from '@/utils/speakerUtils';
-import { buildLiveContext, lineAt, type LiveLine } from '@/lib/live-context';
+import type { QuestionLine } from '@/lib/live-codex';
 import { readLiveNotes } from '@/lib/live-session';
 import { currentRecordingNotesTarget } from '@/lib/notes-store';
 import type { DetectedSpeaker } from '@/types';
@@ -144,7 +143,7 @@ export function LivePanel({
   tab: LivePanelTab;
   onTabChange: (tab: LivePanelTab) => void;
   speakers: DetectedSpeaker[];
-  lines: LiveLine[];
+  lines: QuestionLine[];
   /** Changes per recording, so each call gets its own Ask AI thread. */
   sessionKey: string;
   onIdentify: (speaker: string) => void;
@@ -152,32 +151,6 @@ export function LivePanel({
   /** A cited moment was clicked. */
   onJumpTo: (lineId: string) => void;
 }) {
-  const userName = useUserName();
-  const linesRef = useRef(lines);
-  linesRef.current = lines;
-
-  const ask = useCallback(
-    async (question: string, history: Array<{ question: string; answer: string }>) => {
-      const context = buildLiveContext(linesRef.current, question, 12_000, (speaker) =>
-        isUserSpeaker(speaker) ? `${userName || 'The user'} (the user)` : speaker,
-      );
-      const guidance = [
-        'When you rely on something said in the call, cite its timestamp in square brackets, like [12:34].',
-        history.length
-          ? `Earlier in this conversation:\n${history
-              .slice(-4)
-              .map((turn) => `Q: ${turn.question}\nA: ${turn.answer.slice(0, 800)}`)
-              .join('\n\n')}`
-          : '',
-      ]
-        .filter(Boolean)
-        .join('\n\n');
-      if (!context.trim()) throw new Error('Nothing has been said yet. Ask again once the transcript has some lines.');
-      return invoke<string>('ask_live_assistant', { question, transcriptContext: context, persona: guidance });
-    },
-    [userName],
-  );
-
   return (
     <Tabs value={tab} onValueChange={(value) => onTabChange(value as LivePanelTab)} className="flex h-full min-h-0 flex-col">
       <div className="shrink-0 border-b border-af-border px-3 py-2.5">
@@ -204,21 +177,8 @@ export function LivePanel({
       <TabsContent value="notes" forceMount className="mt-0 min-h-0 flex-1 data-[state=inactive]:hidden">
         <NotesTab key={sessionKey} />
       </TabsContent>
-      <TabsContent value="ask" className="mt-0 min-h-0 flex-1 data-[state=inactive]:hidden">
-        <ChatThread
-          historyKey={`live:${sessionKey}`}
-          ask={ask}
-          compact
-          emptyTitle="Ask about this call"
-          emptyHint="Answers come from what has been said so far. Revisioned Notes context is prepared separately for the subscription CLI integration."
-          suggestions={['What did I miss in the last 5 minutes?', 'What has been decided?', 'Which action items came up?', 'What questions are still open?']}
-          placeholder="Ask about the call…"
-          footnote="Uses your summary model. Cloud providers receive the parts of the transcript needed to answer."
-          onSeek={(seconds) => {
-            const target = lineAt(linesRef.current, seconds);
-            if (target) onJumpTo(target.id);
-          }}
-        />
+      <TabsContent value="ask" forceMount className="mt-0 min-h-0 flex-1 data-[state=inactive]:hidden">
+        <LiveCodexChat key={sessionKey} lines={lines} onJumpTo={onJumpTo} />
       </TabsContent>
     </Tabs>
   );

@@ -13,7 +13,13 @@ import { ArrowUp, RotateCcw, Sparkles, Trash2 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { Hint } from '@/components/ui/tooltip';
 
-export interface ChatMessage {
+export interface ChatResponse {
+  answer: string;
+  citations?: Array<{ id: string; sequenceId?: number; time: number; text: string }>;
+  sourceStatus?: string;
+}
+
+export interface ChatMessage extends Omit<ChatResponse, 'answer'> {
   id: string;
   question: string;
   answer?: string;
@@ -23,7 +29,7 @@ export interface ChatMessage {
 const threads = new Map<string, ChatMessage[]>();
 
 function load(key: string): ChatMessage[] {
-  if (threads.has(key)) return threads.get(key)!;
+  if (threads.has(key)) return threads.get(key)!.map(message => message.status === 'pending' ? { ...message, status: 'error' as const, answer: 'Request interrupted. Retry to ask again.' } : message);
   try {
     const raw = sessionStorage.getItem(`af-chat:${key}`);
     if (raw) {
@@ -71,7 +77,12 @@ function toSeconds(stamp: string): number {
 
 export interface ChatThreadProps {
   historyKey: string;
-  ask: (question: string, history: Array<{ question: string; answer: string }>) => Promise<string>;
+  ask: (question: string, history: Array<{ question: string; answer: string }>, signal: AbortSignal) => Promise<string | ChatResponse>;
+  cancellable?: boolean;
+  strictCitations?: boolean;
+  quickActions?: string[];
+  pendingLabel?: string;
+  onCite?: (id: string, sequenceId?: number) => void;
   suggestions?: string[];
   placeholder?: string;
   emptyTitle?: string;
@@ -82,7 +93,11 @@ export interface ChatThreadProps {
   compact?: boolean;
 }
 
-export function ChatThread({
+export function ChatThread(props: ChatThreadProps) {
+  return <ChatThreadInner key={props.historyKey} {...props} />;
+}
+
+function ChatThreadInner({
   historyKey,
   ask,
   suggestions = [],
@@ -93,9 +108,20 @@ export function ChatThread({
   onSeek,
   className,
   compact = false,
+  cancellable = false,
+  strictCitations = false,
+  quickActions = [],
+  pendingLabel = 'Reading the records…',
+  onCite,
 }: ChatThreadProps) {
   const [messages, update] = useChatHistory(historyKey);
   const [draft, setDraft] = useState('');
+  const requestRef = useRef<AbortController | null>(null);
+  const mounted = useRef(true);
+  useEffect(() => {
+    mounted.current = true;
+    return () => { mounted.current = false; requestRef.current?.abort(); };
+  }, []);
   const scrollRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const busy = messages.some((message) => message.status === 'pending');
@@ -107,18 +133,27 @@ export function ChatThread({
 
   const send = async (question: string) => {
     const text = question.trim();
-    if (!text || busy) return;
+    if (!text || busy || requestRef.current) return;
+    const controller = new AbortController();
+    requestRef.current = controller;
     const id = `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
     const history = messages.filter((m) => m.status === 'done' && m.answer).map((m) => ({ question: m.question, answer: m.answer! }));
     update((current) => [...current, { id, question: text, status: 'pending' }]);
     setDraft('');
     if (inputRef.current) inputRef.current.style.height = 'auto';
     try {
-      const answer = await ask(text, history);
-      update((current) => current.map((m) => (m.id === id ? { ...m, answer, status: 'done' } : m)));
+      const result = await ask(text, history, controller.signal);
+      if (controller.signal.aborted) throw new Error('Request cancelled. Recording, transcription and Notes continue.');
+      if (!mounted.current) return;
+      const response = typeof result === 'string' ? { answer: result } : result;
+      update((current) => current.map((m) => (m.id === id ? { ...m, ...response, status: 'done' } : m)));
     } catch (error) {
-      const message = typeof error === 'string' ? error : error instanceof Error ? error.message : 'Request failed';
-      update((current) => current.map((m) => (m.id === id ? { ...m, answer: message, status: 'error' } : m)));
+      const message = controller.signal.aborted ? 'Request cancelled. Recording, transcription and Notes continue.' : typeof error === 'string' ? error : error instanceof Error ? error.message : 'Request failed';
+      const fail = (current: ChatMessage[]) => current.map((m): ChatMessage => m.id === id ? { ...m, answer: message, status: 'error' } : m);
+      if (mounted.current) update(fail);
+      else store(historyKey, fail(threads.get(historyKey) ?? []));
+    } finally {
+      if (requestRef.current === controller) requestRef.current = null;
     }
   };
 
@@ -172,7 +207,7 @@ export function ChatThread({
                           <span key={dot} className="h-1.5 w-1.5 animate-af-breathe rounded-full bg-af-text-3" style={{ animationDelay: `${dot * 180}ms` }} />
                         ))}
                       </span>
-                      Reading the records…
+                      {pendingLabel}
                     </span>
                   ) : message.status === 'error' ? (
                     <div className="space-y-2">
@@ -185,9 +220,10 @@ export function ChatThread({
                     <div className="prose prose-sm max-w-none leading-relaxed prose-p:my-1.5 prose-ul:my-1.5 prose-li:my-0.5">
                       <ReactMarkdown
                         remarkPlugins={[remarkGfm]}
+                        disallowedElements={strictCitations ? ['img'] : undefined}
                         components={{
                           a: ({ href, children }) =>
-                            href?.startsWith('#t=') && onSeek ? (
+                            strictCitations ? <span>{children}</span> : href?.startsWith('#t=') && onSeek ? (
                               <button
                                 type="button"
                                 onClick={() => onSeek(toSeconds(href.slice(3)))}
@@ -202,8 +238,16 @@ export function ChatThread({
                             ),
                         }}
                       >
-                        {(message.answer ?? '').replace(CITATION, onSeek ? '[$1](#t=$1)' : '[$1]')}
+                        {strictCitations ? message.answer ?? '' : (message.answer ?? '').replace(CITATION, onSeek ? '[$1](#t=$1)' : '[$1]')}
                       </ReactMarkdown>
+                      {message.citations?.length ? <div className="mt-2 flex flex-wrap gap-2" aria-label="Verified speech evidence">
+                        {message.citations.map(citation => {
+                          const total = Math.floor(citation.time);
+                          const time = `${Math.floor(total / 60)}:${String(total % 60).padStart(2, '0')}`;
+                          return <button key={citation.id} type="button" aria-label={`Jump to speech at ${time}`} title={citation.text} onClick={() => onCite?.(citation.id, citation.sequenceId)} className="text-xs text-af-accent underline">[{time}]</button>;
+                        })}
+                      </div> : null}
+                      {message.sourceStatus && <p className="mt-2 text-xs text-af-text-3">{message.sourceStatus}</p>}
                     </div>
                   )}
                 </div>
@@ -214,6 +258,8 @@ export function ChatThread({
       </div>
 
       <div className={cn('shrink-0 border-t border-af-border', compact ? 'p-2.5' : 'p-3')}>
+        {quickActions.map(action => <button key={action} type="button" disabled={busy} onClick={() => void send(action)} className="mb-2 rounded-lg border border-af-border px-3 py-1.5 text-xs disabled:opacity-40">{action}</button>)}
+        {cancellable && busy && <button type="button" onClick={() => requestRef.current?.abort()} className="mb-2 ml-2 text-xs text-af-danger">Cancel request</button>}
         <form
           onSubmit={(event) => {
             event.preventDefault();

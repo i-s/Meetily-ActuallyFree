@@ -1496,6 +1496,34 @@ pub async fn get_meeting_folder_path() -> Result<Option<String>, String> {
     }
 }
 
+/// Request-time audio clock for text consumers; pauses do not advance it.
+pub(crate) fn current_text_clock() -> Result<(String, f64), String> {
+    if !is_recording_active() || is_recording_stopping() { return Err("No active recording".into()); }
+    let guard = RECORDING_MANAGER.lock().map_err(|_| "Recording state unavailable")?;
+    let manager = guard.as_ref().ok_or("No active recording")?;
+    let folder = manager.get_meeting_folder().ok_or("Recording identity is not ready")?;
+    let clock = manager.get_active_recording_duration().ok_or("Recording clock is not ready")?;
+    Ok((format!("recording:{}", folder.to_string_lossy()), clock))
+}
+
+/// Text-only consumer boundary: identity, pause-excluding audio clock and an
+/// immutable ASR snapshot are copied together. No caller retains this lock
+/// while accessing SQLite or running a CLI/model. Does not open any audio file.
+pub(crate) fn current_text_context() -> Result<(String, f64, Vec<crate::audio::recording_saver::TranscriptSegment>), String> {
+    let guard = RECORDING_MANAGER.lock().map_err(|_| "Recording state unavailable")?;
+    if !is_recording_active() || is_recording_stopping() { return Err("No active recording. Open the current recording and retry.".into()); }
+    let manager = guard.as_ref().ok_or("No active recording")?;
+    let folder = manager.get_meeting_folder().ok_or("Recording identity is not ready")?;
+    let clock = manager.get_active_recording_duration().ok_or("Recording clock is not ready")?;
+    Ok((format!("recording:{}", folder.to_string_lossy()), clock, manager.get_transcript_segments()))
+}
+
+/// Cheap watchdog query; unlike current_text_context this never clones ASR.
+pub(crate) fn recording_target_is_current(target: &str) -> bool {
+    if !is_recording_active() || is_recording_stopping() { return false; }
+    RECORDING_MANAGER.lock().ok().and_then(|guard| guard.as_ref().and_then(|m| m.get_meeting_folder()).map(|p| format!("recording:{}", p.to_string_lossy()) == target)).unwrap_or(false)
+}
+
 /// Get accumulated transcript segments from current recording session
 /// Used for syncing frontend state after page reload during active recording
 #[tauri::command]
