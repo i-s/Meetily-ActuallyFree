@@ -18,8 +18,8 @@ pub fn microphone_label(in_person: bool) -> &'static str {
 /// Validate before opening any capture stream. A missing app choice must not
 /// accidentally mean global capture; microphone-only is an explicit mode.
 pub fn validate_sources(in_person: bool, per_app: bool, targets: usize, system_available: bool) -> Result<(), &'static str> {
-    if !in_person && per_app && targets == 0 {
-        return Err("No target applications selected. Choose an app before recording.");
+    if !in_person && per_app {
+        validate_app_count(cfg!(target_os = "macos"), targets)?;
     }
     if !in_person && !per_app && !system_available {
         return Err("System audio is unavailable. Connect an output device or explicitly choose In-person meeting in Recording settings.");
@@ -42,5 +42,47 @@ mod tests {
         assert!(validate_sources(false, false, 0, false).is_err());
         assert!(validate_sources(true, true, 0, false).is_ok());
         assert_eq!(microphone_label(true), "Microphone");
+    }
+}
+
+
+pub fn validate_app_count(macos: bool, count: usize) -> Result<(), &'static str> {
+    if count == 0 { return Err("No target applications selected. Choose an app before recording."); }
+    if macos && count > 1 { return Err("macOS supports one app at a time. Remove extra selected apps before recording."); }
+    Ok(())
+}
+
+/// Resolve the complete user selection, never silently drop unavailable apps.
+/// The caller opens no streams until this succeeds.
+pub fn resolve_app_targets<F>(macos: bool, targets: &[(String, String)], find_pid: F) -> Result<Vec<(String, u32)>, String>
+where F: Fn(&str) -> Option<u32> {
+    validate_app_count(macos, targets.len()).map_err(str::to_string)?;
+    let mut resolved = Vec::new();
+    let mut missing = Vec::new();
+    for (name, executable) in targets {
+        if let Some(pid) = find_pid(executable) { resolved.push((name.clone(), pid)); }
+        else { missing.push(name.clone()); }
+    }
+    if !missing.is_empty() {
+        return Err(format!("Selected target applications are unavailable: {}. Open every chosen app or change the selection before recording.", missing.join(", ")));
+    }
+    Ok(resolved)
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+    fn targets() -> Vec<(String, String)> { vec![("A".into(), "a".into()), ("B".into(), "b".into())] }
+    #[test]
+    fn macos_rejects_the_list_before_even_resolving_a_first_pid() {
+        assert!(resolve_app_targets(true, &targets(), |_| panic!("must fail before any process lookup/capture")).is_err());
+        assert_eq!(resolve_app_targets(true, &targets()[..1], |_| Some(42)).unwrap(), vec![("A".into(), 42)]);
+    }
+    #[test]
+    fn missing_subset_is_not_silently_dropped_on_multi_app_platforms() {
+        assert!(resolve_app_targets(false, &targets(), |exe| if exe == "a" { Some(42) } else { None }).unwrap_err().contains("B"));
+        assert!(resolve_app_targets(true, &targets()[..1], |_| None).is_err());
+        assert!(resolve_app_targets(false, &[], |_| None).is_err());
+        assert_eq!(resolve_app_targets(false, &targets(), |_| Some(42)).unwrap().len(), 2);
     }
 }

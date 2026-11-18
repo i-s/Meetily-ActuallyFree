@@ -54,6 +54,12 @@ not a physical pass for this tree.
   does not train the online diarizer as the user's voice. `metadata.json` records
   the mode, and offline diarization skips the mic→You dual-track shortcut for
   these meetings. Source labels are not person names.
+- macOS selected-app capture explicitly supports **one app at a time**, not
+  “first available app.” Preferences reject new multi-app saves; the picker
+  blocks a second app and offers a clear/repair action for legacy multi-lists.
+  Native stream preflight rejects unsupported counts and any unavailable target
+  before opening even the microphone; app-stream open rechecks availability.
+  Other multi-app platforms must resolve the entire list, never a silent subset.
 - Chosen-app capture resolves a Unix PID to the pinned cidre HAL `Process`
   object before constructing `TapDesc`. Unknown process objects fail startup.
   A tap failure never falls back to a global tap. Empty chosen-app selection
@@ -76,6 +82,17 @@ not a physical pass for this tree.
   **You in ordinary call mode remains a source convention, not verified
   identity. Speaker playback leaking into a mic is not solved by this change.**
 
+Shared in-person microphone identity/diarization is **outside MVP**. Enhance /
+Re-transcribe reads explicit `in_person` provenance and uses neutral
+**Microphone** (including mixed-track fallback), never manufactured **You**.
+Generic source labels are not preserved as manually named people; real manual
+names can still survive overlap-based retranscription. Legacy call recordings
+without the mode field keep their existing mic/system convention; malformed
+metadata fails rather than guessing. No new model or room identity inference is
+introduced. The mandatory MVP gate remains **Zoom through speakers**: remote
+speech must not be attributed to You and local overlapping speech must survive.
+Neutral relabeling or muting all mic audio does not satisfy that gate.
+
 ## Save, failure and recovery behavior
 
 The pipeline's audio saver remains independent of ASR completion. One saver
@@ -97,11 +114,28 @@ recording-sized PCM copy or detached input writer was added by the pipe fix.
 - Per-track finalize keeps checkpoints. Only after **all populated tracks,
   transcripts and metadata** succeed does meeting-level save clean them up.
   Failure preserves available checkpoint sets and reports an audio-save error.
-- Recovery explicitly specifies the MP4 container for `.mp4.recovering`; FFmpeg
-  cannot infer it from that suffix. It syncs recovered output before promotion,
-  retains source tails rather than truncating them to mixed checkpoint count,
-  and refuses to overwrite existing audio. An existing-output conflict is
-  intentionally reported for manual review; it is not destructive repair.
+- Normal finalization and recovery share `audio/track_commit.rs`. Each track has
+  a synced `.audio-commits/<track>.json` proof recording checkpoint names, byte
+  lengths/SHA-256, output SHA-256, decoded duration and the staged basename.
+  FFmpeg explicitly uses MP4 for the unique `.recovering` stage. Proof precedes
+  exclusive hard-link promotion; retry resumes a proven stage/output rather
+  than stopping merely because `audio.mp4` exists. Mixed, mic and system tracks
+  are attempted independently. Legacy partial output can be adopted only when
+  byte-identical to the newly validated checkpoint concatenation.
+- Cleanup revalidates proof/output/inputs and removes only proven checkpoints.
+  Unknown or modified output, changed inputs and uncommitted `.pending` tails
+  survive; a source failure or pending tail yields a visible partial result.
+  Interrupted promotion and partial cleanup are retryable without replacement.
+  Existing-output conflicts require review, not destructive repair.
+- `useTranscriptRecovery` → `StorageService` → `api_save_transcript` now accepts
+  zero-transcript recovery only with validated final playback. Startup checks
+  final audio as well as checkpoints and never clears the durable folder ref on
+  validation failure. Native validation rejects empty ghost meetings. Recovery
+  IDs generate deterministic SQLite IDs; the transactional folder check also
+  finds an ordinary save whose response was lost. Retries never rewrite an
+  already committed title/text/timestamps/speaker labels. DB/IndexedDB failure
+  retains references. Partial source recovery saves playback to the library but
+  retains the draft/checkpoints for retry and review.
 - Manual Stop no longer auto-deletes takes shorter than ten seconds. An empty
   live transcript is not proof that a recording is worthless. ASR UI timeout
   still saves available text/audio instead of skipping meeting save. Failed
@@ -136,6 +170,8 @@ frontend prerequisites on PATH:
 ```sh
 python3 -I frontend/scripts/test-recording-shutdown-portable.py
 python3 -I frontend/scripts/test-audio-idle-portable.py
+python3 -I frontend/scripts/test-retranscription-sources-portable.py
+python3 -I frontend/scripts/test-recovery-database-portable.py
 python3 -I -m unittest discover -s tests -v
 # From frontend/, one process per test file:
 pnpm dlx bun@1.3.10 scripts/test-isolated.mjs
@@ -151,7 +187,7 @@ extracts folder-creation functions verbatim. Repository-lock verification reject
 new dependency versions. It is **not** a native Tauri/macOS build.
 
 Actual 2026-11-18 checks:
-- 22 shutdown/storage/recovery Rust tests passed, real FFmpeg 7.0.2 static on
+- 36 shutdown/storage/recovery Rust tests passed, real FFmpeg 7.0.2 static on
   Linux. Three-track test queues 35 seconds of simultaneous 440/660 Hz signals,
   verifies a completed 30-second checkpoint plus final tail, decodes all tracks,
   and checks each source's own frequency without cross-source mixing. The
@@ -160,7 +196,7 @@ Actual 2026-11-18 checks:
   exit while paused and live-but-silent process cases). Stream traits/OS liveness
   are fixture boundaries, not real Core Audio/HAL observations.
 - 60 portable Python tests passed, including integrated #6–8 preparation.
-- All **29 frontend test files** passed in isolated Bun 1.3.10 processes; the
+- All **32 frontend test files** passed in isolated Bun 1.3.10 processes; the
   final Next production build passed, including TypeScript validation. Existing
   Browserslist/Tailwind ambiguity warnings remain. Reload-status and automatic
   short-take deletion tests were each
@@ -168,8 +204,24 @@ Actual 2026-11-18 checks:
   exercises the normal persisted in-person option while preserving app choices.
 - Full application Cargo test was attempted and failed before app compilation
   in `glib-sys`: this environment lacks `pkg-config` and desktop development
-  prerequisites. The available minimal Rust toolchain also lacks `rustfmt`.
+  prerequisites. An extracted Rust formatter was used for the new commit module
+  and native caller test; this is not application compilation.
   macOS-specific application code has **not** been compiled here.
+- Four room retranscription policy tests passed, including repeated Enhance,
+  real manual-name preservation, neutral fallback and legacy behavior.
+- Thirteen recovery command/repository tests passed with real SQLite and FFmpeg:
+  actual native command bodies, empty-audio rejection, final-audio/no-checkpoint
+  recovery, DB failure/retry, commit-response loss, duplicate prevention, folder
+  identity mismatch and committed text/label preservation. Only desktop transport,
+  device metadata and unrelated contact linking are stubbed. Portable harnesses
+  do not qualify the Tauri ABI or macOS capture.
+- Independent review findings were reproduced red before fixes: room mic became
+  You, stale macOS multiple selection promised first-app capture, promoted mixed
+  output blocked source retry, and zero-transcript/DB-response retry failed or
+  duplicated library entries. Production policy/track commit, UI → storage and
+  native command → repository tests now pass. The final pending-tail regression
+  initially exposed a Rust iterator ownership compile error; it was corrected
+  and both recovery suites rerun successfully.
 
 ## Remaining limits and final combined gate
 

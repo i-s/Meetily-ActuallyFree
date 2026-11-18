@@ -186,11 +186,32 @@ struct RetranscriptionSource {
     negative_threshold: f32,
 }
 
-fn find_retranscription_sources(folder: &Path, fallback: &Path) -> Vec<RetranscriptionSource> {
+fn find_retranscription_sources(folder: &Path, fallback: &Path) -> Result<Vec<RetranscriptionSource>> {
+    let metadata_path = folder.join("metadata.json");
+    let in_person = match std::fs::read(&metadata_path) {
+        Ok(bytes) => {
+            let metadata: serde_json::Value = serde_json::from_slice(&bytes)?;
+            match metadata.get("in_person") {
+                Some(value) => value.as_bool().ok_or_else(|| anyhow!("Invalid in_person recording provenance"))?,
+                None => false, // Legacy recordings used the call-source convention.
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error.into()),
+    };
     let mic_path = folder.join("mic.mp4");
     let system_path = folder.join("system.mp4");
     let mut sources = Vec::new();
 
+    if in_person {
+        return Ok(vec![RetranscriptionSource {
+            path: if mic_path.is_file() { mic_path } else { fallback.to_path_buf() },
+            label: "room microphone",
+            speaker_hint: Some("Microphone"),
+            positive_threshold: 0.20,
+            negative_threshold: 0.10,
+        }]);
+    }
     if mic_path.is_file() && system_path.is_file() {
         sources.push(RetranscriptionSource {
             path: mic_path,
@@ -217,7 +238,7 @@ fn find_retranscription_sources(folder: &Path, fallback: &Path) -> Vec<Retranscr
         });
     }
 
-    sources
+    Ok(sources)
 }
 
 fn is_manual_speaker_label(label: &str) -> bool {
@@ -230,10 +251,33 @@ fn is_manual_speaker_label(label: &str) -> bool {
         p.eq_ignore_ascii_case("guest")
             || p.eq_ignore_ascii_case("you")
             || p.eq_ignore_ascii_case("unknown")
+            || p.eq_ignore_ascii_case("mic")
+            || p.eq_ignore_ascii_case("microphone")
+            || p.eq_ignore_ascii_case("system")
+            || p.eq_ignore_ascii_case("system audio")
             || (p.to_ascii_lowercase().starts_with("speaker ")
                 && p[8..].trim().chars().all(|c| c.is_ascii_digit()))
     });
     !is_generated
+}
+
+/// Keep named people across Enhance runs, never promote a source label into
+/// an identity. Legacy call-mic hints retain their existing You convention.
+fn speaker_after_manual_ranges(hint: Option<&str>, start: f64, end: f64, ranges: &[(f64, f64, String)]) -> Option<String> {
+    if hint.is_some_and(|label| label.eq_ignore_ascii_case("you")) {
+        return hint.map(str::to_string);
+    }
+    let mut result = hint.map(str::to_string);
+    let mut best_overlap = 0.05;
+    for (range_start, range_end, name) in ranges {
+        if !is_manual_speaker_label(name) { continue; }
+        let overlap = (end.min(*range_end) - start.max(*range_start)).max(0.0);
+        if overlap > best_overlap {
+            best_overlap = overlap;
+            result = Some(name.clone());
+        }
+    }
+    result
 }
 
 fn create_source_labeled_segments(
@@ -261,7 +305,7 @@ async fn run_retranscription<R: Runtime>(
 ) -> Result<RetranscriptionResult> {
     let folder_path = PathBuf::from(&meeting_folder_path);
     let audio_path = find_audio_file(&folder_path)?;
-    let sources = find_retranscription_sources(&folder_path, &audio_path);
+    let sources = find_retranscription_sources(&folder_path, &audio_path)?;
 
     // Determine which provider to use (default to whisper)
     let use_parakeet = provider.as_deref() == Some("parakeet");
@@ -586,38 +630,9 @@ async fn run_retranscription<R: Runtime>(
     let mut segments =
         create_source_labeled_segments(&all_transcripts, &speaker_hints, recording_started_at)?;
 
-    if !manual_ranges.is_empty() {
-        for segment in &mut segments {
-            // Keep mic audio deterministically as "You"
-            let is_mic = segment
-                .speaker
-                .as_deref()
-                .map(|s| s.eq_ignore_ascii_case("you"))
-                .unwrap_or(false);
-            if is_mic {
-                continue;
-            }
-            if let (Some(seg_start), Some(seg_end)) =
-                (segment.audio_start_time, segment.audio_end_time)
-            {
-                if seg_end <= seg_start {
-                    continue;
-                }
-                let mut best_name: Option<String> = None;
-                let mut best_overlap: f64 = 0.0;
-                for (ms, me, name) in &manual_ranges {
-                    let overlap = (seg_end.min(*me) - seg_start.max(*ms)).max(0.0);
-                    if overlap > best_overlap {
-                        best_overlap = overlap;
-                        best_name = Some(name.clone());
-                    }
-                }
-                if let Some(name) = best_name {
-                    if best_overlap > 0.05 {
-                        segment.speaker = Some(name);
-                    }
-                }
-            }
+    for segment in &mut segments {
+        if let (Some(start), Some(end)) = (segment.audio_start_time, segment.audio_end_time) {
+            segment.speaker = speaker_after_manual_ranges(segment.speaker.as_deref(), start, end, &manual_ranges);
         }
     }
 
@@ -1221,7 +1236,7 @@ mod tests {
         std::fs::write(dir.path().join("mic.mp4"), b"mic").unwrap();
         std::fs::write(dir.path().join("system.mp4"), b"system").unwrap();
         let fallback = dir.path().join("audio.mp4");
-        let sources = find_retranscription_sources(dir.path(), &fallback);
+        let sources = find_retranscription_sources(dir.path(), &fallback).unwrap();
 
         assert_eq!(sources.len(), 2);
         assert_eq!(sources[0].speaker_hint, Some("You"));
@@ -1232,7 +1247,7 @@ mod tests {
     fn mixed_source_has_no_speaker_hint() {
         let dir = tempfile::tempdir().unwrap();
         let fallback = dir.path().join("audio.mp4");
-        let sources = find_retranscription_sources(dir.path(), &fallback);
+        let sources = find_retranscription_sources(dir.path(), &fallback).unwrap();
 
         assert_eq!(sources.len(), 1);
         assert_eq!(sources[0].speaker_hint, None);
@@ -1265,7 +1280,7 @@ mod tests {
         std::fs::write(dir.path().join("mic.mp4"), b"mic").unwrap();
         std::fs::write(dir.path().join("system.mp4"), b"system").unwrap();
 
-        let sources = find_retranscription_sources(dir.path(), &fallback);
+        let sources = find_retranscription_sources(dir.path(), &fallback).unwrap();
 
         assert_eq!(sources.len(), 2);
         assert_eq!(sources[0].label, "microphone");
@@ -1280,7 +1295,7 @@ mod tests {
         let fallback = dir.path().join("audio.mp4");
         std::fs::write(&fallback, b"mixed").unwrap();
 
-        let sources = find_retranscription_sources(dir.path(), &fallback);
+        let sources = find_retranscription_sources(dir.path(), &fallback).unwrap();
 
         assert_eq!(sources.len(), 1);
         assert_eq!(sources[0].label, "mixed audio");
@@ -1294,7 +1309,7 @@ mod tests {
         std::fs::write(&fallback, b"mixed").unwrap();
         std::fs::write(dir.path().join("mic.mp4"), b"mic").unwrap();
 
-        let sources = find_retranscription_sources(dir.path(), &fallback);
+        let sources = find_retranscription_sources(dir.path(), &fallback).unwrap();
 
         assert_eq!(sources.len(), 1);
         assert_eq!(sources[0].label, "mixed audio");
@@ -1366,5 +1381,58 @@ mod tests {
         // Non-audio formats
         assert!(!AUDIO_EXTENSIONS.contains(&"txt"));
         assert!(!AUDIO_EXTENSIONS.contains(&"pdf"));
+    }
+}
+
+#[cfg(test)]
+mod issue9_room_tests {
+    use super::*;
+
+    #[test]
+    fn enhance_room_recording_does_not_turn_microphone_into_you() {
+        let dir = tempfile::tempdir().unwrap();
+        let mixed = dir.path().join("audio.mp4");
+        for (name, bytes) in [("mic.mp4", b"room".as_slice()), ("system.mp4", b"silent"), ("audio.mp4", b"room mix")] {
+            std::fs::write(dir.path().join(name), bytes).unwrap();
+        }
+        std::fs::write(dir.path().join("metadata.json"), br#"{"in_person":true}"#).unwrap();
+        let sources = find_retranscription_sources(dir.path(), &mixed).unwrap();
+        assert_eq!(sources.len(), 1, "a silent padded system track is not a second room source");
+        assert_eq!(sources[0].path, dir.path().join("mic.mp4"));
+        assert_eq!(sources[0].speaker_hint, Some("Microphone"));
+    }
+
+    #[test]
+    fn room_source_label_is_not_a_manually_identified_person() {
+        assert!(!is_manual_speaker_label("Microphone"));
+        assert!(!is_manual_speaker_label("Microphone + Guest"));
+        assert!(is_manual_speaker_label("Alex"));
+    }
+}
+
+
+#[cfg(test)]
+mod issue9_label_retry_tests {
+    use super::*;
+    #[test]
+    fn repeated_enhance_preserves_real_names_not_room_source_labels() {
+        let ranges = vec![(0.0, 10.0, "Microphone".into()), (1.0, 3.0, "Alex".into()), (0.0, 10.0, "You".into())];
+        assert_eq!(speaker_after_manual_ranges(Some("Microphone"), 1.0, 3.0, &ranges).as_deref(), Some("Alex"));
+        assert_eq!(speaker_after_manual_ranges(Some("Microphone"), 4.0, 5.0, &ranges).as_deref(), Some("Microphone"));
+        assert_eq!(speaker_after_manual_ranges(Some("You"), 1.0, 3.0, &ranges).as_deref(), Some("You"));
+    }
+    #[test]
+    fn legacy_call_sources_keep_their_hints_but_room_fallback_never_uses_you() {
+        let dir = tempfile::tempdir().unwrap();
+        let fallback = dir.path().join("audio.mp4");
+        for name in ["mic.mp4", "system.mp4", "audio.mp4"] { std::fs::write(dir.path().join(name), b"fixture").unwrap(); }
+        assert_eq!(find_retranscription_sources(dir.path(), &fallback).unwrap()[0].speaker_hint, Some("You"));
+        std::fs::write(dir.path().join("metadata.json"), br#"{"in_person":true}"#).unwrap();
+        std::fs::remove_file(dir.path().join("mic.mp4")).unwrap();
+        let sources = find_retranscription_sources(dir.path(), &fallback).unwrap();
+        assert_eq!(sources[0].path, fallback);
+        assert_eq!(sources[0].speaker_hint, Some("Microphone"));
+        std::fs::write(dir.path().join("metadata.json"), b"truncated").unwrap();
+        assert!(find_retranscription_sources(dir.path(), &fallback).is_err());
     }
 }

@@ -1190,6 +1190,7 @@ pub async fn api_save_transcript<R: Runtime>(
     folder_path: Option<String>,
     recording_started_at: Option<String>,
     auth_token: Option<String>,
+    recovery_id: Option<String>,
 ) -> Result<serde_json::Value, String> {
     log_info!(
         "api_save_transcript called for meeting: {}, transcripts: {}, folder_path: {:?}, auth_token: {}",
@@ -1248,15 +1249,23 @@ pub async fn api_save_transcript<R: Runtime>(
         .and_then(recording_started_at_from_folder);
     let recording_started_at = metadata_recording_start.or(supplied_recording_start);
 
-    // Now, call the repository with the correctly typed data.
-    match TranscriptsRepository::save_transcript(
-        pool,
-        &meeting_title,
-        &transcripts_to_save,
-        folder_path,
-        recording_started_at,
-    )
-    .await
+    // Recovery of an audio-only take needs a native validated final track,
+    // not merely an arbitrary folder or the existence of checkpoint filenames.
+    if recovery_id.is_some() && !transcripts_to_save.iter().any(|segment| !segment.text.trim().is_empty()) {
+        let folder = folder_path.clone().ok_or("Audio-only recovery has no recording folder")?;
+        let valid = tokio::task::spawn_blocking(move || {
+            crate::audio::incremental_saver::validated_final_audio_available(std::path::Path::new(&folder))
+        }).await.map_err(|e| e.to_string())??;
+        if !valid { return Err("Audio-only recovery requires validated recorded audio; no empty meeting was created".into()); }
+    }
+    let saved = if let Some(key) = recovery_id.as_deref() {
+        TranscriptsRepository::save_recovered_transcript(pool, &meeting_title, &transcripts_to_save,
+            folder_path, recording_started_at, key).await
+    } else {
+        TranscriptsRepository::save_transcript(pool, &meeting_title, &transcripts_to_save,
+            folder_path, recording_started_at).await
+    };
+    match saved
     {
         Ok(meeting_id) => {
             log_info!(

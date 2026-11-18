@@ -86,7 +86,9 @@ export default function Home() {
       const result = await recoverMeeting(meetingId);
       if (!result.success) return;
       toast.success('Meeting recovered', {
-        description: result.audioRecoveryStatus?.status === 'success' ? 'Transcript and audio recovered.' : 'Transcript recovered (no audio was available).',
+        description: result.audioRecoveryStatus?.audio_file_path
+          ? (result.audioRecoveryStatus.status === 'partial' ? 'Recorded audio saved; some source tracks still need review.' : 'Meeting and recorded audio recovered.')
+          : 'Available transcript recovered; audio was not verified.',
         action: result.meetingId
           ? { label: 'Open', onClick: () => router.push(`/meeting-details?id=${result.meetingId}`) }
           : undefined,

@@ -24,7 +24,10 @@ recovery/data retention and issue #9's unqualified physical acceptance gates are
 mapped in [ISSUE9_MANUAL_RECORDING.md](ISSUE9_MANUAL_RECORDING.md). Read it before
 changing capture selection, Stop ordering or checkpoint cleanup. In-person mic
 labels describe the room source, never a user identity; its persisted metadata
-also disables the offline mic-to-You source-track shortcut.
+also disables the offline mic-to-You source-track shortcut. Shared-room identity
+is outside MVP; Zoom-through-speakers remote-only/double-talk remains the gate.
+The note also owns per-track durable commit proofs, idempotent audio-only library
+recovery, and the explicit macOS one-selected-app limit (including stale prefs).
 
 Speech-start pre-roll, live system speech sensitivity, and real-call replay
 qualification are documented in [LIVE_SPEECH_RETENTION.md](LIVE_SPEECH_RETENTION.md).

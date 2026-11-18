@@ -401,6 +401,12 @@ pub async fn save_recording_preferences<R: Runtime>(
         });
     }
 
+    if cfg!(target_os = "macos") && preferences.per_app_recording_enabled
+        && !preferences.in_person && preferences.per_app_targets.len() > 1 {
+        super::recording_mode::validate_app_count(true, preferences.per_app_targets.len())
+            .map_err(anyhow::Error::msg)?;
+    }
+
     // Validate first so a bad custom path is never persisted and reused on the
     // next recording startup.
     ensure_recordings_directory(&preferences.save_folder)?;

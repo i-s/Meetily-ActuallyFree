@@ -21,7 +21,7 @@ AUDIO = REPO / "frontend/src-tauri/src/audio"
 
 def main():
     lock = tomllib.loads((REPO / "Cargo.lock").read_text())
-    names = ("anyhow", "log", "tokio", "tracing", "serde", "serde_json", "chrono", "tempfile", "bytemuck")
+    names = ("anyhow", "log", "tokio", "tracing", "serde", "serde_json", "chrono", "tempfile", "bytemuck", "sha2")
     versions = {name: next(p["version"] for p in lock["package"] if p["name"] == name) for name in names}
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
@@ -31,7 +31,7 @@ def main():
         (work / "src").mkdir()
         (work / "Cargo.toml").write_text(
             '[package]\nname="meetily-shutdown-portable"\nversion="0.0.0"\nedition="2021"\n[dependencies]\n'
-            + '\n'.join(f'{name}="={versions[name]}"' for name in ("anyhow", "log", "tracing", "serde_json", "chrono", "tempfile", "bytemuck"))
+            + '\n'.join(f'{name}="={versions[name]}"' for name in ("anyhow", "log", "tracing", "serde_json", "chrono", "tempfile", "bytemuck", "sha2"))
             + f'\nserde={{version="={versions["serde"]}",features=["derive"]}}\n'
             + f'\ntokio={{version="={versions["tokio"]}",features=["full","test-util"]}}\n'
         )
@@ -67,6 +67,7 @@ mod audio {{
     }}
     #[path="{AUDIO}/encode.rs"] pub mod encode;
     #[path="{AUDIO}/recording_mode.rs"] pub mod recording_mode;
+    #[path="{AUDIO}/track_commit.rs"] pub mod track_commit;
     #[path="{work}/src/incremental_saver.rs"] pub mod incremental_saver;
     #[path="{work}/src/audio_processing.rs"] pub mod audio_processing;
     #[path="{AUDIO}/recording_saver.rs"] pub mod recording_saver;

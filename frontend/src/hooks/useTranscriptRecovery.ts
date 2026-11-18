@@ -45,36 +45,32 @@ export function useTranscriptRecovery(): UseTranscriptRecoveryReturn {
     try {
       const meetings = await indexedDBService.getAllMeetings();
 
-      // Filter out meetings older than 7 days and newer than 15 seconds
-      // The 15 seconds threshold prevents showing meetings from the current session(jus in case)
-      // where recording just stopped but hasn't been fully saved yet
+      // Keep the existing seven-day retention and two-second startup guard.
+      // The recording page suppresses recovery checks while a session is busy.
       const cutoffTime = Date.now() - (7 * 24 * 60 * 60 * 1000);
       const secondsAgo = Date.now() - (2 * 1000);
 
       const recentMeetings = meetings.filter(m => {
         const isWithinRetention = m.lastUpdated > cutoffTime; // Not older than 7 days
-        const isOldEnough = m.lastUpdated < secondsAgo; // Older than 15 seconds
+        const isOldEnough = m.lastUpdated < secondsAgo;
         return isWithinRetention && isOldEnough;
       });
 
-      // Verify audio checkpoint availability for each meeting
+      // Check finalized audio as well as recoverable checkpoints.
       const meetingsWithAudioStatus = await Promise.all(
         recentMeetings.map(async (meeting) => {
           if (meeting.folderPath) {
             try {
-              const hasAudio = await invoke<boolean>('has_audio_checkpoints', {
+              const hasAudio = await invoke<boolean>('has_recoverable_audio', {
                 meetingFolder: meeting.folderPath
               });
 
-              // If no audio files, clear folderPath to show "No audio" in UI
-              return {
-                ...meeting,
-                folderPath: hasAudio ? meeting.folderPath : undefined
-              };
+              // Keep durable provenance even when validation is unavailable.
+              // Finalized audio may have no checkpoints after a failed DB save.
+              return { ...meeting, audioAvailable: hasAudio };
             } catch (error) {
               console.warn('Failed to check audio for meeting:', error);
-              // On error, assume no audio to be safe
-              return { ...meeting, folderPath: undefined };
+              return { ...meeting, audioAvailable: false };
             }
           }
           return meeting;
@@ -102,7 +98,7 @@ export function useTranscriptRecovery(): UseTranscriptRecoveryReturn {
       return transcripts;
     } catch (error) {
       console.error('Failed to load meeting transcripts:', error);
-      return [];
+      throw error;
     }
   }, []);
 
@@ -120,22 +116,12 @@ export function useTranscriptRecovery(): UseTranscriptRecoveryReturn {
 
       // 2. Load all transcripts
       const transcripts = await loadMeetingTranscripts(meetingId);
-      if (transcripts.length === 0) {
-        throw new Error('No transcripts found for this meeting');
-      }
 
       // 3. Check for folder path
-      let folderPath = metadata.folderPath;
+      const folderPath = metadata.folderPath;
 
-
-      if (!folderPath) {
-        // Try to get from backend (might exist if only app crashed, not system)
-        try {
-          folderPath = await invoke<string>('get_meeting_folder_path');
-        } catch (error) {
-          folderPath = undefined;
-        }
-      }
+      // Never borrow the current native session's folder for a different draft.
+      // Audio-only recovery requires this meeting's durable folder reference.
 
       // 4. Attempt audio recovery if folder path exists
       let audioRecoveryStatus: AudioRecoveryStatus | null = null;
@@ -163,6 +149,12 @@ export function useTranscriptRecovery(): UseTranscriptRecoveryReturn {
         };
       }
 
+      const verifiedAudio = !!audioRecoveryStatus?.audio_file_path
+        && ['success', 'partial'].includes(audioRecoveryStatus.status);
+      if (!transcripts.some(t => t.text.trim()) && !verifiedAudio) {
+        throw new Error('No transcript text or validated recorded audio is available. Recovery references were kept.');
+      }
+
       // 5. Convert StoredTranscripts to the format expected by storageService
       const formattedTranscripts = transcripts.map((t, index) => ({
         id: t.id?.toString() || `${Date.now()}-${index}`,
@@ -184,10 +176,13 @@ export function useTranscriptRecovery(): UseTranscriptRecoveryReturn {
         metadata.title,
         formattedTranscripts,
         folderPath ?? null,
-        new Date(metadata.startTime).toISOString()
+        new Date(metadata.startTime).toISOString(),
+        metadata.meetingId // Native idempotency survives UI reload/commit-response loss.
       );
 
       const savedMeetingId = saveResponse.meeting_id;
+      if (!savedMeetingId) throw new Error('Meeting save did not return a library ID; recovery references were kept.');
+      announceChange('meetings', { meetingId: savedMeetingId });
       // Named speakers in the recovered lines became contacts.
       announceChange('people');
 
@@ -201,11 +196,12 @@ export function useTranscriptRecovery(): UseTranscriptRecoveryReturn {
       }
 
       // 7. Mark as saved in IndexedDB
-      await indexedDBService.markMeetingSaved(meetingId);
+      const audioNeedsReview = ['partial', 'failed'].includes(audioRecoveryStatus?.status ?? '');
+      if (!audioNeedsReview) await indexedDBService.markMeetingSaved(meetingId);
 
 
       // 8. Clean up checkpoint files
-      if (folderPath) {
+      if (folderPath && !audioNeedsReview) {
         try {
           await invoke('cleanup_checkpoints', { meetingFolder: folderPath });
         } catch (error) {
@@ -215,7 +211,7 @@ export function useTranscriptRecovery(): UseTranscriptRecoveryReturn {
       }
 
       // 9. Remove from recoverable list
-      setRecoverableMeetings(prev => prev.filter(m => m.meetingId !== meetingId));
+      if (!audioNeedsReview) setRecoverableMeetings(prev => prev.filter(m => m.meetingId !== meetingId));
 
       return {
         success: true,

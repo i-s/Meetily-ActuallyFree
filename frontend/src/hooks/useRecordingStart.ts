@@ -24,10 +24,16 @@ type StartSource = 'home_page' | 'sidebar_auto' | 'sidebar_direct';
 /** A readable reason for a failed start, from the backend's error text. */
 export function describeStartError(error: unknown): { title: string; message: string } {
   const text = (error instanceof Error ? error.message : String(error)).toLowerCase();
+  if (text.includes('one app at a time')) {
+    return {
+      title: 'Choose one app on macOS',
+      message: 'Remove extra selected apps in Recording settings before starting. No broader audio source was substituted.',
+    };
+  }
   if (text.includes('target application')) {
     return {
-      title: 'None of your chosen apps is open',
-      message: 'Computer audio is set to record only chosen apps. Open one of them, or switch the record card back to all computer audio.',
+      title: 'Chosen apps are not available',
+      message: 'Select an app and open every chosen app before recording, or remove unavailable apps. No broader audio source was substituted.',
     };
   }
   if (text.includes('microphone') || text.includes('mic') || text.includes('input')) {

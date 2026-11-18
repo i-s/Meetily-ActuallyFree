@@ -248,28 +248,10 @@ impl AudioStream {
     ) -> Result<Self> {
         info!("🎯 Creating per-app audio stream for {} target(s)", targets.len());
 
-        #[cfg(target_os = "macos")]
-        if targets.len() > 1 {
-            anyhow::bail!("macOS currently supports one selected app at a time. Select one app or use all computer audio.");
-        }
-
-        let mut running_targets = Vec::new();
-        for target in &targets {
-            if let Some(pid) = crate::audio::capture::per_app::find_pid_for_app(&target.executable) {
-                info!("🎯 Found active PID {} for target app '{}' ({})", pid, target.name, target.executable);
-                running_targets.push((target.name.clone(), pid));
-            } else {
-                warn!("⚠️ Target app '{}' ({}) is not currently running", target.name, target.executable);
-            }
-        }
-
-        if running_targets.is_empty() {
-            let target_summary: Vec<String> = targets.iter().map(|t| format!("{} ({})", t.name, t.executable)).collect();
-            return Err(anyhow::anyhow!(
-                "None of the target applications are currently running: {}. Please launch at least one application before recording.",
-                target_summary.join(", ")
-            ));
-        }
+        let selected: Vec<_> = targets.iter().map(|target| (target.name.clone(), target.executable.clone())).collect();
+        let running_targets = super::recording_mode::resolve_app_targets(
+            cfg!(target_os = "macos"), &selected, crate::audio::capture::per_app::find_pid_for_app,
+        ).map_err(anyhow::Error::msg)?;
 
         let display_names: Vec<String> = running_targets.iter().map(|(name, _)| name.clone()).collect();
         let device = Arc::new(AudioDevice {
@@ -303,13 +285,15 @@ impl AudioStream {
 
         #[cfg(target_os = "macos")]
         {
-            let first_pid = running_targets[0].1;
+            let [(_, selected_pid)] = running_targets.as_slice() else {
+                anyhow::bail!("macOS requires exactly one resolved audio application");
+            };
             Self::create_core_audio_stream_with_process(
                 device,
                 state,
                 _device_type,
                 recording_sender,
-                Some(first_pid),
+                Some(*selected_pid),
             ).await
         }
 
@@ -477,6 +461,13 @@ impl AudioStreamManager {
         let backend = get_current_backend();
         info!("🎙️ Starting audio streams with backend: {:?}, per-app: {:?}", backend, per_app_targets.is_some());
 
+        if let Some(targets) = &per_app_targets {
+            let selected: Vec<_> = targets.iter().map(|target| (target.name.clone(), target.executable.clone())).collect();
+            // Fail the full selection before opening even the microphone. The
+            // actual app-stream open resolves again to catch an exit in between.
+            super::recording_mode::resolve_app_targets(cfg!(target_os = "macos"), &selected,
+                crate::audio::capture::per_app::find_pid_for_app).map_err(anyhow::Error::msg)?;
+        }
         // Start microphone stream
         if let Some(mic_device) = microphone_device {
             info!("🎤 Creating microphone stream: {} (always uses CPAL)", mic_device.name);

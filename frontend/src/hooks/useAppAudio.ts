@@ -8,6 +8,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { toast } from 'sonner';
+import { usePlatform } from '@/hooks/usePlatform';
 import type { PerAppTarget, RecordableApp, RecordingPreferences } from '@/components/RecordingSettings';
 
 const APP_AUDIO_CHANGED_EVENT = 'meetily-app-audio-changed';
@@ -26,6 +27,7 @@ export interface AppAudioChoice {
   setOnlyApps: (value: boolean) => void;
   addApp: (app: RecordableApp | PerAppTarget) => void;
   removeApp: (executable: string) => void;
+  clearApps: () => void;
   scan: () => Promise<void>;
   /** Pick an app that is not running from disk. */
   browse: () => Promise<void>;
@@ -34,6 +36,7 @@ export interface AppAudioChoice {
 }
 
 export function useAppAudio(): AppAudioChoice {
+  const platform = usePlatform();
   const [loaded, setLoaded] = useState(false);
   const [onlyApps, setOnlyAppsState] = useState(false);
   const [targets, setTargets] = useState<PerAppTarget[]>([]);
@@ -111,11 +114,15 @@ export function useAppAudio(): AppAudioChoice {
   const addApp = useCallback((app: RecordableApp | PerAppTarget) => {
     const current = latest.current;
     if (current.targets.some((target) => sameApp(target, app))) return;
+    if (platform === 'macos' && current.targets.length > 0) {
+      toast.error('macOS supports one app at a time', { description: 'Remove the current app before choosing another.' });
+      return;
+    }
     save({
       onlyApps: current.onlyApps,
       targets: [...current.targets, { id: app.id || app.executable, name: app.name, executable: app.executable, icon: app.icon ?? null }],
     });
-  }, [save]);
+  }, [save, platform]);
 
   const removeApp = useCallback((executable: string) => {
     const current = latest.current;
@@ -153,6 +160,7 @@ export function useAppAudio(): AppAudioChoice {
     setOnlyApps,
     addApp,
     removeApp,
+    clearApps: () => save({ onlyApps: latest.current.onlyApps, targets: [] }),
     scan,
     browse,
     statusOf,
