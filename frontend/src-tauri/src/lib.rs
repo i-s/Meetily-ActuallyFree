@@ -38,6 +38,7 @@ pub mod api;
 pub mod app_update;
 pub mod audio;
 pub mod claude_cli;
+pub mod codex_cli;
 pub mod config;
 pub mod console_utils;
 pub mod crash_report;
@@ -877,6 +878,12 @@ pub fn run() {
             summary::template_commands::api_save_custom_template,
             summary::template_commands::api_delete_custom_template,
             summary::template_commands::api_is_custom_template,
+            codex_cli::commands::codex_cli_get_path,
+            codex_cli::commands::codex_cli_save_path,
+            codex_cli::commands::codex_cli_get_status,
+            codex_cli::commands::codex_live_cutoff,
+            codex_cli::commands::codex_live_ask,
+            codex_cli::commands::codex_live_cancel,
             live_assistant::ask_live_assistant,
             live_assistant::ask_person,
             live_assistant::api_ask_meeting,

@@ -138,6 +138,21 @@ state for dialogs, including native activation events and stale-response guards.
 Live ASR and post-call ASR defaults are independent. Optional Whisper activation
 saves the **post-call** default; it must not replace the live Parakeet selection.
 
+### Live subscription questions (issue #13)
+
+`recording/LiveCodexChat.tsx` replaces only the recording panel's generic-provider
+Ask AI caller. `codex_cli/{commands,context,service,cli,jobs}.rs` owns native
+current-session/committed-Notes validation, typed verified citations, cancellation
+and the isolated installed subscription CLI. The five-minute action anchors to
+`recording_commands::current_text_clock()` (active seconds excluding pauses), not
+ASR arrival time or a display timer. Notes remain separate revisioned user data.
+Read [ISSUE13_CODEX_LIVE.md](ISSUE13_CODEX_LIVE.md) before reusing this provider for
+#15/#16: it documents the dedicated private CODEX_HOME/one-time separate login,
+real CLI 0.167.2 global-AGENTS leak reproduction and isolation controls, bounded
+process ownership, stable interfaces and remaining real-subscription/physical Mac
+gates. The live path has no summary-provider/API/key fallback and reads no other
+meetings, contacts or audio. Saved-library/group AI is a separate legacy path.
+
 ## 4. Optional download ownership and UI synchronization
 
 `frontend/src/contexts/OptionalModelDownloadsContext.tsx` owns optional jobs above

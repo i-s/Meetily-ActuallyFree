@@ -159,8 +159,8 @@ export function LiveSession({
       })),
     [transcripts],
   );
-  const lines = useMemo<LiveLine[]>(
-    () => transcripts.map((t) => ({ id: t.id, time: t.audio_start_time ?? 0, speaker: t.speaker, text: t.text })),
+  const lines = useMemo<Array<LiveLine & { endTime: number; sequenceId?: number }>>(
+    () => transcripts.map((t) => ({ id: t.id, time: t.audio_start_time ?? NaN, endTime: t.audio_end_time ?? NaN, sequenceId: t.sequence_id, speaker: t.speaker, text: t.text })),
     [transcripts],
   );
 
