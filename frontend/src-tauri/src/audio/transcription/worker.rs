@@ -1,25 +1,9 @@
 //! Transcription worker pool: consumes VAD speech segments and produces
 //! transcript lines, which are emitted to the UI as `transcript-update` events.
 //!
-//! ## Where the input comes from
-//! Segments arrive from `AudioPipeline` and are **mixed** mic+system audio at
-//! 16 kHz. Their `device_type` is a placeholder and carries no speaker
-//! information — see the pipeline module docs.
-//!
-//! ## Speaker labelling
-//! Each segment is labelled before being emitted:
-//!
-//! 1. **Live diarization** (preferred) — `crate::diarization::online` embeds the
-//!    segment and matches it against voices heard so far, yielding
-//!    "Speaker 1/2/3". Active only when the diarization models are installed.
-//! 2. **Capture-source fallback** — reads `device_type`, which for mixed audio
-//!    can only ever produce "You". Retained purely so transcripts still carry
-//!    some label without the models.
-//!
-//! The label travels to the frontend as `TranscriptUpdate.source`, which
-//! `TranscriptContext` maps onto `Transcript.speaker` for rendering. Running the
-//! "Speakers" action on a finished meeting re-runs full offline diarization and
-//! overwrites these live labels with more accurate ones.
+//! Independent microphone/system VAD turns preserve capture provenance. The displayed
+//! speaker label is separate from that provenance. Optional issue #8 diagnostics
+//! measure dispatcher queue/service time, not physical speech-to-WebView latency.
 
 use super::engine::TranscriptionEngine;
 use super::provider::TranscriptionError;
@@ -31,6 +15,25 @@ use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager, Runtime};
+
+struct TimedChunk {
+    chunk: AudioChunk,
+    timing: Option<super::timing::ChunkTiming>,
+}
+
+struct TimingGuard(Option<super::timing::ChunkTiming>);
+impl TimingGuard {
+    fn outcome(&mut self, outcome: &'static str) {
+        if let Some(timing) = &mut self.0 { timing.outcome(outcome); }
+    }
+}
+impl Drop for TimingGuard {
+    fn drop(&mut self) {
+        if let Some(timing) = &self.0 {
+            info!("MEETILY_ISSUE8 {}", timing.json());
+        }
+    }
+}
 
 // Sequence counter for transcript updates
 static SEQUENCE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -106,7 +109,7 @@ pub fn start_transcription_task<R: Runtime>(
 
         // Create parallel workers for faster processing while preserving ALL chunks
         const NUM_WORKERS: usize = 1; // Serial processing ensures transcripts emit in chronological order
-        let (work_sender, work_receiver) = tokio::sync::mpsc::unbounded_channel::<AudioChunk>();
+        let (work_sender, work_receiver) = tokio::sync::mpsc::unbounded_channel::<TimedChunk>();
         let work_receiver = Arc::new(tokio::sync::Mutex::new(work_receiver));
 
         // Track completion: AtomicU64 for chunks queued, AtomicU64 for chunks completed
@@ -160,7 +163,9 @@ pub fn start_transcription_task<R: Runtime>(
                     };
 
                     match chunk {
-                        Some(chunk) => {
+                        Some(TimedChunk { chunk, timing }) => {
+                            let mut timing = TimingGuard(timing);
+                            if let Some(clock) = &mut timing.0 { clock.start(); }
                             // PERFORMANCE OPTIMIZATION: Reduce logging in hot path
                             // Only log every 10th chunk per worker to reduce I/O overhead
                             let should_log_this_chunk = chunk.chunk_id % 10 == 0;
@@ -182,6 +187,7 @@ pub fn start_transcription_task<R: Runtime>(
                                 continue;
                             }
 
+                            timing.outcome("failed");
                             let chunk_timestamp = chunk.timestamp;
                             let chunk_duration = chunk.data.len() as f64 / chunk.sample_rate as f64;
 
@@ -235,6 +241,7 @@ pub fn start_transcription_task<R: Runtime>(
                             .await
                             {
                             Ok((transcript, confidence_opt, is_partial)) => {
+                                timing.outcome("empty");
                                 if nemotron_remote {
                                     // Inference runs concurrently with ASR. Wait only for bounded
                                     // lookahead here, never on the capture or Tokio worker thread.
@@ -303,8 +310,10 @@ pub fn start_transcription_task<R: Runtime>(
                                             duration: chunk_duration,
                                         };
 
+                                        timing.outcome("emitted");
                                         if let Err(e) = app_clone.emit("transcript-update", &update)
                                         {
+                                            timing.outcome("emit_failed");
                                             error!(
                                                 "Worker {}: Failed to emit transcript update: {}",
                                                 worker_id, e
@@ -406,14 +415,29 @@ pub fn start_transcription_task<R: Runtime>(
 
         // Main dispatcher: receive chunks and distribute to workers
         let mut receiver = transcription_receiver;
+        let diagnostics = std::env::var("MEETILY_ISSUE8_TIMING").as_deref() == Ok("1");
         while let Some(chunk) = receiver.recv().await {
+            let timing = diagnostics.then(|| super::timing::ChunkTiming::new(
+                chunk.chunk_id, chunk.timestamp, chunk.data.len() as f64 / chunk.sample_rate as f64,
+                match &chunk.device_type {
+                    crate::audio::recording_state::DeviceType::Microphone => "microphone",
+                    crate::audio::recording_state::DeviceType::System => "system",
+                    crate::audio::recording_state::DeviceType::Mixed => "mixed",
+                },
+            ));
             let queued = chunks_queued.fetch_add(1, Ordering::SeqCst) + 1;
             info!(
                 "📥 Dispatching chunk {} to workers (total queued: {})",
                 chunk.chunk_id, queued
             );
 
-            if let Err(_) = work_sender.send(chunk) {
+            if diagnostics {
+                info!("MEETILY_ISSUE8 {}", serde_json::json!({
+                    "kind": "asr_queued", "chunk_id": chunk.chunk_id,
+                    "audio_start_seconds": chunk.timestamp,
+                }));
+            }
+            if let Err(_) = work_sender.send(TimedChunk { chunk, timing }) {
                 error!("❌ Failed to send chunk to workers - this should not happen!");
                 break;
             }
@@ -483,6 +507,12 @@ pub fn start_transcription_task<R: Runtime>(
             }
         }
 
+        if diagnostics {
+            info!("MEETILY_ISSUE8 {}", serde_json::json!({
+                "kind": "asr_drained", "queued": chunks_queued.load(Ordering::SeqCst),
+                "completed": chunks_completed.load(Ordering::SeqCst),
+            }));
+        }
         info!("✅ Parallel transcription task completed - all workers finished, ready for model unload");
     })
 }

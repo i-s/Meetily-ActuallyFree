@@ -186,6 +186,20 @@ manual review. The example fixture is explicitly `physical_acceptance: not_run`.
 The final batched Mac run depends on issue #5 and the one final DMG; no DMG build or
 physical operation is part of this preparation.
 
+## Issue #8 duration and subscription CLI qualification
+
+[ISSUE8_QUALIFICATION.md](ISSUE8_QUALIFICATION.md) owns the four-run Mac protocol,
+model/corpus provenance, speech/display clock limits, power/resource/audio-integrity
+checks and configuration decision. `scripts/issue8_qualification.py` collects
+resource samples, runs only a fixed synthetic-text subscription Codex CLI prompt,
+summarizes text-free ASR diagnostic records and checks manual journals for missing
+evidence/failed targets. `audio/transcription/timing.rs` plus `worker.rs` emit
+opt-in dispatcher queue/service/outcome records (`MEETILY_ISSUE8_TIMING=1`).
+This is qualification instrumentation, not an in-app Codex provider or a physical
+Mac pass. Existing ASR/capture semantics and queue policy are unchanged. Portable
+coverage is `tests/test_issue8_qualification.py`; native build and physical/model
+qualification remain separately required.
+
 ## 7. Tests, qualification, and historical notes
 
 Issue #5 artifact-only Actions build (pinned source/tree vs workflow SHA),
