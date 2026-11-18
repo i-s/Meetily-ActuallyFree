@@ -555,7 +555,7 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
     system_device_name: Option<String>,
     meeting_name: Option<String>,
 ) -> Result<super::recording_ownership::RecordingLease, String> {
-    start_recording_with_lifecycle(app, mic_device_name, system_device_name, meeting_name, None).await
+    start_recording_with_lifecycle(app, mic_device_name, system_device_name, meeting_name, None, None).await
 }
 
 pub async fn start_recording_with_lifecycle<R: Runtime>(
@@ -564,7 +564,20 @@ pub async fn start_recording_with_lifecycle<R: Runtime>(
     system_device_name: Option<String>,
     meeting_name: Option<String>,
     lifecycle_session: Option<String>,
+    expected_start: Option<super::recording_start_authority::StartRequest>,
 ) -> Result<super::recording_ownership::RecordingLease, String> {
+    let engine_lifecycle_guard = super::common::acquire_engine_lifecycle_lock().await;
+    // Claim before qualification/setup, under the SAME lock as settle/cancel.
+    // Cancellation before this IPC arrives permanently consumes its sequence.
+    let start_claim = expected_start.as_ref().map(super::recording_start_authority::claim).transpose()?;
+    if lifecycle_session.is_some() != expected_start.is_some() {
+        return Err("Automated recording requires native start authority v1 and a lifecycle session".into());
+    }
+    if let Some(expected) = &expected_start {
+        if lifecycle_session.as_deref() != Some(expected.session_id.as_str()) {
+            return Err("Recording start session binding mismatch".into());
+        }
+    }
     if let Some(session) = &lifecycle_session {
         crate::meeting_detection::lifecycle::validate_start(session)?;
     }
@@ -575,12 +588,15 @@ pub async fn start_recording_with_lifecycle<R: Runtime>(
             .ok_or("The automated call ended before recording initialization.")?),
         None => None,
     };
+    if let (Some(expected), Some(owner)) = (&expected_start, &lifecycle_owner) {
+        if expected.source != owner.source || expected.session_id != owner.session_id {
+            return Err("Recording start source/session binding mismatch".into());
+        }
+    }
     info!(
         "Starting recording with specific devices: mic={:?}, system={:?}, meeting={:?}",
         mic_device_name, system_device_name, meeting_name
     );
-
-    let engine_lifecycle_guard = super::common::acquire_engine_lifecycle_lock().await;
 
     // Check if already recording
     let current_recording_state = IS_RECORDING.load(Ordering::SeqCst);
@@ -750,6 +766,7 @@ pub async fn start_recording_with_lifecycle<R: Runtime>(
     info!("ðŸ” Setting IS_RECORDING to true and resetting SPEECH_DETECTED_EMITTED");
     let recording_lease = super::recording_ownership::begin(lifecycle_owner);
     IS_RECORDING.store(true, Ordering::SeqCst);
+    if let Some(claim) = start_claim { claim.commit(recording_lease.clone()); }
 
     // Live speaker identification: label transcript segments with individual
     // voices as they arrive. Best-effort — if the models aren't installed we
@@ -834,6 +851,28 @@ pub async fn start_recording_with_lifecycle<R: Runtime>(
     drop(engine_lifecycle_guard);
 
     Ok(recording_lease)
+}
+
+/// Settling barriers, not snapshots: queued starts cannot commit after a receipt.
+/// An already-admitted capture holds this lock; resolve waits for its outcome
+/// instead of pretending that cancellation can safely interrupt device startup.
+#[tauri::command]
+pub async fn resolve_automated_recording_start(
+    expected: super::recording_start_authority::StartRequest,
+) -> Result<super::recording_start_authority::StartResolution, String> {
+    let _engine_lifecycle_guard = super::common::acquire_engine_lifecycle_lock().await;
+    let mut result = super::recording_start_authority::settle(&expected)?;
+    result.recording_lease = super::recording_ownership::current();
+    result.is_recording = IS_RECORDING.load(Ordering::SeqCst);
+    result.is_stopping = IS_STOPPING.load(Ordering::SeqCst);
+    Ok(result)
+}
+
+#[tauri::command]
+pub async fn cancel_automated_recording_start(
+    expected: super::recording_start_authority::StartRequest,
+) -> Result<super::recording_start_authority::StartResolution, String> {
+    resolve_automated_recording_start(expected).await
 }
 
 /// Stop recording with optimized graceful shutdown ensuring NO transcript chunks are lost

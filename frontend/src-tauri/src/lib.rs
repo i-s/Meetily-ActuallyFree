@@ -365,7 +365,7 @@ async fn start_recording_with_devices<R: Runtime>(
     mic_device_name: Option<String>,
     system_device_name: Option<String>,
 ) -> Result<(), String> {
-    start_recording_with_devices_and_meeting(app, mic_device_name, system_device_name, None, None).await.map(|_| ())
+    start_recording_with_devices_and_meeting(app, mic_device_name, system_device_name, None, None, None).await.map(|_| ())
 }
 
 #[tauri::command]
@@ -375,6 +375,7 @@ async fn start_recording_with_devices_and_meeting<R: Runtime>(
     system_device_name: Option<String>,
     meeting_name: Option<String>,
     lifecycle_session: Option<String>,
+    expected_start: Option<audio::recording_start_authority::StartRequest>,
 ) -> Result<audio::recording_ownership::RecordingLease, String> {
     log_info!("ðŸš€ CALLED start_recording_with_devices_and_meeting - Mic: {:?}, System: {:?}, Meeting: {:?}",
              mic_device_name, system_device_name, meeting_name);
@@ -383,9 +384,9 @@ async fn start_recording_with_devices_and_meeting<R: Runtime>(
     let meeting_name_for_notification = meeting_name.clone();
 
     // Call the recording module functions that support meeting names
-    let recording_result = if lifecycle_session.is_some() {
+    let recording_result = if lifecycle_session.is_some() || expected_start.is_some() {
         audio::recording_commands::start_recording_with_lifecycle(
-            app.clone(), mic_device_name.clone(), system_device_name.clone(), meeting_name.clone(), lifecycle_session,
+            app.clone(), mic_device_name.clone(), system_device_name.clone(), meeting_name.clone(), lifecycle_session, expected_start,
         ).await
     } else {
         match (mic_device_name.clone(), system_device_name.clone()) {
@@ -749,6 +750,9 @@ pub fn run() {
             onnx_runtime::check_transcription_runtime,
             start_recording_with_devices,
             start_recording_with_devices_and_meeting,
+            audio::recording_start_authority::get_recording_start_capability,
+            audio::recording_commands::resolve_automated_recording_start,
+            audio::recording_commands::cancel_automated_recording_start,
             start_audio_level_monitoring,
             stop_audio_level_monitoring,
             is_audio_level_monitoring,

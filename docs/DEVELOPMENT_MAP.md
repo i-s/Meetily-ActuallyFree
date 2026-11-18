@@ -25,7 +25,10 @@ meeting automation or adding Discord's adapter. Prior physical AX **UNKNOWN** is
 unresolved. Real AX classes are observation-only and cannot authorize capture,
 including with old enabled preferences; timestamped read-only qualification is
 available in Settings. Shared token reservations and native recording generations/
-owners guard Stop atomically and restore ownership on WebView reload. Scoped native
+owners guard Stop atomically and restore ownership on WebView reload. The follow-up
+[native start authority v1](RECORDING_START_AUTHORITY.md) fences delayed start IPC
+with a process epoch/sequence and serialized terminal barriers; #11 owns browser
+expiry/phase integration, which is not implied by the native-only implementation. Scoped native
 provenance (identified Zoom contexts, ambiguous global Zoom inventory, and room)
 sets persisted `microphone_identity_unverified`; unrelated capture keeps its prior
 behavior. Flagged offline calls bypass BOTH mic-to-You and legacy voiceprint/user-
