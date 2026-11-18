@@ -43,6 +43,26 @@ Notes JSON/Markdown are not copied into them. Summary archiving on selection doe
 not archive or clear Notes. Existing #9 recovery and source/provenance ownership
 remain unchanged.
 
+## R1: compatibility first-save revision
+
+The registered `api_save_meeting_notes` compatibility command establishes revision
+`1` on first insert, just like `api_write_notes_document`; subsequent compatibility
+updates increment the existing revision. Otherwise an editor that read an absent
+document at `0` could silently overwrite the compatibility writer's first Notes.
+The migration default remains `0` for genuinely pre-existing Notes: a client that
+reads those Notes can still update them at their current revision. Recording-folder
+attachment copies its existing revision, and both revisioned insertion paths
+already establish `1`; no schema or transaction boundary changes are needed.
+
+The production-command regression in `frontend/tests/native/notes-versions.rs`
+failed before this fix because the stale absent-document write succeeded. It now
+checks rejection, exact preservation of the other writer's formatted RU/EN
+Markdown/JSON, successful current-revision save, and advancing later compatibility
+updates. A separate fixture creates Notes before the revision migration, applies
+the remaining complete migration sequence, and verifies revision-zero editing.
+Both execute against real SQLite with production command/repository bodies; only
+the Tauri state/command transport boundary is stubbed.
+
 ## Qualification and limits
 
 `frontend/tests/transcript-versions/page-editors.test.tsx` drives the real page,

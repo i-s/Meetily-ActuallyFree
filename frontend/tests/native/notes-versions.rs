@@ -4,10 +4,19 @@ use crate::{api::TranscriptSegment, database::transcript_versions as versions, n
 use sqlx::SqlitePool;
 
 async fn migrate(pool: &SqlitePool) {
+    migrate_with_legacy_notes(pool, false).await;
+}
+async fn migrate_with_legacy_notes(pool: &SqlitePool, legacy: bool) {
     let folder = std::path::Path::new(file!()).parent().unwrap().join("../../src-tauri/migrations");
     let mut files: Vec<_> = std::fs::read_dir(folder).unwrap().map(|entry| entry.unwrap().path()).filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("sql")).collect();
     files.sort();
-    for file in files { sqlx::raw_sql(&std::fs::read_to_string(file).unwrap()).execute(pool).await.unwrap(); }
+    for file in files {
+        if legacy && file.file_name().unwrap() == "20261118001200_recording_notes.sql" {
+            // Populate the old schema before its revision column exists.
+            sqlx::raw_sql("INSERT INTO meetings(id,title,created_at,updated_at) VALUES('legacy-notes','Legacy','2025','2025'); INSERT INTO meeting_notes(meeting_id,notes_markdown,notes_json,created_at,updated_at) VALUES('legacy-notes','Старые Notes','[{\"type\":\"paragraph\",\"content\":\"exact old blocks\"}]','2025','2025');").execute(pool).await.unwrap();
+        }
+        sqlx::raw_sql(&std::fs::read_to_string(file).unwrap()).execute(pool).await.unwrap();
+    }
     assert!(sqlx::query("PRAGMA foreign_key_check").fetch_all(pool).await.unwrap().is_empty());
 }
 fn turn(id: &str, text: &str, speaker: &str) -> TranscriptSegment {
@@ -92,4 +101,52 @@ async fn combined_pending_summary_and_notes_competing_writer_are_separate_revisi
     assert!(archived.unwrap().contains("pending summary"));
     assert_eq!(notes_document::read(&pool,&target).await.unwrap().unwrap().revision,2);
     assert_eq!(notes_document::read(&pool,&target).await.unwrap().unwrap().json,Some(blocks()));
+}
+
+#[tokio::test]
+async fn compatibility_first_notes_insert_rejects_absent_document_cas() {
+    use crate::database::repositories::meeting_notes::api_save_meeting_notes;
+    let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+    migrate(&pool).await;
+    let meeting = TranscriptsRepository::save_transcript(&pool, "Meeting", &[], None, None).await.unwrap();
+    let target = format!("meeting:{meeting}");
+    // Editor A loads absence at revision zero, then compatibility writer B saves.
+    assert!(notes_document::read(&pool, &target).await.unwrap().is_none());
+    let state = crate::state::AppState { db_manager: crate::state::DbManager(pool.clone()) };
+    let markdown = "## **Заметки B / Notes**\n\n- *API follow-up*";
+    api_save_meeting_notes(crate::State(&state), meeting.clone(), Some(markdown.into()), Some(blocks())).await.unwrap();
+    let stale = notes_document::write(&pool, &target, "A stale draft", Some(serde_json::json!([])), 0).await;
+    assert!(stale.is_err(), "absent-document CAS must not overwrite the first compatibility save");
+    let saved = notes_document::read(&pool, &target).await.unwrap().unwrap();
+    assert_eq!(saved.revision, 1);
+    assert_eq!(saved.markdown.as_deref(), Some(markdown));
+    assert_eq!(saved.json, Some(blocks()));
+    assert_eq!(saved.source, "user_notes");
+    assert_eq!(notes_document::write(&pool, &target, "Reviewed A", Some(blocks()), saved.revision).await.unwrap(), 2);
+    for revision in [3, 4] {
+        api_save_meeting_notes(crate::State(&state), meeting.clone(), Some(markdown.into()), Some(blocks())).await.unwrap();
+        let saved = notes_document::read(&pool, &target).await.unwrap().unwrap();
+        assert_eq!(saved.revision, revision);
+        assert_eq!(saved.markdown.as_deref(), Some(markdown));
+        assert_eq!(saved.json, Some(blocks()));
+    }
+}
+
+#[tokio::test]
+async fn compatibility_revision_fix_preserves_preexisting_migrated_zero_notes() {
+    use crate::database::repositories::meeting_notes::api_save_meeting_notes;
+    let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+    migrate_with_legacy_notes(&pool, true).await;
+    let target = "meeting:legacy-notes";
+    let saved = notes_document::read(&pool, target).await.unwrap().unwrap();
+    assert_eq!(saved.revision, 0);
+    assert_eq!(saved.markdown.as_deref(), Some("Старые Notes"));
+    assert_eq!(saved.json, Some(serde_json::json!([{"type":"paragraph","content":"exact old blocks"}])));
+    assert_eq!(notes_document::write(&pool, target, "Reviewed migrated Notes", Some(blocks()), 0).await.unwrap(), 1);
+    let state = crate::state::AppState { db_manager: crate::state::DbManager(pool.clone()) };
+    api_save_meeting_notes(crate::State(&state), "legacy-notes".into(), Some("Legacy update".into()), Some(blocks())).await.unwrap();
+    let saved = notes_document::read(&pool, target).await.unwrap().unwrap();
+    assert_eq!(saved.revision, 2);
+    assert_eq!(saved.markdown.as_deref(), Some("Legacy update"));
+    assert_eq!(saved.json, Some(blocks()));
 }
