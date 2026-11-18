@@ -110,6 +110,24 @@ pub async fn release(
 ) -> Result<(), String> {
     checked(sqlx::query("UPDATE post_call_jobs SET status=?,error=?,updated_at=datetime('now') WHERE meeting_id=? AND epoch=? AND status='running'").bind(status).bind(error).bind(&job.meeting_id).bind(job.epoch).execute(pool).await.map_err(|e|e.to_string())?.rows_affected())
 }
+/// Retain one exact claim's terminal intent until SQLite accepts it or the
+/// claim is superseded. The caller must drop inference/resource admission first.
+/// A zero-row UPDATE is success here: defer/cancel/new epochs own their state.
+pub async fn reconcile_release(pool: &SqlitePool, job: &Job, status: &str, error: Option<&str>) {
+    let mut delay = std::time::Duration::from_millis(500);
+    loop {
+        match sqlx::query("UPDATE post_call_jobs SET status=?,error=?,updated_at=datetime('now') WHERE meeting_id=? AND epoch=? AND status='running'")
+            .bind(status).bind(error).bind(&job.meeting_id).bind(job.epoch).execute(pool).await {
+            Ok(_) => return,
+            Err(_) => {
+                // Persistence failure is not lost ownership. Never rerun work
+                // or reset other claims; keep this intent with bounded backoff.
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(std::time::Duration::from_secs(5));
+            }
+        }
+    }
+}
 pub async fn control(pool: &SqlitePool, meeting: &str, action: &str) -> Result<(), String> {
     let status = match action {
         "defer" => "deferred",

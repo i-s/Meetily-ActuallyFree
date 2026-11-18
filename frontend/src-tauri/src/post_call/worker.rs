@@ -86,12 +86,14 @@ pub fn start<R: Runtime>(app: AppHandle<R>) {
                             if recording_commands::is_recording_active()
                                 || recording_commands::is_recording_stopping()
                             {
-                                let _ = store::release(&pool, &job, "queued", None).await;
+                                drop(work);
+                                store::reconcile_release(&pool, &job, "queued", None).await;
                             } else {
                                 let _ = app.emit("post-call-queue-changed", ());
                                 let meeting = job.meeting_id.clone();
                                 let local_app = app.clone();
-                                let result=runner::execute(&pool,&job,&work.token,
+                                let token = work.token.clone();
+                                let result=runner::run(&pool,&job,&work.token,
                                     |token|async move {crate::audio::retranscription::run_queued_refinement(local_app,meeting,&token).await},
                                     ||snapshot(&pool,&job.meeting_id),
                                     |prompt,token|async move {
@@ -102,6 +104,8 @@ pub fn start<R: Runtime>(app: AppHandle<R>) {
                                         codex_cli::cli::generate(path.as_deref(),&home,codex_cli::cli::DEFAULT_MODEL,
                                             "Saved meeting summary. Return only the specified evidence-backed JSON.",&prompt,Some(&token)).await
                                     }).await;
+                                drop(work);
+                                runner::finish(&pool, &job, &token, &result).await;
                                 if result.is_err() {
                                     log::info!(
                                         "Post-call job retained for resume/retry: {}",
@@ -110,9 +114,8 @@ pub fn start<R: Runtime>(app: AppHandle<R>) {
                                 }
                                 let _ = app.emit("post-call-queue-changed", ());
                             }
-                            drop(work);
                         } else {
-                            let _ = store::release(&pool, &job, "queued", None).await;
+                            store::reconcile_release(&pool, &job, "queued", None).await;
                         }
                     }
                     Ok(None) => {}

@@ -221,3 +221,166 @@ async fn speech_or_notes_changed_during_local_work_are_rejected_before_cli_dispa
     assert_eq!(a.stage, "summary");
     assert_eq!(a.candidate_id.as_deref(), Some("post-call-refined:a"));
 }
+
+#[tokio::test]
+async fn failed_cli_release_survives_sqlite_busy_timeout_without_replaying_work() {
+    use std::{
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+        time::Duration,
+    };
+    let (_dir, p, writer) = contended_pool().await;
+    let j = store::claim(&p).await.unwrap().unwrap();
+    sqlx::query("INSERT INTO post_call_results(meeting_id,version_id,transcript_revision,notes_revision,vocabulary_revision,result_json) VALUES('a','old-selected',1,0,-1,?)").bind(EMPTY).execute(&p).await.unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = calls.clone();
+    runner::execute(
+        &p,
+        &j,
+        &CancellationToken::new(),
+        |_| async { Ok("post-call-refined:a".into()) },
+        || async { Ok(snapshot("a")) },
+        |_, _| async move {
+            counter.fetch_add(1, Ordering::SeqCst);
+            let mut lock = writer.begin().await.unwrap();
+            sqlx::query("UPDATE meetings SET folder_path=folder_path WHERE id='a'")
+                .execute(&mut *lock)
+                .await
+                .unwrap();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                lock.commit().await.unwrap();
+            });
+            Err("synthetic CLI failure".into())
+        },
+    )
+    .await
+    .unwrap_err();
+    // Wait past the external lock even on the broken early-return path.
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    let a = store::list(&p).await.unwrap().remove(0);
+    assert_eq!(
+        a.status, "waiting",
+        "release intent was lost after SQLITE_BUSY"
+    );
+    assert_eq!(a.stage, "summary");
+    assert_eq!(a.candidate_id.as_deref(), Some("post-call-refined:a"));
+    let artifacts = store::results(&p, "a").await.unwrap();
+    assert_eq!(artifacts.len(), 1);
+    assert_eq!(artifacts[0].version_id, "old-selected");
+    assert_eq!(artifacts[0].result_json, EMPTY);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let b = store::claim(&p).await.unwrap().unwrap();
+    assert_eq!(b.meeting_id, "b");
+    runner::execute(
+        &p,
+        &b,
+        &CancellationToken::new(),
+        |_| async { Ok("post-call-refined:b".into()) },
+        || async { Ok(snapshot("b")) },
+        |_, _| async { Ok(EMPTY.into()) },
+    )
+    .await
+    .unwrap();
+    assert_eq!(store::list(&p).await.unwrap()[1].status, "complete");
+}
+
+async fn contended_pool() -> (tempfile::TempDir, SqlitePool, SqlitePool) {
+    use std::time::Duration;
+    let dir = tempfile::tempdir().unwrap();
+    let options = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(dir.path().join("release.sqlite"))
+        .create_if_missing(true)
+        .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+        .busy_timeout(Duration::from_millis(40));
+    let p = SqlitePool::connect_with(options.clone()).await.unwrap();
+    sqlx::raw_sql("CREATE TABLE meetings(id TEXT PRIMARY KEY,folder_path TEXT); CREATE TABLE transcript_selection(meeting_id TEXT,version_id TEXT,revision INTEGER); CREATE TABLE meeting_notes(meeting_id TEXT,revision INTEGER); INSERT INTO meetings VALUES('a','/synthetic/a'),('b','/synthetic/b'); INSERT INTO transcript_selection VALUES('a','live-a',3),('b','live-b',0);").execute(&p).await.unwrap();
+    crate::test_schema::queue_schema(&p).await;
+    let mut tx = p.begin().await.unwrap();
+    store::enqueue(&mut tx, "a").await.unwrap();
+    store::enqueue(&mut tx, "b").await.unwrap();
+    tx.commit().await.unwrap();
+    let writer = SqlitePool::connect_with(options).await.unwrap();
+    (dir, p, writer)
+}
+
+#[tokio::test]
+async fn pending_release_does_not_block_recording_and_preserves_terminal_intent() {
+    use std::{sync::Arc, time::Duration};
+    let (_dir, p, writer) = contended_pool().await;
+    let j = store::claim(&p).await.unwrap().unwrap();
+    let priority = Arc::new(crate::priority::Priority::default());
+    let work = priority.try_background("a").await.unwrap();
+    let token = work.token.clone();
+    let result = runner::run(
+        &p,
+        &j,
+        &token,
+        |_| async { Ok("post-call-refined:a".into()) },
+        || async { Ok(snapshot("a")) },
+        |_, _| async { Err("synthetic CLI failure".into()) },
+    )
+    .await;
+    let mut lock = writer.begin().await.unwrap();
+    sqlx::query("UPDATE meetings SET folder_path=folder_path WHERE id='a'")
+        .execute(&mut *lock)
+        .await
+        .unwrap();
+    // Same ordering as worker: inference is drained, admission dropped, then
+    // only the exact terminal write is retained across the busy timeout.
+    drop(work);
+    let finish = runner::finish(&p, &j, &token, &result);
+    tokio::pin!(finish);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(150), &mut finish)
+            .await
+            .is_err()
+    );
+    let recording = tokio::time::timeout(Duration::from_millis(100), priority.recording())
+        .await
+        .expect("SQLite release retry held recording admission");
+    assert!(priority.try_background("b").await.is_none());
+    lock.commit().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(3), &mut finish)
+        .await
+        .unwrap();
+    assert_eq!(store::list(&p).await.unwrap()[0].status, "waiting");
+    drop(recording);
+    assert_eq!(store::claim(&p).await.unwrap().unwrap().meeting_id, "b");
+}
+
+#[tokio::test]
+async fn pending_release_never_overwrites_defer_cancel_or_a_new_claim() {
+    use std::time::Duration;
+    for action in ["defer", "cancel", "retry"] {
+        let (_dir, p, writer) = contended_pool().await;
+        let old = store::claim(&p).await.unwrap().unwrap();
+        let mut lock = writer.begin().await.unwrap();
+        sqlx::query("UPDATE meetings SET folder_path=folder_path WHERE id='a'")
+            .execute(&mut *lock)
+            .await
+            .unwrap();
+        let reconcile = store::reconcile_release(&p, &old, "waiting", Some("old failure"));
+        tokio::pin!(reconcile);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), &mut reconcile)
+                .await
+                .is_err()
+        );
+        lock.commit().await.unwrap();
+        store::control(&p, "a", action).await.unwrap();
+        if action == "retry" {
+            assert_eq!(store::claim(&p).await.unwrap().unwrap().meeting_id, "a");
+        }
+        let before = store::list(&p).await.unwrap().remove(0);
+        tokio::time::timeout(Duration::from_secs(3), &mut reconcile)
+            .await
+            .unwrap();
+        let after = store::list(&p).await.unwrap().remove(0);
+        assert_eq!(after.epoch, before.epoch);
+        assert_eq!(after.status, before.status);
+        assert_eq!(after.error, before.error);
+    }
+}

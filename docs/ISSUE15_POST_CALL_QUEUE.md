@@ -58,6 +58,19 @@ become `waiting`, with an explicit Retry action, not a retry storm or provider
 fallback. Cancel/Defer invalidate the epoch before requesting process-local
 cancellation; an old result cannot undo that choice.
 
+Release persistence is process-owned too. After local/CLI work drains, the worker
+drops background resource admission **before** `runner::finish` reconciles its
+terminal write. `store::reconcile_release` retains meeting + exact claim epoch +
+status/error, retrying SQLite failures with 500-ms exponential backoff capped at
+5 seconds. Admission rejection uses the same reconciliation for `queued`. No
+local/CLI replay or startup-wide recovery runs to repair a failed release. A
+successful zero-row epoch/status-guarded UPDATE means ownership was superseded
+(defer/cancel/retry/deletion) and ends reconciliation without touching current work.
+Recording can acquire resources while persistence waits; the scheduler retains
+this release intent until settled before claiming another job. Persistent database
+unavailability can still stall queue progress, but does not busy-spin or hold model
+admission; process restart continues to use ordinary startup recovery.
+
 ### Recording priority and retained progress
 
 Both native recording-start entrypoints reserve priority **before** acquiring
@@ -228,8 +241,11 @@ These tests use synthetic local text, SQLite and fake CLI executables only:
 
 - `python3 frontend/scripts/test-post-call-portable.py`: production queue storage,
   runner, evidence validation, recording-priority admission and scoped cancellation;
-  **25 passed**; includes disk reopen, epoch fencing, defer/resume, two calls, interruption, CLI
-  failure/retry, immutable history and all revision-tuple stale guards.
+  **28 passed**; includes disk reopen, epoch fencing, defer/resume, two calls, interruption, CLI
+  failure/retry, immutable history and all revision-tuple stale guards. Real file-backed
+  SQLite contention tests hold a second writer beyond busy timeout, then verify
+  terminal release, next-job completion, recording admission, and superseding
+  defer/cancel/new epochs without destroying candidate/result references.
 - `python3 frontend/scripts/test-post-call-native.py`: production scheduler,
   actual awaited refinement/start bodies, native command bodies, real migrations,
   SQLite and the #13 subprocess adapter. **3 passed**. Only desktop transport, model/source IO,

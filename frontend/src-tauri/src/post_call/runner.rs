@@ -45,7 +45,7 @@ async fn owned<T, F: Future<Output = Result<T, String>>>(
     result
 }
 
-pub async fn execute<L, LF, S, SF, G, GF>(
+pub async fn run<L, LF, S, SF, G, GF>(
     pool: &SqlitePool,
     job: &Job,
     token: &CancellationToken,
@@ -61,7 +61,7 @@ where
     G: FnOnce(String, CancellationToken) -> GF,
     GF: Future<Output = Result<String, String>>,
 {
-    let result=async {
+    async {
         if token.is_cancelled() {return Err("Recording has priority".into());}
         let snapshot=owned(pool,job,token,snapshot()).await?;
         if snapshot.revision.meeting_id!=job.meeting_id {return Err("Snapshot belongs to another meeting".into());}
@@ -90,16 +90,46 @@ where
         };
         if token.is_cancelled(){return Err("Post-call summary cancelled before publication".into());}
         store::publish(pool,job,&snapshot.revision,vocabulary_revision,&json).await
-    }.await;
-    if let Err(error) = &result {
-        // A stale epoch means the user already deferred/cancelled; don't undo it.
+    }.await
+}
+
+/// Complete resource-owning work before retrying its durable release. The native
+/// scheduler calls run/finish separately so recording can acquire admission while
+/// SQLite is unavailable; this convenience entrypoint is resource-independent.
+pub async fn execute<L, LF, S, SF, G, GF>(
+    pool: &SqlitePool,
+    job: &Job,
+    token: &CancellationToken,
+    local: L,
+    snapshot: S,
+    generate: G,
+) -> Result<(), String>
+where
+    L: FnOnce(CancellationToken) -> LF,
+    LF: Future<Output = Result<String, String>>,
+    S: FnOnce() -> SF,
+    SF: Future<Output = Result<Snapshot, String>>,
+    G: FnOnce(String, CancellationToken) -> GF,
+    GF: Future<Output = Result<String, String>>,
+{
+    let result = run(pool, job, token, local, snapshot, generate).await;
+    finish(pool, job, token, &result).await;
+    result
+}
+
+pub async fn finish(
+    pool: &SqlitePool,
+    job: &Job,
+    token: &CancellationToken,
+    result: &Result<(), String>,
+) {
+    if let Err(error) = result {
         let status = if token.is_cancelled() {
             "queued"
         } else {
             "waiting"
         };
         let message: String = error.chars().take(2000).collect();
-        let _ = store::release(pool, job, status, Some(&message)).await;
+        store::reconcile_release(pool, job, status, Some(&message)).await;
     }
-    result
 }
