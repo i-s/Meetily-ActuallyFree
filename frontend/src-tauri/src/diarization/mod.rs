@@ -14,6 +14,7 @@
 //!
 //! Models live install-locally in `<install>/data/models/diarization`.
 
+pub mod batch_control;
 pub mod clustering;
 pub mod download;
 pub mod dsp;
@@ -371,6 +372,7 @@ pub fn diarize_file_with_models(
     let mut embeddings: Vec<Vec<f32>> = Vec::with_capacity(turns.len());
     let mut kept: Vec<usize> = Vec::with_capacity(turns.len());
     for (i, turn) in turns.iter().enumerate() {
+        batch_control::check()?;
         match models.embed(&turn.audio) {
             Ok(e) => {
                 embeddings.push(e);
@@ -1071,6 +1073,8 @@ async fn diarize_meeting_inner(
     let engine_for_blocking = selected_engine.clone();
     let is_candidate = version.is_some();
     let (result, used_source_tracks, profile_names) = tokio::task::spawn_blocking(move || -> Result<(DiarizationResult, bool, std::collections::HashMap<usize, String>)> {
+        let _cancellation = batch_control::Scope::new(is_candidate.then_some(crate::audio::retranscription::refinement_cancelled as fn() -> bool));
+        batch_control::check()?;
         let parent = source.parent().map(Path::to_path_buf);
         // A room microphone is not a user identity. Older recordings retain
         // their source-track convention; explicit in-person recordings use the

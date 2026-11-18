@@ -38,6 +38,7 @@ import { CHROME_BOOT_SCRIPT } from '@/lib/window-chrome'
 import { RecordingPill } from '@/components/recording/RecordingPill'
 import { GroupEditorHost } from '@/components/groups/GroupEditor'
 import { RecordingNotice } from '@/components/RecordingNotice'
+import { PostCallQueue } from '@/components/PostCallQueue'
 
 // Development only: in a plain browser (no Tauri bridge) serve sample data so
 // screens can be reviewed at http://localhost:3118. Stripped from production.
@@ -530,6 +531,7 @@ export default function RootLayout({
                         <TooltipProvider>
                           <AppTooltipGuard />
                           <RecordingPostProcessingProvider>
+                            {onboardingCompleted && !showOnboarding && <PostCallQueue />}
                             <UpdateCheckProvider onboardingCompleted={onboardingCompleted}>
                               <ImportDialogProvider onOpen={handleOpenImportDialog}>
                                 {onboardingCompleted && !showOnboarding && <GlobalSearchDialog />}

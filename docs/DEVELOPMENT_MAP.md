@@ -115,6 +115,17 @@ source labels rather than guessing a speaker or switching engines.
 
 ## 3. Post-call processing and model selection
 
+Issue #15's native automatic save/recovery queue, recording-first resource admission,
+checkpoint reuse, subscription-only saved-meeting Codex operation, immutable revision-
+bound summaries, visible stages/defer/retry/history, synthetic qualification and
+remaining physical/signed-in gates are documented in
+[ISSUE15_POST_CALL_QUEUE.md](ISSUE15_POST_CALL_QUEUE.md). Read it before changing
+Stop/save/recovery enqueue, recording startup priority, offline cancellation or
+summary publication. SQLite owns jobs/results; WebViews only observe/control.
+Automatic refinement never selects a candidate; summaries use the committed selected
+transcript and separate personal Notes. #10 policy and #16 approved-vocabulary
+integration seams/tests are explicit in that note; unfinished branches are not imported.
+
 Issue #14's local ASR + diarization candidate workflow, immutable live/refined/
 corrections snapshots, revision-checked selection and text corrections, restart/
 cancellation ownership, source-neutral in-person policy, #9 recovery invariants,
@@ -123,8 +134,8 @@ in [ISSUE14_TRANSCRIPT_VERSIONS.md](ISSUE14_TRANSCRIPT_VERSIONS.md). Read it bef
 changing retranscription commit or post-call sequencing. Native refinement now
 saves a separate version; it never deletes selected transcript rows on success.
 Meeting details owns the normal version review/select/correction UI. Automatic
-post-recording summary handoff is deferred to the approved subscriber Codex CLI
-integration, rather than silently using a legacy configured text provider.
+post-recording summary handoff now belongs to the native #15 queue and approved
+#13 subscriber Codex CLI, never a legacy configured text provider.
 The feature note also names the #10 seam: opaque recording metadata and per-row
 capture source maps survive candidate/correction/restore; generated labels are
 not manual identity. #10's accepted session-policy resolution must cover the

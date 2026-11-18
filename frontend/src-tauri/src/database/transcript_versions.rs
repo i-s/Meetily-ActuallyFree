@@ -104,6 +104,29 @@ pub async fn begin(
     Ok(id)
 }
 
+/// Automatic queue retries own one candidate identity, including a crash between
+/// candidate reservation and the queue's next checkpoint. Completed ASR JSON and
+/// its original model/policy/source map survive speaker-stage interruption.
+/// A ready snapshot is immutable and is never selected by this operation.
+pub async fn begin_automatic(
+    pool: &SqlitePool,
+    meeting: &str,
+    settings: &serde_json::Value,
+) -> Result<String, String> {
+    let id = format!("post-call-refined:{meeting}");
+    let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
+    sqlx::query("UPDATE meetings SET id = id WHERE id = ?")
+        .bind(meeting).execute(&mut *tx).await.map_err(|e| e.to_string())?;
+    ensure(&mut tx, meeting).await?;
+    sqlx::query("INSERT INTO transcript_versions(id,meeting_id,kind,status,created_at,parent_id,settings_json) SELECT ?,?,'refined','running',?,version_id,? FROM transcript_selection WHERE meeting_id=? ON CONFLICT(id) DO NOTHING")
+        .bind(&id).bind(meeting).bind(chrono::Utc::now().to_rfc3339()).bind(settings.to_string()).bind(meeting)
+        .execute(&mut *tx).await.map_err(|e| e.to_string())?;
+    sqlx::query("UPDATE transcript_versions SET status='running',error=NULL WHERE id=? AND meeting_id=? AND status!='ready'")
+        .bind(&id).bind(meeting).execute(&mut *tx).await.map_err(|e| e.to_string())?;
+    tx.commit().await.map_err(|e| e.to_string())?;
+    Ok(id)
+}
+
 pub async fn finish(
     pool: &SqlitePool,
     id: &str,

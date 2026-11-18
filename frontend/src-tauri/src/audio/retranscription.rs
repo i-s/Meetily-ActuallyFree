@@ -105,10 +105,21 @@ async fn start_retranscription<R: Runtime>(
     provider: Option<String>,
     initial_prompt: Option<String>,
     version_id: String,
+    reuse_saved_asr: bool,
 ) -> Result<RetranscriptionResult> {
     let use_parakeet = provider.as_deref() == Some("parakeet");
     let batch_lease = super::common::acquire_stt_batch_lease().await;
-    let result = run_retranscription(
+    let retained = if reuse_saved_asr {
+        let state = app.state::<AppState>();
+        let json: Option<String> = sqlx::query_scalar("SELECT segments_json FROM transcript_versions WHERE id=? AND meeting_id=?")
+            .bind(&version_id).bind(&meeting_id).fetch_one(state.db_manager.pool()).await?;
+        json.map(|json| serde_json::from_str::<Vec<crate::api::TranscriptSegment>>(&json)).transpose()?
+    } else { None };
+    let result = if let Some(segments) = retained {
+        Ok(RetranscriptionResult { meeting_id: meeting_id.clone(), segments_count: segments.len(),
+            duration_seconds: segments.iter().filter_map(|s| s.audio_end_time).fold(0.0, f64::max),
+            language: language.clone(), version_id: version_id.clone() })
+    } else { run_retranscription(
         app.clone(),
         meeting_id.clone(),
         meeting_folder_path,
@@ -118,7 +129,7 @@ async fn start_retranscription<R: Runtime>(
         initial_prompt,
         version_id.clone(),
     )
-    .await;
+    .await };
     drop(batch_lease);
 
     // Unload the engine after the batch job (success, failure, or cancellation)
@@ -962,7 +973,7 @@ pub async fn start_retranscription_command<R: Runtime>(
         let monitor_version = version_id.clone();
         let result = tauri::async_runtime::spawn(start_retranscription(
             guard, app, meeting_id_clone, meeting_folder_path, language,
-            model, provider, initial_prompt, version_id,
+            model, provider, initial_prompt, version_id, false,
         )).await;
         let failure = match result {
             Err(join_error) => Some(format!("Local refinement worker stopped: {join_error}")),
@@ -985,6 +996,70 @@ pub async fn start_retranscription_command<R: Runtime>(
         meeting_id,
         message: "Retranscription started".to_string(),
     })
+}
+
+/// Awaited saved-meeting operation for the durable queue. No live-session DTO,
+/// generic provider, detached JS promise or candidate selection is involved.
+/// Caller owns recording-priority admission until this returns, including drain.
+pub(crate) async fn run_queued_refinement<R: Runtime>(
+    app: AppHandle<R>, meeting_id: String,
+    token: &tokio_util::sync::CancellationToken,
+) -> Result<String, String> {
+    use crate::database::{transcript_versions as versions, repositories::setting::SettingsRepository};
+    let state = app.state::<AppState>();
+    let pool = state.db_manager.pool();
+    let id = format!("post-call-refined:{meeting_id}");
+    let existing: Option<(String, String)> = sqlx::query_as("SELECT status,settings_json FROM transcript_versions WHERE id=? AND meeting_id=?")
+        .bind(&id).bind(&meeting_id).fetch_optional(pool).await.map_err(|e|e.to_string())?;
+    if existing.as_ref().is_some_and(|(status,_)| status=="ready") { return Ok(id); }
+    if token.is_cancelled() { return Err("Post-call work yielded to recording".into()); }
+    let guard = RetranscriptionGuard::acquire()?;
+    RETRANSCRIPTION_CANCELLED.store(false, Ordering::SeqCst);
+    let _operation_guard = tokio::select! {
+        guard = crate::diarization::operation_guard() => guard,
+        _ = token.cancelled() => return Err("Post-call work yielded before offline operation admission".into()),
+    };
+    if token.is_cancelled() { return Err("Post-call work yielded to recording".into()); }
+    let folder: Option<String> = sqlx::query_scalar("SELECT folder_path FROM meetings WHERE id=?")
+        .bind(&meeting_id).fetch_one(pool).await.map_err(|e|e.to_string())?;
+    let folder=folder.ok_or("Saved recording folder is unavailable")?;
+    saved_sources(Path::new(&folder)).map_err(|e|e.to_string())?;
+    let settings = if let Some((_,json))=existing {
+        serde_json::from_str::<serde_json::Value>(&json).map_err(|e|e.to_string())?
+    } else {
+        let configured=SettingsRepository::get_post_call_transcript_config(pool).await.map_err(|e|e.to_string())?;
+        let (provider,model)=match configured {
+            Some((p,m)) if p!="live" => (p,m),
+            _ => sqlx::query_as::<_,(String,String)>("SELECT provider,model FROM transcript_settings WHERE id='1'").fetch_optional(pool).await.map_err(|e|e.to_string())?
+                .ok_or("Choose a downloaded local post-call ASR model in Settings")?,
+        };
+        if !matches!(provider.as_str(),"whisper"|"localWhisper"|"parakeet") {return Err("Automatic post-call ASR requires a local Whisper or Parakeet model; no provider fallback is allowed".into());}
+        let vocabulary=if provider=="parakeet" {None} else {VocabularyRepository::get_effective(pool,Some(&meeting_id)).await.map_err(|e|e.to_string())?};
+        let mut config=crate::diarization::get_diarization_config();config.nemotron_max_speakers=8;
+        serde_json::json!({"provider":provider,"model":model,"language":null,"vocabulary_prompt":vocabulary,
+            "recording_metadata":recording_metadata(Path::new(&folder)).map_err(|e|e.to_string())?,
+            "label_origin":"generated_asr","diarization_engine":config.engine,"diarization_config":config,"post_call_job":meeting_id})
+    };
+    if !recording_in_person(Path::new(&folder)).map_err(|e|e.to_string())? && !crate::diarization::diarization_models_available().await? {
+        return Err("Download the selected local diarization model before post-call processing".into());
+    }
+    let version=versions::begin_automatic(pool,&meeting_id,&settings).await?;
+    *ACTIVE_RETRANSCRIPTION.lock().unwrap_or_else(|e|e.into_inner())=Some((meeting_id.clone(),version.clone()));
+    let string=|key:&str|settings.get(key).and_then(|v|v.as_str()).map(str::to_owned);
+    let run=start_retranscription(guard,app.clone(),meeting_id,folder,string("language"),string("model"),string("provider"),string("vocabulary_prompt"),version.clone(),true);
+    tokio::pin!(run);
+    let result=tokio::select! {
+        result=&mut run => result,
+        _=token.cancelled()=> { cancel_retranscription(); run.await }
+    };
+    if let Err(error) = &result {
+        // Also cover early checkpoint/storage failures before the shared worker
+        // reaches its ordinary terminal-status block. Never leave a failed
+        // awaited queue operation looking like a live native inference.
+        let status = if token.is_cancelled() || refinement_cancelled() { "cancelled" } else { "failed" };
+        let _ = versions::set_status(pool, &version, status, Some(error.to_string())).await;
+    }
+    result.map(|_|version).map_err(|e|e.to_string())
 }
 
 #[tauri::command]

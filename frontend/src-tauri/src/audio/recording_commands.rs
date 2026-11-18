@@ -222,6 +222,9 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
         meeting_name
     );
 
+    // Reserve before the engine lock: cancelling a background model must be
+    // able to drain/release that lock before live model initialization.
+    let _post_call_priority = crate::post_call::worker::PRIORITY.recording().await;
     let engine_lifecycle_guard = super::common::acquire_engine_lifecycle_lock().await;
 
     // Check if already recording
@@ -556,6 +559,9 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
         mic_device_name, system_device_name, meeting_name
     );
 
+    // Reserve before the engine lock: cancelling a background model must be
+    // able to drain/release that lock before live model initialization.
+    let _post_call_priority = crate::post_call::worker::PRIORITY.recording().await;
     let engine_lifecycle_guard = super::common::acquire_engine_lifecycle_lock().await;
 
     // Check if already recording
