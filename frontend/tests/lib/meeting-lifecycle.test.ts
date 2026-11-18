@@ -20,7 +20,8 @@ function snapshot(id: string | null, presence: 'active' | 'inactive' | 'unknown'
   return { revision: ++revision, enabled: true, sources: [{ source, app: source, process: source, presence, reason: 'synthetic_controls', session_id: id }] };
 }
 const flush = async () => { for (let i = 0; i < 10; i++) await Promise.resolve(); };
-function controller(state = async () => ({ is_recording: recording, is_stopping: stopping })) {
+type RecordingQuery = { is_recording?: boolean; is_stopping?: boolean };
+function controller(state: () => Promise<RecordingQuery> = async () => ({ is_recording: recording, is_stopping: stopping })) {
   return createLifecycleAutomation({ enabled: () => enabled, state,
     start: () => { starts++; }, stop: () => { stops++; recording = false; },
     conflict: () => { conflicts++; }, error: e => errors.push(e),
@@ -67,7 +68,7 @@ test('pending/start-in-flight reserves the single recorder across simultaneous s
   assert.equal(starts, 1); assert.equal(conflicts, 1); releaseAutomatedStart(); c.dispose();
 });
 test('leave while recording-state query is pending cancels delayed start', async () => {
-  let resolve!: (state: {}) => void;
+  let resolve!: (state: RecordingQuery) => void;
   const c = controller(() => new Promise(r => { resolve = r; }));
   c.accept(snapshot('late')); c.accept(snapshot(null, 'inactive')); resolve({}); await flush();
   assert.equal(starts, 0); c.dispose();
@@ -80,7 +81,7 @@ test('stale snapshots, disabled detection, and unknown never cause synthetic sto
   c.dispose();
 });
 test('manual override during async stop query wins over old owner', async () => {
-  let resolve!: (state: {}) => void;
+  let resolve!: (state: RecordingQuery) => void;
   let gate = false;
   const c = controller(() => gate ? new Promise(r => { resolve = r; }) : Promise.resolve({ is_recording: recording }));
   c.accept(snapshot('one')); await flush(); finishStart(); gate = true;
@@ -89,7 +90,7 @@ test('manual override during async stop query wins over old owner', async () => 
 });
 
 test('Unknown during pending state lookup cannot authorize a new start', async () => {
-  let resolve!: (state: {}) => void;
+  let resolve!: (state: RecordingQuery) => void;
   const c = controller(() => new Promise(r => { resolve = r; }));
   c.accept(snapshot('permission-lost'));
   c.accept(snapshot('permission-lost', 'unknown'));
