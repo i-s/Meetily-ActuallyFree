@@ -40,7 +40,9 @@ bounded probe with three commands:
   `capture_source` (`microphone`, `system`, or `unknown`); speaker text is never
   treated as proof of provenance. It flags remote-only rows labeled with an explicit
   local-user label and checks expected near-speech phrase presence in microphone
-  rows for near-only/double-talk cases.
+  rows for near-only/double-talk cases and expected remote-speech phrase presence
+  in system rows for remote-only/double-talk cases. These keyword observations only
+  support listening and transcript comparison; they cannot establish retention.
 - `hash` records SHA-256 for original evidence files without uploading them.
 
 The probe returns `manual_review_required` for every case. A null result, missing
@@ -136,6 +138,11 @@ playback has its own ducking and is not a reliable Zoom output-level measurement
 
 ## Batched physical protocol after all tickets
 
+This is a **bounded, owner-participating physical stage**, arranged with the owner
+for the final batch, not authorization for unattended Mac operations. No Mac
+operations are performed now. The owner confirms the test scope, private local
+destinations, and owned/synthetic material before that stage starts.
+
 Use one final DMG and record its SHA-256 and the installed binary/source commit.
 Do not mix artifacts from different commits. On each target Mac, record macOS build,
 Meetily commit, client versions, input/output routes, Mic Mode, volume/gain, selected
@@ -143,6 +150,32 @@ system capture process, ASR/diarization versions, and permission state. Use only
 owned or synthetic phrases; keep audio and ASR local and disable automatic LLM
 transmission. Never add a virtual loopback or replay a system tap merely to create
 an AEC reference.
+
+### Required recording preflight before the duration matrix
+
+During that owner-participating stage, on each target Mac:
+
+1. Enable **audio auto-save** and verify the active recording setting, not just
+   transcript saving. Confirm a writable, private local recording destination
+   outside the checkout and cloud-synced/shared folders, with sufficient free space;
+   record the setting and destination in the local evidence. Audio auto-save being
+   off discards audio chunks and cannot supply the required source evidence.
+2. Make a short owned/synthetic smoke take with both selected sources active, long
+   enough to meet the installed build's minimum save duration and include recognizable
+   local and remote phrases. Stop it normally and wait for saving/finalization to
+   complete; do not assume a brief start/stop or live transcript proves audio saved.
+3. In the completed meeting directory, verify that **all three distinct files**
+   `mic.mp4`, `system.mp4`, and mixed `audio.mp4` exist, are nonempty, and each decodes
+   successfully. Listen to the expected test material in the separate sources and
+   mixed playback; retain the save/decode results and hashes locally. A mixed-only
+   recording, filename presence alone, or a transcript is not an adequate preflight.
+
+If auto-save, the destination, finalization, any required file, or decoding is
+missing, failed, or unresolved, **stop before the 5/30/90-minute matrix** and report
+the blocker. Do not spend the duration run without verified source evidence. Repeat
+the preflight when recording settings or source selection change.
+
+### Controlled cases and duration matrix
 
 For each route (built-in speakers, then the same microphone with wired headphones),
 run both Zoom and Discord only when their actual call is connected. Capture a short
@@ -189,9 +222,12 @@ No AEC candidate is enabled by this preparation. After the physical diagnosis:
    Zoom's render reference. Do not replay a captured tap, rely on Zoom's own AEC for
    Meetily, or claim that voice isolation/noise suppression provides separation.
 3. Qualify candidate versus baseline on identical owned phrases and routes through
-   capture → source persistence → local ASR → displayed/saved labels, with near-only
-   and double-talk retained. Preserve text/timing, original sources, and comparison
-   artifacts. Check source timing at start/middle/end, device contention, latency,
+   capture → source persistence → local ASR → displayed/saved labels. Manually verify
+   expected remote speech retention in remote-only **and** double-talk, expected
+   local speech retention in near-only **and** double-talk, and zero remote speech
+   falsely labeled `You`, as required by the acceptance gate below. Preserve
+   text/timing, original sources, and comparison artifacts. Check source timing at
+   start/middle/end, device contention, latency,
    route/volume changes and Zoom ducking; include the full duration matrix on both
    Macs. Keep candidate/reference configuration and failures in evidence.
 4. If candidate fails a required case, stop qualification and report the failed
@@ -214,19 +250,34 @@ intermediate installer just to attempt an unvalidated candidate.
 - Clean mic/system source tracks but `You` remains on system text: investigate
   persisted/manual labels, event source, build identity, and timestamp alignment.
 
-Pass only if every remote-only case has zero local-user-labeled remote phrases after
-manual audio/text review, and every double-talk case retains the designated local
-phrase without unacceptable loss. A failed case must name the remaining mechanism
-unknown and whether the current source-separated foundation remains suitable. Do not
-call waveform similarity AEC, model improvement, or an API capability evidence.
+### Required manual acceptance gate
+
+Pass only when manual listening to the saved source audio and comparison with the
+expected test speech and live/saved/post-call transcripts establish **all** of:
+
+- expected remote speech retained in every **remote-only and double-talk** case;
+- expected local speech retained in every **near-only and double-talk** case;
+- **zero remote speech falsely labeled `You`** (including local-user display-name
+  or manual-label substitutions), in remote-only and double-talk cases alike.
+
+Record the per-case listening and transcript comparison, word errors or losses,
+and label findings. Keyword/phrase presence from the probe only supports that
+review; it does not prove full speech retention or correct attribution. Zero
+false-`You` rows is not a pass if required speech was lost or never captured.
+**Missing, failed, or unresolved required evidence blocks acceptance**, including
+recording preflight, retention, labels, alignment, and Zoom ducking. Do not convert
+`unknown`, `not_run`, an empty transcript, or a boundary ambiguity into a pass.
+A failed or unresolved case must name the remaining mechanism unknown and whether
+the current source-separated foundation remains suitable. Do not call waveform
+similarity AEC, model improvement, or an API capability evidence.
 
 ## Acceptance criteria and honest handoff
 
 | Live issue acceptance criterion | Preparation delivered | Acceptance state |
 | --- | --- | --- |
 | Compare system/mic and text; distinguish acoustic echo, software duplication, attribution | Read-only track/lag/level probe, transcript observations, hash collection, diagnostic controls | Pending real owned Mac tracks and diagnosis |
-| Remote-only, near-only, double-talk on speakers/headphones with reproducible configuration | Explicit metadata template, unique RU/EN script, both Macs/clients/routes protocol | Pending physical matrix |
-| No false `You` remotely; preserve near speech in overlap; no mic gating | False-label flags, near and remote phrase observations, synthetic nonmutation regressions | Pending actual local ASR/audio/text comparison; not proved by unit tests |
+| Remote-only, near-only, double-talk on speakers/headphones with reproducible configuration | Required auto-save/private-destination/completed smoke-take preflight with all three tracks verified to decode; explicit metadata template, unique RU/EN script, both Macs/clients/routes protocol | Pending owner-participating physical preflight and matrix |
+| No false `You` remotely; preserve near speech in overlap; no mic gating | Required manual remote retention in remote-only/double-talk, local retention in near-only/double-talk, and zero remote falsely labeled `You`; keyword observations support review only | Pending actual local ASR/audio/text comparison; missing or unresolved evidence blocks acceptance, not proved by unit tests |
 | Candidate in capture→ASR→labels with source timing and Zoom ducking | Candidate gate, clock/route controls, independent-output ducking protocol | Blocked on diagnosis/reference selection and final physical run; no AEC candidate implemented |
 | If mandatory case fails, remaining work and foundation suitability | Explicit limits and remainder below; no model/API claim | Preparation documented, final suitability decision still pending |
 
