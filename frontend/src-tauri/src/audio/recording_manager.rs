@@ -30,6 +30,7 @@ pub struct RecordingManager {
     device_monitor: Option<AudioDeviceMonitor>,
     device_event_receiver: Option<mpsc::UnboundedReceiver<DeviceEvent>>,
     in_person: bool,
+    automatic_zoom: bool,
     per_app_enabled: bool,
     per_app_targets: Vec<crate::audio::recording_preferences::PerAppTarget>,
 }
@@ -53,6 +54,7 @@ impl RecordingManager {
             device_monitor: Some(device_monitor),
             device_event_receiver: Some(device_event_receiver),
             in_person: false,
+            automatic_zoom: false,
             per_app_enabled: false,
             per_app_targets: Vec::new(),
         }
@@ -60,6 +62,21 @@ impl RecordingManager {
 
     pub fn set_in_person(&mut self, in_person: bool) {
         self.in_person = in_person;
+    }
+
+    pub fn set_automatic_zoom(&mut self, automatic: bool) { self.automatic_zoom = automatic; }
+
+    /// Called before live model initialization and again before opening capture.
+    /// Native app inventory informs provenance only, never call lifecycle.
+    pub fn prepare_source_provenance(&self) {
+        #[cfg(target_os = "macos")]
+        let zoom_present = crate::meeting_detection::zoom::client_present();
+        #[cfg(not(target_os = "macos"))]
+        let zoom_present = Some(false);
+        let executables: Vec<&str> = self.per_app_targets.iter().map(|t| t.executable.as_str()).collect();
+        let unverified = super::recording_mode::zoom_identity_unverified(cfg!(target_os = "macos"),
+            self.in_person, self.per_app_enabled, &executables, zoom_present, self.automatic_zoom);
+        super::recording_mode::start_session(self.in_person, unverified);
     }
 
     /// Start recording with specified devices
@@ -79,7 +96,7 @@ impl RecordingManager {
         let system_device = if self.in_person { None } else { system_device };
         super::recording_mode::validate_sources(self.in_person, self.per_app_enabled,
             self.per_app_targets.len(), system_device.is_some()).map_err(anyhow::Error::msg)?;
-        super::recording_mode::start_session(self.in_person);
+        self.prepare_source_provenance();
         if self.in_person {
             self.per_app_enabled = false;
         }

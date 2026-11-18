@@ -3,9 +3,9 @@ import { Spinner } from '@/components/ui/spinner';
 import { invoke } from '@tauri-apps/api/core';
 import { OPTIONAL_MODEL_PREFERENCES_CHANGED } from '@/lib/optional-model-activation';
 import { useOptionalModelDownloads } from '@/contexts/OptionalModelDownloadsContext';
-import { BookOpen, Check, CheckCircle2, ChevronDown, Clock3, Languages, Radio, Zap } from 'lucide-react';
+import { Check, CheckCircle2, ChevronDown, Clock3, Languages, Radio, Zap } from 'lucide-react';
 import { toast } from 'sonner';
-import { Textarea } from './ui/textarea';
+import { PersonalVocabulary } from './PersonalVocabulary';
 import { Button } from './ui/button';
 import { Label } from './ui/label';
 import { Switch } from './ui/switch';
@@ -26,11 +26,6 @@ export interface TranscriptSettingsProps {
     transcriptModelConfig: TranscriptModelProps;
     setTranscriptModelConfig: (config: TranscriptModelProps) => void;
     onModelSelect?: () => void;
-}
-
-interface WhisperVocabularyConfig {
-    global: string;
-    meeting: string;
 }
 
 interface PostCallTranscriptConfig {
@@ -61,14 +56,9 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
     const [isSavingPostCall, setIsSavingPostCall] = useState(false);
     const [postCallSaved, setPostCallSaved] = useState(false);
     const [postCallError, setPostCallError] = useState<string | null>(null);
-    const [vocabulary, setVocabulary] = useState('');
-    const [isSavingVocabulary, setIsSavingVocabulary] = useState(false);
-    const [vocabularySaved, setVocabularySaved] = useState(false);
-    const [vocabularyError, setVocabularyError] = useState<string | null>(null);
     const [realTimeTranscription, setRealTimeTranscription] = useState(false);
     // Labs speech options that are on are named on the engine they change.
     const { labs } = useLabs();
-    const vocabularyRevisionRef = useRef(0);
     const liveSaveInFlightRef = useRef(false);
     const postCallSaveInFlightRef = useRef(false);
     const postCallRevisionRef = useRef(0);
@@ -158,20 +148,6 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
             })
             .finally(() => setIsLoadingPostCall(false));
     }, [refreshInstalledModels]);
-
-    useEffect(() => {
-        const revision = vocabularyRevisionRef.current;
-        invoke<WhisperVocabularyConfig>('api_get_whisper_vocabulary', { meetingId: null })
-            .then((config) => {
-                if (vocabularyRevisionRef.current === revision) {
-                    setVocabulary(config.global || '');
-                }
-            })
-            .catch((error) => {
-                console.error('Failed to load Whisper vocabulary:', error);
-                setVocabularyError('Could not load the saved vocabulary.');
-            });
-    }, []);
 
     const saveLiveConfig = async (provider: 'localWhisper' | 'parakeet', model: string): Promise<boolean> => {
         if (liveSaveInFlightRef.current) return false;
@@ -263,25 +239,6 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
         const saved = await saveLiveConfig('parakeet', modelName);
         void refreshInstalledModels();
         return saved;
-    };
-
-    const saveVocabulary = async () => {
-        setIsSavingVocabulary(true);
-        setVocabularySaved(false);
-        setVocabularyError(null);
-        const revision = vocabularyRevisionRef.current;
-        try {
-            const normalized = await invoke<string>('api_save_global_whisper_vocabulary', { vocabulary });
-            if (vocabularyRevisionRef.current === revision) {
-                setVocabulary(normalized);
-            }
-            setVocabularySaved(true);
-            window.setTimeout(() => setVocabularySaved(false), 2000);
-        } catch (error) {
-            setVocabularyError(typeof error === 'string' ? error : String(error));
-        } finally {
-            setIsSavingVocabulary(false);
-        }
     };
 
     const installedWhisperModels = installedModels.filter((model) => model.provider === 'whisper');
@@ -632,54 +589,7 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
                 </details>
             </section>
 
-            <section className={`space-y-3 rounded-xl border border-[var(--af-border)] bg-[var(--af-panel-2)] p-4 text-[var(--af-text)] ${whisperIsActive ? '' : 'opacity-60'}`}>
-                <div className="flex items-start gap-3">
-                    <BookOpen className={`mt-0.5 h-4 w-4 shrink-0 ${whisperIsActive ? 'text-af-accent' : 'text-muted-foreground'}`} />
-                    <div className="min-w-0 flex-1">
-                        <div className="flex flex-wrap items-center gap-2">
-                            <Label htmlFor="whisper-vocabulary" className="text-sm font-medium">Global vocabulary hints</Label>
-                            {!whisperIsActive && (
-                                <span className="rounded-full border border-border px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide">Whisper only</span>
-                            )}
-                        </div>
-                        <p className="mt-1 text-xs text-muted-foreground">
-                            {whisperIsActive
-                                ? 'Help Whisper recognize names, companies, products, acronyms, and technical terms in live or post-call transcription. Whisper uses up to 224 prompt tokens.'
-                                : 'These hints become available when Whisper is selected for live or post-call transcription.'}
-                        </p>
-                    </div>
-                </div>
-                <Textarea
-                    id="whisper-vocabulary"
-                    value={vocabulary}
-                    onChange={(event) => {
-                        vocabularyRevisionRef.current += 1;
-                        setVocabulary(event.target.value);
-                        setVocabularySaved(false);
-                        setVocabularyError(null);
-                    }}
-                    maxLength={1000}
-                    rows={5}
-                    disabled={isSavingVocabulary || !whisperIsActive}
-                    placeholder={'Meetily\nTauri\nKubernetes\nOKR'}
-                    className="resize-y"
-                />
-                <div className="flex items-center justify-between gap-3">
-                    <div className="min-h-5 text-xs">
-                        {vocabularyError ? (
-                            <span className="text-af-danger">{vocabularyError}</span>
-                        ) : vocabularySaved ? (
-                            <span className="inline-flex items-center gap-1 text-af-success"><Check className="h-3.5 w-3.5" /> Saved</span>
-                        ) : (
-                            <span className="text-muted-foreground">{vocabulary.length}/1000 characters</span>
-                        )}
-                    </div>
-                    <Button type="button" size="sm" onClick={saveVocabulary} disabled={isSavingVocabulary || !whisperIsActive}>
-                        {isSavingVocabulary && <Spinner className="mr-2 h-4 w-4 " />}
-                        Save vocabulary
-                    </Button>
-                </div>
-            </section>
+            <PersonalVocabulary />
         </div>
     );
 }

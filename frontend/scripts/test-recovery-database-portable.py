@@ -71,6 +71,7 @@ mod state {{
     pub struct DbManager(pub sqlx::SqlitePool);
     impl DbManager {{ pub fn pool(&self)->&sqlx::SqlitePool{{&self.0}} }}
 }}
+pub mod post_call {{ #[path="{ROOT}/frontend/src-tauri/src/post_call/store.rs"] pub mod store; }}
 mod api;
 pub use database::repositories::notes_document;
 mod database {{ #[path="{ROOT}/frontend/src-tauri/src/database/transcript_versions.rs"] pub mod transcript_versions; pub mod repositories {{

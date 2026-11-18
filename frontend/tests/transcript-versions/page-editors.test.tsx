@@ -32,6 +32,7 @@ const rows=()=>[{id:version?'new-line':'old-line',text:version?'Selected text':'
 const canonical=(target:string)=>target.startsWith('recording:/synthetic/')?`meeting:${target.slice('recording:/synthetic/'.length)}`:target;
 const transport=async(name:string,args:any):Promise<any>=>{
  calls.push([name,structuredClone(args)]);
+ if(name==='post_call_canonical_summary')return null;
  if(name==='api_notes_recording_target')return `recording:/synthetic/${args.meetingId}`;
  if(name==='api_read_notes_document')return structuredClone(documents.get(canonical(args.target))??null);
  if(name==='api_write_notes_document'){
@@ -55,6 +56,7 @@ const transport=async(name:string,args:any):Promise<any>=>{
  throw new Error(name);
 };
 mock.module('@tauri-apps/api/core',()=>({invoke:transport}));
+mock.module('@tauri-apps/api/event',()=>({listen:async()=>()=>{}}));
 const empty=()=>null;
 mock.module('lucide-react',()=>Object.fromEntries(['AlertTriangle','ChevronDown','FileText','Languages','ListChecks','NotebookPen','RefreshCw','Settings2','Sparkles','Square','Wand2'].map(name=>[name,empty])));
 const wrap=({children}:any)=><div>{children}</div>;

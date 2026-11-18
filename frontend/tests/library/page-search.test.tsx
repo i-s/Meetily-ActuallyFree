@@ -1,6 +1,7 @@
 import React from 'react';
 import { act, create, type ReactTestRenderer } from 'react-test-renderer';
 import { expect, mock, test } from 'bun:test';
+mock.module('@tauri-apps/api/event', () => ({ listen: async () => () => {} }));
 const listeners = new Map<string, Set<(...args: any[]) => void>>();
 Object.assign(globalThis, { window: { location: { search: '', pathname: '/meetings' }, history: { replaceState() {} }, addEventListener: (name: string, fn: any) => { if (!listeners.has(name)) listeners.set(name, new Set()); listeners.get(name)!.add(fn); }, removeEventListener: (name: string, fn: any) => listeners.get(name)?.delete(fn) } });
 let route = '';

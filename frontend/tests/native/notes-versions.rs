@@ -150,3 +150,33 @@ async fn compatibility_revision_fix_preserves_preexisting_migrated_zero_notes() 
     assert_eq!(saved.markdown.as_deref(), Some("Legacy update"));
     assert_eq!(saved.json, Some(blocks()));
 }
+
+#[tokio::test]
+async fn automatic_queue_save_and_recovery_are_one_transaction_and_idempotent() {
+    let pool = SqlitePool::connect(":memory:").await.unwrap(); migrate(&pool).await;
+    let first=TranscriptsRepository::save_transcript(&pool,"Call one",&[turn("x","Keep original","You")],Some("/synthetic/queue-one".into()),None).await.unwrap();
+    let recovered=TranscriptsRepository::save_recovered_transcript(&pool,"Retry",&[],Some("/synthetic/queue-one".into()),None,"queue-recovery").await.unwrap();assert_eq!(first,recovered);
+    let second=TranscriptsRepository::save_recovered_transcript(&pool,"Call two",&[turn("y","Second call","Speaker 1")],Some("/synthetic/queue-two".into()),None,"queue-two").await.unwrap();assert_ne!(first,second);
+    let jobs:Vec<String>=sqlx::query_scalar("SELECT meeting_id FROM post_call_jobs ORDER BY meeting_id").fetch_all(&pool).await.unwrap();assert_eq!(jobs.len(),2);assert!(jobs.contains(&first));assert!(jobs.contains(&second));
+    let before:i64=sqlx::query_scalar("SELECT count(*) FROM meetings").fetch_one(&pool).await.unwrap();
+    sqlx::raw_sql("CREATE TRIGGER reject_queue BEFORE INSERT ON post_call_jobs BEGIN SELECT RAISE(ABORT,'synthetic storage failure'); END;").execute(&pool).await.unwrap();
+    assert!(TranscriptsRepository::save_transcript(&pool,"Failed",&[],Some("/synthetic/failure".into()),None).await.is_err());
+    assert_eq!(sqlx::query_scalar::<_,i64>("SELECT count(*) FROM meetings").fetch_one(&pool).await.unwrap(),before);
+}
+
+#[tokio::test]
+async fn automatic_candidate_identity_and_completed_asr_checkpoint_survive_retry() {
+    let p=SqlitePool::connect(":memory:").await.unwrap();migrate(&p).await;
+    let meeting=TranscriptsRepository::save_transcript(&p,"Call",&[turn("live","Live words","You")],Some("/synthetic/owned".into()),None).await.unwrap();
+    let settings=serde_json::json!({"provider":"whisper","model":"synthetic","recording_metadata":{"in_person":true,"future_policy":"preserve"}});
+    let id=versions::begin_automatic(&p,&meeting,&settings).await.unwrap();
+    let rows=[turn("asr-row","Durable ASR checkpoint","Room microphone")];
+    versions::finish_with_sources(&p,&id,&rows,&std::collections::HashMap::from([("asr-row".into(),"room".into())])).await.unwrap();
+    versions::set_status(&p,&id,"cancelled",None).await.unwrap();
+    let retry=versions::begin_automatic(&p,&meeting,&serde_json::json!({"provider":"other"})).await.unwrap();assert_eq!(retry,id);
+    let saved:String=sqlx::query_scalar("SELECT segments_json FROM transcript_versions WHERE id=?").bind(&id).fetch_one(&p).await.unwrap();assert!(saved.contains("Durable ASR checkpoint"));
+    assert_eq!(versions::version_sources(&p,&meeting,&id).await.unwrap().get("asr-row").map(String::as_str),Some("room"));
+    versions::set_status(&p,&id,"ready",None).await.unwrap();assert_eq!(versions::begin_automatic(&p,&meeting,&settings).await.unwrap(),id);
+    assert_eq!(versions::selected(&p,&meeting).await.unwrap().segments[0].text,"Live words");
+    assert_eq!(sqlx::query_scalar::<_,i64>("SELECT count(*) FROM transcript_versions WHERE kind='refined'").fetch_one(&p).await.unwrap(),1);
+}

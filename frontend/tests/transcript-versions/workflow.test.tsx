@@ -12,7 +12,7 @@ mock.module('@tauri-apps/api/core', () => ({ invoke: async (name: string, args: 
   calls.push([name, args]);
   if (name === 'list_transcript_versions') return { selected_id: 'live', revision, audio_available: !missingAudio, versions: [version] };
   if (name === 'get_selected_transcript') return { revision, segments: [{ id: 'live-line', text: 'Original text', speaker: 'You', audio_start_time: 1 }] };
-  if (name === 'correct_transcript_text') return;
+  if (name === 'correct_transcript_text') { revision++; return; }
   if (name === 'get_transcript_version') return [{ id: 'line', text: 'RU/EN API candidate', speaker: 'Guest', audio_start_time: 1 }];
   if (name === 'select_transcript_version') {
     if (stale) throw new Error('Transcript changed in another operation. Refresh versions and review again; nothing was replaced.');
@@ -88,3 +88,51 @@ test('refreshing the list cannot bless a stale review with a newer revision', as
   expect(changed).toBe(2);
   expect(calls.filter(([name]) => name === 'select_transcript_version')).toHaveLength(1);
  });
+
+test('correction is committed before a separate optional vocabulary confirmation; decline never undoes it', async () => {
+  await act(async () => { root = create(<TranscriptVersions meetingId="legacy" onChanged={() => { changed++; }} />); });
+  await act(async () => button('Correct selected text').props.onClick());
+  await act(async () => root!.root.findByType('textarea').props.onChange({ target: { value: 'Ёлка API and SRE' } }));
+  await act(async () => button('Save text correction').props.onClick());
+  expect(calls.filter(([name]) => name === 'correct_transcript_text')).toHaveLength(1);
+  expect(JSON.stringify(root!.toJSON())).toContain('Запомнить');
+  expect(calls.some(([name]) => name === 'api_confirm_vocabulary_term')).toBe(false);
+  await act(async () => button('Не запоминать').props.onClick());
+  expect(calls.filter(([name]) => name === 'correct_transcript_text')).toHaveLength(1);
+  expect(calls.some(([name]) => name === 'api_confirm_vocabulary_term')).toBe(false);
+});
+
+test('vocabulary retry after refresh failure does not resave text and explicitly sends only the approved term', async () => {
+  await act(async () => { root = create(<TranscriptVersions meetingId="m" onChanged={() => { throw new Error('projection offline'); }} />); });
+  await act(async () => button('Correct selected text').props.onClick());
+  await act(async () => button('Save text correction').props.onClick());
+  const input = root!.root.findByProps({ 'aria-label': 'Правильное написание термина' });
+  await act(async () => input.props.onChange({ target: { value: 'OpenAPI' } }));
+  await act(async () => button('Запомнить').props.onClick());
+  expect(calls).toContainEqual(['api_confirm_vocabulary_term', { term: 'OpenAPI' }]);
+  expect(JSON.stringify(root!.toJSON())).toContain('Unexpected command api_confirm_vocabulary_term');
+  await act(async () => button('Запомнить').props.onClick());
+  expect(calls.filter(([name]) => name === 'correct_transcript_text')).toHaveLength(1);
+  expect(calls.filter(([name]) => name === 'api_confirm_vocabulary_term')).toHaveLength(2);
+});
+
+test('navigation removes the prior meeting confirmation and current drafts cannot learn', async () => {
+  await act(async () => { root=create(<TranscriptVersions meetingId="old" onChanged={() => {}} />); });
+  await act(async () => button('Correct selected text').props.onClick());
+  expect(calls.some(([name])=>name==='api_confirm_vocabulary_term')).toBe(false);
+  await act(async () => button('Save text correction').props.onClick());
+  expect(JSON.stringify(root!.toJSON())).toContain('Запомнить');
+  await act(async () => root!.update(<TranscriptVersions meetingId="new" onChanged={() => {}} />));
+  expect(JSON.stringify(root!.toJSON())).not.toContain('Правильное написание термина');
+  expect(calls.some(([name])=>name==='api_confirm_vocabulary_term')).toBe(false);
+});
+
+test('each successful correction gets a fresh confirmation even when saved line text repeats', async () => {
+  await act(async()=>{root=create(<TranscriptVersions meetingId="m" onChanged={()=>{}}/>);});
+  await act(async()=>button('Correct selected text').props.onClick());
+  await act(async()=>button('Save text correction').props.onClick());
+  await act(async()=>root!.root.findByType('input').props.onChange({target:{value:'Old draft term'}}));
+  await act(async()=>button('Correct selected text').props.onClick());
+  await act(async()=>button('Save text correction').props.onClick());
+  expect(root!.root.findByType('input').props.value).toBe('');
+});

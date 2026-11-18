@@ -32,12 +32,16 @@ const conversions:Array<{kind:string;resolve:(value:string)=>void}> = [];
 let releaseWrite:(()=>void)|undefined;
 let actionWait:Promise<void>|null=null, actionReplyWait:Promise<void>|null=null, actionStarted=false, summaryToken=0, summaryExists=true;
 let actionRows:any[]=[];
+let canonicalSummary:any=null, canonicalWait:Promise<void>|null=null;
+const nativeEvents=new Set<()=>void>();
+mock.module('@tauri-apps/api/event',()=>({listen:async(_name:string,fn:()=>void)=>{nativeEvents.add(fn);return()=>nativeEvents.delete(fn);}}));
 const documents=new Map<string,any>();
 const calls:Array<[string,any]>=[];
 const rows=()=>[{id:selectedRowId,text:selectedText,speaker:'You',audio_start_time:1,audio_end_time:2}];
 const canonical=(target:string)=>target.startsWith('recording:/synthetic/')?`meeting:${target.slice('recording:/synthetic/'.length)}`:target;
 const transport=async(name:string,args:any):Promise<any>=>{
  calls.push([name,structuredClone(args)]);
+ if(name==='post_call_canonical_summary'){const snapshot=structuredClone(canonicalSummary);if(canonicalWait)await canonicalWait;return snapshot;}
  if(name==='api_notes_recording_target')return `recording:/synthetic/${args.meetingId}`;
  if(name==='api_read_notes_document')return structuredClone(documents.get(canonical(args.target))??null);
  if(name==='api_write_notes_document'){
@@ -71,12 +75,13 @@ const transport=async(name:string,args:any):Promise<any>=>{
  if(name==='api_export_meeting_snapshot'){
   const notes=structuredClone(documents.get(`meeting:${args.meetingId}`)??{markdown:'',json:null,revision:0});
   if(notes.revision!==args.expectedNotesRevision)throw new Error('Notes changed while capturing export');
-  return {id:args.meetingId,title:'Meeting',createdAt:'2026-11-18',capturedAt:'2026-11-18T10:00:00Z',audioAvailable:false,notes:{...notes,source:'user_notes'},summary:savedSummary?JSON.stringify({markdown:savedSummary}):null,summaryStatus:savedSummary?'completed':null,transcripts:rows().map(row=>({id:row.id,text:row.text,speaker:row.speaker,audioStartTime:row.audio_start_time})),actions:[]};
+  return {id:args.meetingId,title:'Meeting',createdAt:'2026-11-18',capturedAt:'2026-11-18T10:00:00Z',audioAvailable:false,notes:{...notes,source:'user_notes'},summary:savedSummary?JSON.stringify(canonicalSummary??{markdown:savedSummary}):null,summaryStatus:savedSummary?'completed':null,transcripts:rows().map(row=>({id:row.id,text:row.text,speaker:row.speaker,audioStartTime:row.audio_start_time})),actions:actionRows};
  }
  if(name==='api_library_materials')return [{id:active,transcriptCount:rows().length,hasNotes:documents.has(`meeting:${active}`),hasSummary:!!savedSummary,summaryStatus:savedSummary?'completed':null,audioAvailable:false}];
  if(name==='api_search_library'){
   const needle=args.query.toLowerCase(),notes=documents.get(`meeting:${active}`),hits:any[]=[];
   if(needle==='api'&&notes?.markdown===richMarkdown)hits.push({kind:'notes',id:`notes-${active}`,meetingId:active,title:'Meeting',snippet:'Заметки RU/EN\nAPI follow-up'});
+  if(!hits.length&&savedSummary.toLowerCase().includes(needle))hits.push({kind:'summary',id:`summary-${active}`,meetingId:active,title:'Meeting',snippet:savedSummary});
   if(!hits.length&&selectedText.toLowerCase().includes(needle))hits.push({kind:'transcript',id:selectedRowId,transcriptId:selectedRowId,meetingId:active,title:'Meeting',snippet:selectedText,audioStartTime:1});
   return hits;
  }
@@ -168,7 +173,7 @@ const ready=async()=>{await act(async()=>{for(const fn of [...timers.values()])f
 async function mount(seed=true){active=`combined-${++seq}`;if(seed)documents.set(`meeting:${active}`,{markdown:'Stored notes',json:null,revision:1,source:'user_notes'});await act(async()=>{root=create(<Page/>);});await ready();await act(async()=>{await flushNotes(`meeting:${active}`);});}
 async function review(operation:string){await act(async()=>button(operation==='select'?'Review snapshot':'Correct selected text').props.onClick());}
 const mutate=(operation:string)=>button(operation==='select'?'Save current corrections':'Save text correction').props.onClick();
-afterEach(async()=>{holdNotes=false;holdSummary=false;holdWrite=false;failNotes=false;failSummary=false;pendingSummary=false;failNotesConversion=false;releaseWrite?.();for(const p of conversions.splice(0))p.resolve(richMarkdown);await act(async()=>root?.unmount());root=undefined;timers.clear();storeTimers.clear();storage.clear();documents.clear();calls.length=0;reloads=0;mutations=0;version=0;selectedText='Live text';selectedRowId='old-line';written.length=0;toasts.length=0;outputPath='/synthetic/user-selected.custom';writeError=false;pickerWait=null;navigated='';quota=false;savedSummary='Stored summary';archivedSummary='';releaseWrite=undefined;clock=0;actionWait=null;actionReplyWait=null;actionStarted=false;summaryToken=0;summaryExists=true;actionRows=[];});
+afterEach(async()=>{holdNotes=false;holdSummary=false;holdWrite=false;failNotes=false;failSummary=false;pendingSummary=false;failNotesConversion=false;releaseWrite?.();for(const p of conversions.splice(0))p.resolve(richMarkdown);await act(async()=>root?.unmount());root=undefined;timers.clear();storeTimers.clear();storage.clear();documents.clear();calls.length=0;reloads=0;mutations=0;version=0;selectedText='Live text';selectedRowId='old-line';written.length=0;toasts.length=0;outputPath='/synthetic/user-selected.custom';writeError=false;pickerWait=null;navigated='';quota=false;savedSummary='Stored summary';archivedSummary='';releaseWrite=undefined;clock=0;actionWait=null;actionReplyWait=null;actionStarted=false;summaryToken=0;summaryExists=true;actionRows=[];canonicalSummary=null;canonicalWait=null;nativeEvents.clear();});
 
 const visible=(node:any):string=>typeof node==='string'?node:Array.isArray(node)?node.map(visible).join(''):(node?.children??[]).map(visible).join('');
 const exactButton=(label:string,last=false)=>{const found=root!.root.findAllByType('button').filter(node=>visible(node)===label);return last?found.at(-1)!:found[0]!;};
@@ -352,4 +357,38 @@ test('navigation cancels old extraction UI completion without blocking the new m
   expect(root!.root.findAllByProps({'aria-label':'Summary editor'})).toHaveLength(0);
   expect(editor('Notes editor').props.value).toContain('Meeting B notes');
  }finally{await act(async()=>{release();await work;});}
+},60000);
+
+
+const publishCanonical=()=>{
+ canonicalSummary={markdown:'## Summary\n\nCanonical report discussed',post_call:{source:'post_call_results',job_epoch:3,version_id:'live',transcript_revision:7,notes_revision:1,vocabulary_revision:0}};
+ savedSummary=canonicalSummary.markdown;summaryExists=true;summaryToken++;
+ actionRows=[{id:'generated-task',text:'Send report',done:false,source:'ai',transcriptId:'old-line',audioTime:1}];
+};
+
+test('canonical native publication refreshes normal detail editor/tasks/library and both exports',async()=>{
+ savedSummary='';summaryExists=false;await mount();
+ const notesIdentity=editor('Notes editor').props['data-engine'];
+ await act(async()=>{publishCanonical();for(const event of nativeEvents)event();});await ready();
+ expect(editor('Summary editor').props.value).toContain('Canonical report discussed');
+ expect(visible(root!.toJSON())).toContain('Send report');expect(editor('Notes editor').props['data-engine']).toBe(notesIdentity);
+ await detailExport();expect(written).toHaveLength(1);expect(written[0].text).toContain('Canonical report discussed');expect(written[0].text).toContain('Send report');
+ await act(async()=>root!.update(<MeetingsPage/>));await search('Canonical');
+ expect(visible(root!.toJSON())).toContain('Canonical report discussed');
+ await act(async()=>exactButton('Export…').props.onClick());await act(async()=>exactButton('Export',true).props.onClick());
+ expect(written).toHaveLength(2);expect(written[1].text).toContain('Canonical report discussed');expect(written[1].text).toContain('Send report');expect(written[0].text).toContain('job epoch 3');expect(written[1].text).toContain('Notes revision 1');
+},60000);
+
+test('canonical late refresh cannot replace an immediate rich summary draft or navigated meeting',async()=>{
+ await mount();const summaryIdentity=editor('Summary editor').props['data-engine'];
+ let release!:()=>void;canonicalWait=new Promise<void>(resolve=>{release=resolve;});
+ await act(async()=>{publishCanonical();for(const event of nativeEvents)event();});
+ holdSummary=true;await act(async()=>editor('Summary editor').props.onChange({target:{blocks:rich}}));
+ await act(async()=>{release();root!.update(<Page/>);});expect(editor('Summary editor').props['data-engine']).toBe(summaryIdentity);expect(editor('Summary editor').props.value).toContain('API follow-up');
+ holdSummary=false;await act(async()=>{for(const item of conversions.splice(0))item.resolve(richMarkdown);});
+ canonicalWait=new Promise<void>(resolve=>{release=resolve;});
+ await act(async()=>{for(const event of nativeEvents)event();});
+ active=`combined-${++seq}`;documents.set(`meeting:${active}`,{markdown:'Meeting B notes',json:null,revision:1,source:'user_notes'});
+ canonicalSummary=null;savedSummary='Meeting B summary';await act(async()=>{navigateView(active,savedSummary);release();});await ready();
+ expect(editor('Summary editor').props.value).toContain('Meeting B summary');expect(editor('Summary editor').props.value).not.toContain('Canonical report');
 },60000);

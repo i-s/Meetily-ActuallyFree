@@ -37,7 +37,9 @@ import { useAppAudio } from '@/hooks/useAppAudio';
 import { GroupPicker } from '@/components/groups/GroupBits';
 import { Hint } from '@/components/ui/tooltip';
 import { Spinner } from '@/components/ui/spinner';
-import { STOP_RECORDING_EVENT, STOP_REQUEST_KEY } from '@/lib/recording-launch';
+import { STOP_RECORDING_EVENT, takeRecordingStopRequest, readRecordingStopRequest, queueRecordingStopRequest, completeRecordingStopRequest, requestRecordingStop } from '@/lib/recording-launch';
+import { stopRecordingRequest, type RecordingLease } from '@/lib/native-recording';
+import { loadLabsPreferences } from '@/lib/labs';
 import { formatClock } from '@/lib/dates';
 
 interface RecordingControlsProps {
@@ -276,57 +278,82 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
     }
   }, [onRecordingStart, isStarting]);
 
-  const stopRecordingAction = useCallback(async () => {
+  const stopRecordingAction = useCallback(async (expected?: RecordingLease, manualGeneration?: string) => {
     try {
-      setIsProcessing(true);
+      if (expected && !loadLabsPreferences().meetingAutomation) return false;
+      if (!expected && !manualGeneration) setIsProcessing(true);
       // Recordings save under the install-local data root (same directory as the database).
       const dataDir = await invoke<string>('get_database_directory');
       const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-      const didStop = await invoke<boolean>('stop_recording', {
-        args: { save_path: `${dataDir}/recording-${timestamp}.wav` },
-      });
-      setIsProcessing(false);
-      if (!didStop) return;
+      if (expected && !loadLabsPreferences().meetingAutomation) return false;
+      const didStop = await stopRecordingRequest(`${dataDir}/recording-${timestamp}.wav`, expected, manualGeneration);
+      if (!expected && !manualGeneration) setIsProcessing(false);
+      if (!didStop) return false;
+      if (manualGeneration) onStopInitiated?.();
       Analytics.trackTranscriptionSuccess();
       // Rust emits one completion event; RecordingPostProcessingProvider saves
       // the meeting and navigates for every stop origin.
+      return true;
     } catch (error) {
       console.error('Failed to stop recording:', error);
-      if (errorText(error).includes('No recording in progress')) return;
-      setIsProcessing(false);
-      onRecordingStop(false);
+      if (errorText(error).includes('No recording in progress')) return false;
+      if (!expected && !manualGeneration) {
+        setIsProcessing(false);
+        onRecordingStop(false);
+      }
+      return false;
     } finally {
-      setIsStopping(false);
+      if (!expected && !manualGeneration) setIsStopping(false);
     }
-  }, [onRecordingStop]);
+  }, [onRecordingStop, onStopInitiated]);
 
   const handleStopRecording = useCallback(async () => {
     if (!isRecording || isStarting || isStopping) return;
     onStopInitiated?.();
     setIsStopping(true);
-    await stopRecordingAction();
+    return stopRecordingAction();
   }, [isRecording, isStarting, isStopping, stopRecordingAction, onStopInitiated]);
 
-  // Stop pressed elsewhere in the app (recording pill, command bar, meeting
-  // automation) routes here and leaves a request, so the normal stop and save
-  // flow runs from this card.
-  useEffect(() => {
-    let requested = false;
+  const stopDispatcher = useRef(false);
+  const stopReady = useRef(false);
+  stopReady.current = isRecording && !isStarting && !isStopping;
+  const stopMounted = useRef(true);
+  useEffect(() => { stopMounted.current = true; return () => { stopMounted.current = false; }; }, []);
+  const dispatchPendingStop = useCallback(async () => {
+    if (stopDispatcher.current || !stopReady.current || !stopMounted.current) return;
+    stopDispatcher.current = true;
     try {
-      requested = sessionStorage.getItem(STOP_REQUEST_KEY) === '1';
-      if (requested) sessionStorage.removeItem(STOP_REQUEST_KEY);
-    } catch {
-      requested = false;
-    }
-    if (requested && isRecording) void handleStopRecording();
-  }, [isRecording, handleStopRecording]);
+      while (stopReady.current && stopMounted.current) {
+        const request = takeRecordingStopRequest();
+        if (!request) break;
+        try {
+          if (request.kind === 'automated') await stopRecordingAction(request.expected);
+          else if (request.state === 'ready') await stopRecordingAction(undefined, request.generation);
+        } finally { completeRecordingStopRequest(request); }
+      }
+    } finally { stopDispatcher.current = false; }
+  }, [stopRecordingAction]);
 
-  // The same request while this page is open (command bar, meeting automation).
   useEffect(() => {
-    const onStop = () => void handleStopRecording();
+    const onStop = (event: Event) => {
+      const detail = (event as CustomEvent).detail;
+      // Legacy typed manual events are fresh actions, not stored/replayed
+      // unbound intent. Their generation is frozen now, even before UI sync.
+      if (detail?.kind === 'manual' && detail.id === undefined) {
+        requestRecordingStop(() => {}); return;
+      }
+      if (detail?.kind !== 'queued') {
+        const request = readRecordingStopRequest(detail);
+        if (!request) return;
+        queueRecordingStopRequest(request);
+      }
+      void dispatchPendingStop();
+    };
     window.addEventListener(STOP_RECORDING_EVENT, onStop);
     return () => window.removeEventListener(STOP_RECORDING_EVENT, onStop);
-  }, [handleStopRecording]);
+  }, [dispatchPendingStop]);
+
+  useEffect(() => { void dispatchPendingStop(); }, [isRecording, isStarting, isStopping, dispatchPendingStop]);
 
   const handlePauseRecording = useCallback(async () => {
     if (!isRecording || isPaused || isPausing) return;

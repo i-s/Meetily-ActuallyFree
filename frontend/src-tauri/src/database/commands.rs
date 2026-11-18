@@ -161,6 +161,7 @@ pub async fn import_and_initialize_database(
     // Update app state with the new manager
     if app.try_state::<AppState>().is_none() { super::transcript_versions::interrupt_running(db_manager.pool()).await?; }
     app.manage(AppState { db_manager });
+    crate::post_call::worker::start(app.clone());
 
     info!("Legacy database imported and initialized successfully");
 
@@ -185,6 +186,7 @@ pub async fn initialize_fresh_database(app: AppHandle) -> Result<(), String> {
 
     // Update app state with the new manager
     app.manage(AppState { db_manager: db_manager.clone() });
+    crate::post_call::worker::start(app.clone());
 
     // Set default model configuration for fresh installs
     let pool = db_manager.pool();

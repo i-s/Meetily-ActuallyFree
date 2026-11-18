@@ -13,7 +13,7 @@ interface UseCopyOperationsProps {
 }
 const message = (error: unknown) => error instanceof Error ? error.message : String(error);
 const partsFor = (content: MeetingExportContent): Set<ExportPart> => new Set<ExportPart>(
-  content === 'all' ? ['notes', 'summary', 'transcript'] : content === 'both' ? ['summary', 'transcript'] : [content],
+  content === 'all' ? ['notes', 'actions', 'summary', 'transcript'] : content === 'both' ? ['summary', 'transcript'] : [content],
 );
 
 /** Both export entrypoints read the same committed native snapshot, not a stale

@@ -118,10 +118,11 @@ fn notes_text(markdown: Option<&str>, json: Option<&str>) -> String {
 }
 
 pub async fn materials(pool: &SqlitePool) -> Result<Vec<LibraryMaterial>, sqlx::Error> {
+    crate::post_call::store::projection::recover(pool,None).await.map_err(sqlx::Error::Protocol)?;
     let rows = sqlx::query(
         "SELECT m.id, m.folder_path, (SELECT COUNT(*) FROM transcripts t WHERE t.meeting_id=m.id) AS count, \
          n.notes_markdown, n.notes_json, s.result, s.status FROM meetings m \
-         LEFT JOIN meeting_notes n ON n.meeting_id=m.id LEFT JOIN summary_processes s ON s.meeting_id=m.id",
+         LEFT JOIN meeting_notes n ON n.meeting_id=m.id LEFT JOIN current_meeting_summaries s ON s.meeting_id=m.id",
     ).fetch_all(pool).await?;
     rows.into_iter().map(|row| {
         let raw: Option<String> = row.try_get("result")?;
@@ -155,6 +156,7 @@ pub struct LibrarySearchHit {
 /// visible text in Rust for RU/EN and literal %, _ and backslash. Keep only a
 /// bounded result set, never materialize an entire transcript library or JSON.
 pub async fn search(pool: &SqlitePool, query: &str, limit: usize, one_per_meeting: bool) -> Result<Vec<LibrarySearchHit>, sqlx::Error> {
+    crate::post_call::store::projection::recover(pool,None).await.map_err(sqlx::Error::Protocol)?;
     let query = query.trim().to_lowercase();
     if query.is_empty() { return Ok(vec![]) }
     let limit = limit.clamp(1, 200);
@@ -165,7 +167,7 @@ pub async fn search(pool: &SqlitePool, query: &str, limit: usize, one_per_meetin
             "meeting" => "SELECT m.id AS id,m.id AS meeting_id,m.title,m.title AS text,m.created_at AS timestamp,NULL AS speaker,NULL AS audio_start_time FROM meetings m ORDER BY m.created_at DESC,m.id LIMIT 256 OFFSET ?",
             "notes" => "SELECT m.id AS id,m.id AS meeting_id,m.title,COALESCE(n.notes_markdown,'') AS text,n.notes_json,m.created_at AS timestamp,NULL AS speaker,NULL AS audio_start_time FROM meeting_notes n JOIN meetings m ON m.id=n.meeting_id WHERE n.notes_markdown IS NOT NULL OR n.notes_json IS NOT NULL ORDER BY m.created_at DESC,m.id LIMIT 256 OFFSET ?",
             "transcript" => "SELECT t.id,m.id AS meeting_id,m.title,t.transcript AS text,m.created_at AS timestamp,t.speaker,t.audio_start_time FROM transcripts t JOIN meetings m ON m.id=t.meeting_id ORDER BY m.created_at DESC,m.id,COALESCE(t.audio_start_time,0),t.timestamp,t.id LIMIT 256 OFFSET ?",
-            _ => "SELECT m.id AS id,m.id AS meeting_id,m.title,s.result AS text,m.created_at AS timestamp,NULL AS speaker,NULL AS audio_start_time FROM summary_processes s JOIN meetings m ON m.id=s.meeting_id WHERE s.result IS NOT NULL ORDER BY m.created_at DESC,m.id LIMIT 256 OFFSET ?",
+            _ => "SELECT m.id AS id,m.id AS meeting_id,m.title,s.result AS text,m.created_at AS timestamp,NULL AS speaker,NULL AS audio_start_time FROM current_meeting_summaries s JOIN meetings m ON m.id=s.meeting_id WHERE s.result IS NOT NULL ORDER BY m.created_at DESC,m.id LIMIT 256 OFFSET ?",
         };
         let mut offset = 0_i64;
         let mut count = 0;
@@ -221,6 +223,7 @@ pub struct MeetingExportSnapshot {
 /// current summary together, including during atomic #14 selection/correction.
 /// Audio availability is only a filesystem observation, never a retention claim.
 pub async fn export_snapshot(pool: &SqlitePool, id: &str, expected_notes_revision: i64) -> Result<MeetingExportSnapshot, String> {
+    crate::post_call::store::projection::recover(pool,Some(id)).await?;
     async fn read(pool: &SqlitePool, id: &str) -> Result<MeetingExportSnapshot, sqlx::Error> {
         let mut tx = pool.begin().await?;
         let row = sqlx::query("SELECT title,created_at,folder_path FROM meetings WHERE id=?").bind(id).fetch_one(&mut *tx).await?;
@@ -230,7 +233,7 @@ pub async fn export_snapshot(pool: &SqlitePool, id: &str, expected_notes_revisio
         let notes = sqlx::query_as::<_,(Option<String>,Option<String>,i64)>("SELECT notes_markdown,notes_json,revision FROM meeting_notes WHERE meeting_id=?").bind(id).fetch_optional(&mut *tx).await?;
         let (markdown, json, revision) = notes.unwrap_or((None,None,0));
         let json = json.map(|raw| serde_json::from_str(&raw)).transpose().map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
-        let summary = sqlx::query_as::<_,(Option<String>,String)>("SELECT result,status FROM summary_processes WHERE meeting_id=?").bind(id).fetch_optional(&mut *tx).await?;
+        let summary = sqlx::query_as::<_,(Option<String>,String)>("SELECT result,status FROM current_meeting_summaries WHERE meeting_id=?").bind(id).fetch_optional(&mut *tx).await?;
         let rows = sqlx::query("SELECT id,transcript,speaker,audio_start_time FROM transcripts WHERE meeting_id=? ORDER BY COALESCE(audio_start_time,0),timestamp,id").bind(id).fetch_all(&mut *tx).await?;
         let transcripts = rows.into_iter().map(|r| Ok(ExportTranscript { id:r.try_get("id")?, text:r.try_get("transcript")?, speaker:r.try_get("speaker")?, audio_start_time:r.try_get("audio_start_time")? })).collect::<Result<Vec<_>,sqlx::Error>>()?;
         let rows = sqlx::query("SELECT a.text,a.done,COALESCE(p.display_name,a.owner_label) AS owner,a.due_text,a.source FROM action_items a LEFT JOIN people p ON p.id=a.person_id WHERE a.meeting_id=? ORDER BY a.position,a.id").bind(id).fetch_all(&mut *tx).await?;

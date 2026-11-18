@@ -46,7 +46,7 @@ pub async fn context(pool: &SqlitePool, meeting: &str) -> Result<Option<ActionSy
     let exists = sqlx::query("UPDATE meetings SET id=id WHERE id=?").bind(meeting)
         .execute(&mut *tx).await.map_err(|e| e.to_string())?.rows_affected();
     if exists != 1 { return Ok(None); }
-    let row: Option<(String,String,String)> = sqlx::query_as("SELECT action_sync_token,result,status FROM summary_processes WHERE meeting_id=? AND result IS NOT NULL")
+    let row: Option<(String,String,String)> = sqlx::query_as("SELECT action_sync_token,result,status FROM current_meeting_summaries WHERE meeting_id=? AND result IS NOT NULL")
         .bind(meeting).fetch_optional(&mut *tx).await.map_err(|e| e.to_string())?;
     let Some((summary_token, raw, status)) = row else { return Ok(None); };
     let summary = summary_data(&raw);
@@ -63,7 +63,7 @@ pub async fn commit(pool: &SqlitePool, context: &ActionSyncGuard, drafts: Vec<Ac
     let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
     sqlx::query("UPDATE meetings SET id=id WHERE id=?").bind(&context.meeting_id)
         .execute(&mut *tx).await.map_err(|e| e.to_string())?;
-    let row: Option<(String,i64,String,String,String)> = sqlx::query_as("SELECT t.version_id,t.revision,s.action_sync_token,s.result,s.status FROM transcript_selection t JOIN summary_processes s ON s.meeting_id=t.meeting_id WHERE t.meeting_id=? AND s.result IS NOT NULL")
+    let row: Option<(String,i64,String,String,String)> = sqlx::query_as("SELECT t.version_id,t.revision,s.action_sync_token,s.result,s.status FROM transcript_selection t JOIN current_meeting_summaries s ON s.meeting_id=t.meeting_id WHERE t.meeting_id=? AND s.result IS NOT NULL")
         .bind(&context.meeting_id).fetch_optional(&mut *tx).await.map_err(|e| e.to_string())?;
     let Some((version,revision,token,raw,status)) = row else { return Ok(None); };
     if version != context.version_id || revision != context.revision || token != context.summary_token || summary_data(&raw) != context.summary || !terminal(&status) {

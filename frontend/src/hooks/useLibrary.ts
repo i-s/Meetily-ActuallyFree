@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { libraryMaterials, searchLibrary, type LibraryMaterial } from '@/lib/library-api';
 import { onWorkspaceChange } from '@/lib/workspace-api';
+import { onPostCallCanonicalChange } from '@/lib/post-call-canonical';
 import type { GlobalSearchResult } from '@/types';
 
 /** A result belongs to the exact query generation, not just the latest request
@@ -9,7 +10,12 @@ export function useLibrarySearch(query: string) {
   const [state, setState] = useState<{ query: string; hits: GlobalSearchResult[]; loading: boolean; error: string | null }>({ query: '', hits: [], loading: false, error: null });
   const generation = useRef(0);
   const [revision, setRevision] = useState(0);
-  useEffect(() => onWorkspaceChange(['notes', 'meetings'], () => setRevision(value => value + 1)), []);
+  useEffect(() => {
+    const changed = () => setRevision(value => value + 1);
+    const stop = onWorkspaceChange(['notes', 'meetings'], changed);
+    const stopNative = onPostCallCanonicalChange(changed);
+    return () => { stop(); stopNative(); };
+  }, []);
   useEffect(() => {
     const run = ++generation.current;
     const needle = query.trim();
@@ -48,8 +54,9 @@ export function useLibraryMaterials() {
     void load();
     const changed = () => void load();
     const stop = onWorkspaceChange(['notes', 'meetings'], changed);
+    const stopNative = onPostCallCanonicalChange(changed);
     window.addEventListener('focus', changed);
-    return () => { active = false; ++generation; stop(); window.removeEventListener('focus', changed); };
+    return () => { active = false; ++generation; stop(); stopNative(); window.removeEventListener('focus', changed); };
   }, [revision]);
   return { materials, error, retry: () => setRevision(value => value + 1) };
 }

@@ -20,7 +20,7 @@ REPO = ROOT / 'frontend/src-tauri/src/database/repositories'
 def main():
     lock = tomllib.loads((ROOT / 'Cargo.lock').read_text())
     versions = {n: next(p['version'] for p in lock['package'] if p['name'] == n)
-                for n in ('sqlx', 'tokio', 'serde', 'serde_json', 'chrono', 'tempfile', 'uuid', 'pulldown-cmark')}
+                for n in ('sqlx', 'tokio', 'serde', 'serde_json', 'chrono', 'tempfile', 'uuid', 'pulldown-cmark', 'tracing')}
     with tempfile.TemporaryDirectory(prefix='meetily-library-sql-') as folder:
         work = Path(folder)
         (work / 'src').mkdir()
@@ -60,7 +60,7 @@ def main():
         identity = person if 'pub(crate) fn normalize_person_name' in person else (REPO / 'speaker_identity.rs').read_text()
         normalize = identity[identity.index('pub(crate) fn normalize_person_name'):identity.index('pub(crate) fn is_person_name')]
         (work / 'src/person.rs').write_text('use sqlx::SqlitePool; use std::cmp::Ordering; use crate::state::AppState; const DEFAULT_SEARCH_LIMIT:i64=40; const MAX_SEARCH_LIMIT:i64=100;\n' + dto + ranking + 'impl PeopleRepository {\n' + search + '}\n' + global_command + normalize + helpers + visible + '\n' + snippet + ('\npub(crate) use super::speaker_identity::is_person_name;\n' if with_versions else ''))
-        for name in ('meeting_notes', 'notes_document', *(['action_item', 'action_sync'] if with_versions else [])):
+        for name in ('meeting_notes', 'notes_document', 'summary', *(['action_item', 'action_sync'] if with_versions else [])):
             notes_source = (REPO / f'{name}.rs').read_text().replace('#[tauri::command]', '')
             notes_source = notes_source.replace("tauri::State<'_, crate::state::AppState>", '&crate::state::AppState')
             notes_source = notes_source.replace('../../../migrations/', str(ROOT / 'frontend/src-tauri/migrations') + '/')
@@ -72,7 +72,7 @@ def main():
         (work / 'src/commands.rs').write_text(commands)
         migrations = sorted((ROOT / 'frontend/src-tauri/migrations').glob('*.sql')) + extra_migrations
         (work / 'src/migrations.rs').write_text('pub const MIGRATIONS: &[&str] = &[\n' + ''.join(f'include_str!("{p}"),\n' for p in migrations) + '];')
-        deps = '\n'.join(f'{n}="={versions[n]}"' for n in ('serde_json', 'chrono', 'tempfile'))
+        deps = '\n'.join(f'{n}="={versions[n]}"' for n in ('serde_json', 'tempfile', 'tracing'))
         (work / 'Cargo.toml').write_text(f'''[package]
 name="meetily-library-sql"
 version="0.0.0"
@@ -81,20 +81,25 @@ edition="2021"
 versions=[]
 [dependencies]
 {deps}
+chrono={{version="={versions['chrono']}",features=["serde"]}}
 pulldown-cmark={{version="={versions['pulldown-cmark']}",default-features=false}}
 uuid={{version="={versions['uuid']}",features=["v4"]}}
 serde={{version="={versions['serde']}",features=["derive"]}}
 sqlx={{version="={versions['sqlx']}",features=["runtime-tokio", "sqlite", "chrono"]}}
 tokio={{version="={versions['tokio']}",features=["macros", "rt-multi-thread", "sync", "time"]}}
 ''')
+        models = (ROOT / 'frontend/src-tauri/src/database/models.rs').read_text()
+        summary_model = '#[derive(Debug,sqlx::FromRow,serde::Serialize,serde::Deserialize)]\n' + models[models.index('pub struct SummaryProcess {'):models.index('\n#[derive', models.index('pub struct SummaryProcess {'))]
         (work / 'src/lib.rs').write_text(f'''
 {extra_modules}
 mod state {{ pub struct Db(pub sqlx::SqlitePool); impl Db {{ pub fn pool(&self)->&sqlx::SqlitePool{{&self.0}} }} pub struct AppState{{pub db_manager:Db}} }}
-mod database {{ {version_alias} pub mod repositories {{
+pub mod post_call {{ #[path="{ROOT}/frontend/src-tauri/src/post_call/store.rs"] pub mod store; }}
+mod database {{ {version_alias} pub mod models {{ {summary_model} }} pub mod repositories {{
 #[path="{work}/src/person.rs"] pub mod person;
 #[path="{REPO}/library.rs"] pub mod library;
 #[path="{work}/src/meeting_notes.rs"] pub mod meeting_notes;
 #[path="{work}/src/notes_document.rs"] pub mod notes_document;
+#[path="{work}/src/summary.rs"] pub mod summary;
 {identity_module}
 {action_modules}
 }} }}
@@ -102,6 +107,7 @@ mod database {{ {version_alias} pub mod repositories {{
 #[path="{work}/src/migrations.rs"] mod migrations;
 #[cfg(test)] #[path="{ROOT}/frontend/tests/native/library.rs"] mod tests;
 #[cfg(all(test, feature="versions"))] #[path="{ROOT}/frontend/tests/native/action-sync.rs"] mod action_sync_tests;
+#[cfg(all(test, feature="versions"))] #[path="{ROOT}/frontend/tests/native/post-call-bridge.rs"] mod bridge_tests;
 ''')
         # Reuse the workspace lock versions; Cargo removes unused entries and
         # adds only this fixture's root. The second invocation is locked.

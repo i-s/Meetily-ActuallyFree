@@ -91,8 +91,9 @@ Physical Mac WebView/BlockNote interaction, power loss, recording/ASR continuity
 real models and same-audio RU/EN accuracy remain unqualified. No model/audio test,
 installer, local Mac installation or release is established by these tests.
 
-The separate #10/#11 branch is not merged here. Its accepted identity-policy
-cross-gate must later exercise original recording metadata before temporary WAV
-conversion, malformed metadata and generated composite labels through candidate
-creation and selection. Shared-room identity remains outside MVP. No automatic
-provider substitution is introduced.
+The later accepted #10/#11 scaffold is now integrated on this branch; see
+[ISSUE10_14_IDENTITY_INTEGRATION.md](ISSUE10_14_IDENTITY_INTEGRATION.md) for the
+original-session/stored identity-policy cross-gate and its focused regressions.
+Notes/version revision ownership and normal save/recovery remain unchanged.
+Shared-room identity remains outside MVP; physical capture/identity qualification
+is still open. No automatic provider substitution is introduced.
