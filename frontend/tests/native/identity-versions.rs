@@ -199,3 +199,21 @@ async fn candidate_identity_labels_and_authority_roll_back_together_on_sql_failu
     let after:(String,String)=sqlx::query_as("SELECT segments_json,settings_json FROM transcript_versions WHERE id=?").bind(&id).fetch_one(pool).await.unwrap();
     assert_eq!(after,before);assert_eq!(projection(&f).await,selected);
 }
+
+#[tokio::test]
+async fn frozen_room_candidate_with_only_mic_track_stays_neutral_without_decode() {
+    let f=Fixture::new(json!({"in_person":true}),true).await;
+    std::fs::remove_file(f.folder.path().join("system.mp4")).unwrap();
+    let id=f.candidate(json!({"in_person":true}),"pyannote").await;
+    let before=projection(&f).await;
+    let sources=crate::audio::retranscription::asr_preflight(&f.state,"m".into(),f.folder.path().to_string_lossy().into_owned(),id.clone()).await.unwrap();
+    assert_eq!(sources,vec![("room".into(),Some("Microphone".into()))]);
+    command::diarize_version(&f.state,"m",&id).await.unwrap();
+    assert_eq!(command::DECODES.load(Ordering::SeqCst),0);
+    assert_eq!(command::voiceprint::READS.load(Ordering::SeqCst),0);
+    assert_eq!(command::voiceprint::WRITES.load(Ordering::SeqCst),0);
+    assert_eq!(projection(&f).await,before);
+    for row in versions::segments(f.state.db_manager.pool(),"m",&id).await.unwrap() {
+        assert!(!row.speaker.as_deref().unwrap_or_default().contains("You"));
+    }
+}

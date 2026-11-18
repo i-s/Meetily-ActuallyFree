@@ -153,7 +153,13 @@ async fn qualification_binding_and_missing_authority_never_reach_capture() {
     let mut unqualified = request("zoom", "unqualified");
     unqualified.session_id = "real-unqualified-observation".into();
     assert!(start(unqualified.clone()).await.is_err());
-    assert_eq!(commands::resolve_automated_recording_start(unqualified).await.unwrap().outcome, starts::StartOutcome::Failed);
+    // Rejection still retires a well-formed next ticket; qualification changes
+    // cannot revive it, and resolve retains the existing failure receipt.
+    let receipt=commands::resolve_automated_recording_start(unqualified.clone()).await.unwrap();
+    assert_eq!(receipt.outcome, starts::StartOutcome::Failed);
+    assert!(receipt.terminal && receipt.no_future_commit && receipt.committed_lease.is_none());
+    assert_eq!(receipt.expected,unqualified);
+    assert!(starts::claim(&unqualified).is_err());
     let mut wrong = request("zoom", "binding"); wrong.source = "discord".into();
     assert!(start(wrong.clone()).await.is_err());
     assert_eq!(commands::resolve_automated_recording_start(wrong).await.unwrap().outcome, starts::StartOutcome::Failed);
@@ -221,4 +227,114 @@ async fn combined_post_call_priority_precedes_engine_lock_and_cancelled_acquisit
     assert!(start(request("discord","failed-priority-release")).await.is_err());
     commands::FAIL.store(false,Ordering::SeqCst);
     assert!(crate::post_call::worker::PRIORITY.try_background("after-failure").await.is_some(),"failed setup leaked recording priority");
+}
+
+#[tokio::test]
+async fn already_invalid_automated_ipc_never_interrupts_owned_post_call_work() {
+    use std::{sync::Arc, time::Duration};
+    for case in ["terminal", "fenced-after-read", "conflicting", "old-epoch", "future", "malformed", "missing-ticket", "missing-session", "mismatched", "unqualified", "disabled", "unsupported"] {
+        reset().await;
+        let mut expected=request("zoom",case);
+        crate::meeting_detection::lifecycle::fixture(Some(expected.session_id.clone()),"active".into(),true);
+        let mut session=Some(expected.session_id.clone());
+        match case {
+            "terminal" | "fenced-after-read" | "conflicting" => {
+                if case=="fenced-after-read" {starts::preflight(&expected).unwrap();}
+                commands::cancel_automated_recording_start(expected.clone()).await.unwrap();
+                if case=="conflicting" {expected.token="different-token".into();}
+            }
+            "old-epoch" => expected.epoch="previous-process".into(),
+            "future" => expected.sequence=(expected.sequence.parse::<u64>().unwrap()+1).to_string(),
+            "malformed" => expected.version=0,
+            "missing-session" => session=None,
+            "mismatched" => session=Some("different-session".into()),
+            "unqualified" => crate::meeting_detection::lifecycle::fixture(Some(expected.session_id.clone()),"active".into(),false),
+            "disabled" => ownership::set_meeting_automation_enabled(false),
+            "unsupported" => expected.source="unsupported".into(),
+            _ => {}
+        }
+        let ticket=if case=="missing-ticket" {None} else {Some(expected)};
+        commands::HOLD.store(true,Ordering::SeqCst);
+        let setups=commands::ENTERED.available_permits();
+        let background=crate::post_call::worker::PRIORITY.try_background("unrelated-saved-meeting").await.unwrap();
+        let token=background.token.clone();
+        let release=Arc::new(tokio::sync::Notify::new());let drain=release.clone();
+        let owned=tokio::spawn(async move {drain.notified().await;drop(background);});
+        let mut rejected=tokio::spawn(commands::start_recording_with_lifecycle(app(),None,None,None,session,ticket));
+        let result=tokio::time::timeout(Duration::from_millis(100),&mut rejected).await;
+        let interrupted=token.is_cancelled();
+        let still_owned=crate::post_call::worker::PRIORITY.try_background("competing-job").await.is_none();
+        if result.is_err() {rejected.abort();let _=rejected.await;}
+        release.notify_one();owned.await.unwrap();
+        assert!(!interrupted,"already-invalid {case} request cancelled unrelated post-call token");
+        assert!(still_owned,"rejected {case} request displaced owned background work");
+        assert!(result.is_ok_and(|r|r.unwrap().is_err()),"{case} should reject before waiting for background drain");
+        assert_eq!(commands::CAPTURES.load(Ordering::SeqCst),0);
+        assert_eq!(commands::ENTERED.available_permits(),setups,"rejected request reached setup");
+    }
+}
+
+
+#[tokio::test]
+async fn valid_admission_later_revoked_during_background_drain_cannot_capture_or_replay() {
+    use std::time::Duration;
+    for source in ["zoom","discord"] {
+        for revocation in ["cancel","disable","unqualified"] {
+            reset().await;
+            let expected=request(source,"revoked-during-drain");
+            let background=crate::post_call::worker::PRIORITY.try_background("owned-local-inference").await.unwrap();
+            let token=background.token.clone();
+            let request=expected.clone();let running=tokio::spawn(start(request));
+            tokio::time::timeout(Duration::from_secs(1),token.cancelled()).await.unwrap();
+            assert!(!running.is_finished(),"admitted request must await owned work drain");
+            assert_eq!(commands::CAPTURES.load(Ordering::SeqCst),0);
+            if revocation=="cancel" {
+                // The v1 barrier remains usable while a valid preflight waits
+                // for queue drain; preflight itself never claimed the ticket.
+                let receipt=commands::cancel_automated_recording_start(expected.clone()).await.unwrap();
+                assert!(receipt.terminal && receipt.no_future_commit);
+                assert_eq!(receipt.outcome,starts::StartOutcome::Cancelled);
+            } else if revocation=="disable" {
+                ownership::set_meeting_automation_enabled(false);
+            } else if source=="zoom" {
+                crate::meeting_detection::lifecycle::fixture(Some(expected.session_id.clone()),"active".into(),false);
+            } else {
+                crate::discord_automation::fixture(crate::discord_automation::Status {enabled:true,qualified:false,state:"active".into(),session_id:Some(expected.session_id.clone()),transition:"start".into()});
+            }
+            drop(background);
+            assert!(tokio::time::timeout(Duration::from_secs(1),running).await.unwrap().unwrap().is_err());
+            assert_eq!(commands::CAPTURES.load(Ordering::SeqCst),0);
+            let receipt=commands::resolve_automated_recording_start(expected.clone()).await.unwrap();
+            assert!(receipt.terminal && receipt.no_future_commit && receipt.committed_lease.is_none());
+            assert_eq!(receipt.outcome,if revocation=="cancel" {starts::StartOutcome::Cancelled} else {starts::StartOutcome::Failed});
+            ownership::set_meeting_automation_enabled(true);
+            let next=crate::post_call::worker::PRIORITY.try_background("next-owned-job").await.unwrap();
+            assert!(start(expected).await.is_err());
+            assert!(!next.token.is_cancelled(),"replay after terminal receipt disturbed next job");
+            drop(next);
+        }
+    }
+}
+
+#[tokio::test]
+async fn rejected_unqualified_ticket_stays_fenced_after_qualification_returns() {
+    use std::time::Duration;
+    reset().await;
+    let expected=request("zoom","unqualified-then-republished");
+    crate::meeting_detection::lifecycle::fixture(Some(expected.session_id.clone()),"active".into(),false);
+    assert!(commands::start_recording_with_lifecycle(app(),None,None,None,Some(expected.session_id.clone()),Some(expected.clone())).await.is_err());
+    crate::meeting_detection::lifecycle::fixture(Some(expected.session_id.clone()),"active".into(),true);
+    let background=crate::post_call::worker::PRIORITY.try_background("unrelated-job-after-rejection").await.unwrap();
+    let token=background.token.clone();
+    let copy=expected.clone();
+    let mut replay=tokio::spawn(commands::start_recording_with_lifecycle(app(),None,None,None,Some(copy.session_id.clone()),Some(copy)));
+    let result=tokio::time::timeout(Duration::from_millis(100),&mut replay).await;
+    if result.is_err() {replay.abort();let _=replay.await;}
+    drop(background);
+    assert!(!token.is_cancelled(),"rejected ticket became eligible after qualification returned");
+    assert!(result.is_ok_and(|r|r.unwrap().is_err()));
+    let receipt=commands::resolve_automated_recording_start(expected).await.unwrap();
+    assert_eq!(receipt.outcome,starts::StartOutcome::Failed);
+    assert!(receipt.terminal && receipt.no_future_commit && receipt.committed_lease.is_none());
+    assert_eq!(commands::CAPTURES.load(Ordering::SeqCst),0);
 }

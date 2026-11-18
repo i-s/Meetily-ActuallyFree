@@ -74,10 +74,16 @@ impl StartAuthority {
         }
         Ok(sequence)
     }
-    pub fn claim(&mut self, request: &StartRequest) -> Result<(), String> {
+    /// Non-disruptive eligibility read, not admission or a terminal receipt.
+    /// A later claim must repeat this under the engine lifecycle lock.
+    pub fn preflight(&self, request: &StartRequest) -> Result<(), String> {
         let sequence = Self::sequence(request)?;
         if request.epoch != self.epoch { return Err("Recording start process epoch changed".into()); }
         if sequence != self.next || self.inflight.is_some() { return Err("Recording start ticket is stale, conflicting or out of order".into()); }
+        Ok(())
+    }
+    pub fn claim(&mut self, request: &StartRequest) -> Result<(), String> {
+        self.preflight(request)?;
         self.next += 1;
         self.inflight = Some(request.clone());
         Ok(())
@@ -127,6 +133,18 @@ pub fn get_recording_start_capability() -> StartCapability { STARTS.lock().unwra
 /// Owned by the native start future, never the initiating WebView. Early return
 /// or future destruction settles failure; a barrier still waits for engine lock.
 pub struct StartClaim { expected: StartRequest }
+pub fn preflight(expected: &StartRequest) -> Result<(), String> {
+    STARTS.lock().unwrap().preflight(expected)
+}
+/// Retire only a still-next well-formed ticket after preflight rejection. This
+/// grants no setup/capture ownership. Reuse the existing watermark/history under
+/// one mutex; malformed/future/stale/in-flight tickets cannot fence other work.
+pub fn reject_unadmitted(expected: &StartRequest) {
+    let mut starts = STARTS.lock().unwrap();
+    if starts.claim(expected).is_ok() {
+        starts.finish(expected, None);
+    }
+}
 pub fn claim(expected: &StartRequest) -> Result<StartClaim, String> {
     STARTS.lock().unwrap().claim(expected)?;
     Ok(StartClaim { expected: expected.clone() })

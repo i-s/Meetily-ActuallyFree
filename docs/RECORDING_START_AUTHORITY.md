@@ -90,8 +90,25 @@ NOT assert cancellation/no prior capture. No unbounded cancelled-token registry
 or TTL that could reopen an old request is used. Idempotence is the permanent
 fence; live recorder state and evictable diagnostic detail may evolve.
 
-Native start claims under the existing recorder lifecycle lock before validation
-or device/model setup. Early failure/future destruction settles its claim through
+Before reserving #15 recording priority (which cancels background queue work),
+`start_recording_with_lifecycle` synchronously checks request/session binding,
+read-only native ticket eligibility and source qualification. Definitively invalid
+requests never reserve priority, wait for queue drain, or reach setup/capture.
+A well-formed still-next rejected ticket is atomically marked failed through the
+existing authority watermark/history, without capture admission or the engine
+lock. This preserves failure receipts and prevents qualification changes from
+reviving a rejected request. Stale/malformed/future/in-flight requests cannot
+retire other work; early rejection is not itself a terminal barrier receipt.
+
+A successful preflight is only permission to request resource priority, not a
+capture claim or terminal proof. There is no await between that synchronous read
+and priority reservation. A valid request may therefore cancel/drain background
+work and then be revoked while waiting; the final authority/source checks still
+reject it, with no setup/capture/replay. Cancel/resolve can fence an unclaimed
+ticket during the drain wait and continue to provide their lock-protected receipts.
+
+Native capture admission still claims under the existing recorder lifecycle lock
+before final validation or device/model setup. Early failure/future destruction settles its claim through
 RAII. Successful capture binds its native lease before releasing that lock.
 Resolve/cancel take the **same lock**. If cancel wins before a delayed/queued IPC,
 it consumes the sequence and that IPC cannot reach setup/capture. If native start

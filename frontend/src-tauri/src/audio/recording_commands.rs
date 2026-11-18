@@ -571,6 +571,31 @@ pub async fn start_recording_with_lifecycle<R: Runtime>(
     lifecycle_session: Option<String>,
     expected_start: Option<super::recording_start_authority::StartRequest>,
 ) -> Result<super::recording_ownership::RecordingLease, String> {
+    // Reject known-invalid IPC before preempting an unrelated saved-meeting job.
+    // This grants no setup ownership. There is no await before priority; later
+    // revocation is still checked under the shared engine lock below.
+    let preflight = (|| -> Result<(), String> {
+        if lifecycle_session.is_some() != expected_start.is_some() {
+            return Err("Automated recording requires native start authority v1 and a lifecycle session".into());
+        }
+        if let Some(expected) = &expected_start {
+            if lifecycle_session.as_deref() != Some(expected.session_id.as_str()) {
+                return Err("Recording start session binding mismatch".into());
+            }
+            super::recording_start_authority::preflight(expected)?;
+            super::recording_start_sources::validate(&expected.source, &expected.session_id)?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = preflight {
+        // Keep rejected next tickets failed/fenced, just as the locked claim's
+        // early-return path did. This is not a terminal receipt for future or
+        // malformed tickets; resolve/cancel still provide the actual barrier.
+        if let Some(expected) = &expected_start {
+            super::recording_start_authority::reject_unadmitted(expected);
+        }
+        return Err(error);
+    }
     // Yield background inference before taking the lock shared with v1 barriers.
     let _post_call_priority = crate::post_call::worker::PRIORITY.recording().await;
     let engine_lifecycle_guard = super::common::acquire_engine_lifecycle_lock().await;

@@ -93,3 +93,47 @@ separately allocated exclusive heavy-build slot; none was run in this convergenc
 Physical 5–90 minute RU/EN, overlap/leakage quality, real source qualification,
 battery/thermal behavior, maximum inference yield and recording readiness remain
 open as documented in the owning feature notes.
+
+## Combined R1: invalid IPC must not preempt queue work
+
+Review of pinned merge head `97764108821c188f299e293bb2f81eabef2d83af`
+identified that `PRIORITY.recording()` ran before any automated admission check.
+Reproduced on production Priority + lifecycle-start prefix + native authority:
+a terminal A replay cancelled an unrelated running background token before
+rejection (**36 passed, 1 failed**, expected RED). The new rejection table covers
+terminal/conflicting/old-epoch/future/malformed, missing/mismatched bindings,
+unqualified/disabled/unsupported requests, and a ticket fenced after an earlier
+read. Background admission/token remain owned and unchanged; rejected calls return
+without waiting for inference drain or entering synthetic setup/capture.
+
+An initial read-only preflight exposed a second regression in the fix itself:
+republishing qualification could revive a rejected next ticket (**38 passed,
+1 failed**, expected RED). Rejection now uses the existing exact watermark/history
+to atomically fail only a still-next well-formed unadmitted ticket; it does not
+create a second authority or claim setup. Failure/cancel/resolve receipt meanings
+remain unchanged. Malformed/future/in-flight/stale checks never fence unrelated
+work. Final capture claims and qualification checks remain under the shared
+engine lock; priority remains ahead of that lock.
+
+Current focused checks: **39 native authority tests passed**, including all the
+above cases plus valid-at-preflight tickets revoked by cancel, automation disable,
+or source qualification loss during background drain for Zoom and Discord. Those
+valid requests may preempt, but cannot capture or replay after revocation. Existing
+manual/qualified-start priority-before-engine and aborted/failed acquisition tests
+continue to pass. The cross-language mounted-recorder harness also passes **60
+tests**; its setup/devices/save adapter remains synthetic and real qualification
+stays false. Queue/runner/storage tests pass **28**, and the actual awaited native
+queue/fake-CLI suite passes **4**, including retained artifacts and epoch fencing.
+
+The optional frozen-room mic-only coverage is pinned by
+`frozen_room_candidate_with_only_mic_track_stays_neutral_without_decode`:
+original and frozen metadata retain `in_person:true`, no system track exists,
+actual ASR preflight returns only neutral room mic, and actual candidate dispatch
+performs no decode/voiceprint read/write or selected-projection mutation.
+The ordinary/candidate identity suite passes **47 tests**. This is coverage, not a
+second confirmed defect or acoustic qualification; it does not assert behavior
+for externally weakened room metadata with incomplete source tracks.
+
+Heavy verification remains **deferred**, with no slot allocated. #18 and the
+canonical output bridge remain outside this fix. No Next, full native/model build,
+physical/private data/service invocation, delegate, packaging, Actions or push.
