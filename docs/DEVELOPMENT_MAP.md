@@ -124,6 +124,10 @@ write reservation. Recovery/direct diarization/voice enrollment retain offline
 admission through their awaited file readers. `audio-cleanup-finished` invalidates
 open playback, library and retranscription availability, not saved text. Generated
 fixture tests do not qualify physical Mac storage/IPC/playback or deletion latency.
+[R1 qualification](ISSUE19_R1.md) separates lifecycle-owned Stop finalization
+cleanup from offline-admitted IPC cleanup, avoiding the refinement lock inversion.
+It also owns identity-based, scoped playback revalidation (unchanged focus retains
+position/rate/playing) and native-task ownership of manual meeting diarization.
 
 ## 3. Post-call processing and model selection
 

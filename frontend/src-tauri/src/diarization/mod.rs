@@ -997,15 +997,20 @@ pub async fn diarize_meeting(
     threshold: Option<f32>,
     engine: Option<String>,
 ) -> Result<MeetingDiarizationResult, String> {
-    let _operation_guard = operation_guard().await;
-    let folder: Option<String> = sqlx::query_scalar("SELECT folder_path FROM meetings WHERE id = ?").bind(&meeting_id).fetch_one(state.db_manager.pool()).await.map_err(|e| e.to_string())?;
-    if let Some(folder) = folder {
-        if crate::audio::retranscription::recording_in_person(std::path::Path::new(&folder)).map_err(|e| e.to_string())? {
-            return Err("Shared-room speaker identification is outside MVP. The room microphone remains a neutral source.".into());
+    let state = crate::state::AppState { db_manager: state.db_manager.clone() };
+    // Keep admission through the awaited blocking reader and publication even
+    // when an IPC waiter is abandoned. No Tauri cancellation assumption is needed.
+    tokio::spawn(async move {
+        let _operation_guard = operation_guard().await;
+        let folder: Option<String> = sqlx::query_scalar("SELECT folder_path FROM meetings WHERE id = ?").bind(&meeting_id).fetch_one(state.db_manager.pool()).await.map_err(|e| e.to_string())?;
+        if let Some(folder) = folder {
+            if crate::audio::retranscription::recording_in_person(std::path::Path::new(&folder)).map_err(|e| e.to_string())? {
+                return Err("Shared-room speaker identification is outside MVP. The room microphone remains a neutral source.".into());
+            }
         }
-    }
-    crate::database::transcript_versions::checkpoint_current(state.db_manager.pool(), &meeting_id).await?;
-    diarize_meeting_inner(&state, meeting_id, audio_path, num_speakers, threshold, engine, None).await
+        crate::database::transcript_versions::checkpoint_current(state.db_manager.pool(), &meeting_id).await?;
+        diarize_meeting_inner(&state, meeting_id, audio_path, num_speakers, threshold, engine, None).await
+    }).await.map_err(|e|format!("Native meeting diarization stopped: {e}"))?
 }
 
 /// Called under the native post-meeting operation guard. Candidate rows never

@@ -22,8 +22,10 @@ AUDIO = REPO / "frontend/src-tauri/src/audio"
 def main():
     diarization = (REPO / "frontend/src-tauri/src/diarization/mod.rs").read_text()
     offline_guard = diarization[diarization.index("static OPERATION_LOCK:"):diarization.index("/// Record where the bundled")]
+    common = (AUDIO / "common.rs").read_text()
+    lifecycle = common[common.index("static ENGINE_LIFECYCLE_LOCK:"):common.index("/// Last time STT")] + common[common.index("pub(crate) fn try_engine_lifecycle_lock"):common.index("/// Keeps a batch transcription")]
     lock = tomllib.loads((REPO / "Cargo.lock").read_text())
-    names = ("anyhow", "log", "tokio", "tracing", "serde", "serde_json", "chrono", "tempfile", "bytemuck", "sha2")
+    names = ("anyhow", "log", "tokio", "tracing", "serde", "serde_json", "chrono", "tempfile", "bytemuck", "sha2", "once_cell")
     versions = {name: next(p["version"] for p in lock["package"] if p["name"] == name) for name in names}
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
@@ -33,7 +35,7 @@ def main():
         (work / "src").mkdir()
         (work / "Cargo.toml").write_text(
             '[package]\nname="meetily-shutdown-portable"\nversion="0.0.0"\nedition="2021"\n[dependencies]\n'
-            + '\n'.join(f'{name}="={versions[name]}"' for name in ("anyhow", "log", "tracing", "serde_json", "chrono", "tempfile", "bytemuck", "sha2"))
+            + '\n'.join(f'{name}="={versions[name]}"' for name in ("anyhow", "log", "tracing", "serde_json", "chrono", "tempfile", "bytemuck", "sha2", "once_cell"))
             + f'\nserde={{version="={versions["serde"]}",features=["derive"]}}\n'
             + f'\ntokio={{version="={versions["tokio"]}",features=["full","test-util"]}}\n'
         )
@@ -54,6 +56,11 @@ pub trait Emitter {{
 }}
 impl<R: Runtime> Emitter for AppHandle<R> {{}}
 mod audio {{
+    pub mod common {{
+        use once_cell::sync::Lazy; use std::sync::Arc;
+        use tokio::sync::{{Mutex as AsyncMutex,OwnedMutexGuard}};
+        {lifecycle}
+    }}
     // Device metadata is replaced; production encoder and state are included intact.
     pub mod devices {{
         #[derive(Clone)] pub struct AudioDevice {{ pub name: String }}
@@ -75,8 +82,9 @@ mod audio {{
     #[path="{work}/src/audio_processing.rs"] pub mod audio_processing;
     #[path="{AUDIO}/recording_saver.rs"] pub mod recording_saver;
 }}
+#[cfg(test)] #[path="{REPO}/frontend/tests/native/stop-cleanup-locks.rs"] mod stop_cleanup_locks;
 ''')
-        subprocess.run(["cargo", "test", "--manifest-path", str(work / "Cargo.toml"), "--", "--test-threads=1"], check=True)
+        subprocess.run(["cargo", "test", "--offline", "--manifest-path", str(work / "Cargo.toml"), "--", "--test-threads=1"], check=True)
         original = {(p["name"], p["version"], p.get("source")) for p in lock["package"]}
         actual = tomllib.loads((work / "Cargo.lock").read_text())
         unexpected = [p for p in actual["package"] if p["name"] != "meetily-shutdown-portable" and (p["name"], p["version"], p.get("source")) not in original]

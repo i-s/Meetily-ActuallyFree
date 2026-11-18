@@ -54,7 +54,18 @@ pub async fn api_confirm_audio_cleanup<R: tauri::Runtime>(
         let _lifecycle = crate::audio::common::try_engine_lifecycle_lock()?;
         idle()?;
         let outcome = audio_cleanup::execute(&pool, plans(), &token).await;
-        let _ = app.emit("audio-cleanup-finished", ());
+        let affected = outcome.as_ref().ok().map(|result| {
+            result
+                .files
+                .iter()
+                .map(|file| file.meeting_id.clone())
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>()
+        });
+        // Null means execution failed before its exact outcomes were available;
+        // consumers revalidate, but never rebuild an unchanged playback element.
+        let _ = app.emit("audio-cleanup-finished", affected);
         outcome
     })
     .await

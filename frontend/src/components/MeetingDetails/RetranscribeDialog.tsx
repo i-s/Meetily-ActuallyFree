@@ -85,7 +85,7 @@ export function RetranscribeDialog({
   const [isClearingMeetingVocabulary, setIsClearingMeetingVocabulary] = useState(false);
   const [listenersReady, setListenersReady] = useState(false);
   const [audioAvailable, setAudioAvailable] = useState(false);
-  const savedAudioRevision = useSavedAudioRevision();
+  const savedAudioRevision = useSavedAudioRevision(meetingId);
   useEffect(() => {
     let active = true;
     setAudioAvailable(false);

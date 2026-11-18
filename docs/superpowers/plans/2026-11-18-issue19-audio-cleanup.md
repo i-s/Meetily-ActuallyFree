@@ -53,3 +53,23 @@ Ruling: protect all pending/deferred/waiting queue audio and ambiguous legacy
 folders; this intentionally retains more storage rather than guessing ownership.
 Task 3 convergence waits for #18's supplied committed head; do not duplicate its
 accepted-history merge or canonical-summary bridge.
+
+## R1 review ledger — 2026-11-19
+
+Standalone implementation committed at 15f8ca70288367482e89f95fd75c8715a614ad85.
+P1: actual Stop saver + extracted production lock helpers reproduced a cycle;
+native finalized cleanup now uses its existing lifecycle owner rather than
+waiting for offline. Independent cleanup/recovery still use offline, and both
+cleanup owners reuse the same file proofs. Shutdown 45/45 and full recovery 83/83.
+P2: mounted 23s/1.5x focus/replacement red tests now pass; observe path + native
+revision without disposing unchanged elements, scope native events, fence stale
+checks/callbacks and apply selected rate to newly created elements. Playback 3/3,
+isolated frontend 54/54 files, narrow native 14/14.
+Diarization: aborting an actual Rust command waiter exposed a guard/reader lifetime
+gap; native-task ownership fixes it. This is not evidence that Tauri closes/reloads
+actually cancel commands; that transport behavior and real media remain unqualified.
+Ruling: keep finalization-specific internal admission, not a new lease subsystem;
+independent callers must never reuse the lifecycle-owned helper without that owner.
+Bridge 2d388cf15adb95f2d37ab1e9ff17b82df723e328 is supplied and accepted upstream;
+standalone R1 must be rechecked/accepted before the separate history-preserving
+integration commit and combined regression. No owner/dependency relay is needed.

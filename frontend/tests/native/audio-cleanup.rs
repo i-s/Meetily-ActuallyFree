@@ -294,6 +294,10 @@ async fn normal_command_rejects_active_capture_and_draining_native_jobs() {
             .removed_bytes,
         72
     );
+    assert_eq!(
+        crate::tauri::EMITTED.lock().unwrap().last(),
+        Some(&serde_json::json!(["a"]))
+    );
 }
 
 async fn retained_dump(pool: &SqlitePool) -> Vec<(String, Vec<String>)> {
@@ -417,4 +421,71 @@ async fn abandoned_recovery_waiter_cannot_release_a_blocking_readers_audio_owner
         "blocking file reader must own admission after IPC waiter is abandoned"
     );
     *crate::recovery_reader::BARRIERS.lock().unwrap() = None;
+}
+
+#[tokio::test]
+async fn normal_playback_api_observes_stable_identity_replacement_and_removal() {
+    let f = fixture().await;
+    let dir = meeting(&f, "a").await;
+    let state = crate::state::AppState {
+        db_manager: crate::state::Db(f.pool.clone()),
+    };
+    let app = || crate::tauri::AppHandle::<crate::tauri::TestRuntime>::default();
+    let first = crate::playback_api::api_get_meeting_audio(app(), &state, "a".into())
+        .await
+        .unwrap();
+    assert!(first.playback_revision.is_some());
+    let same = crate::playback_api::api_get_meeting_audio(app(), &state, "a".into())
+        .await
+        .unwrap();
+    assert_eq!(same.playback_revision, first.playback_revision);
+    fs::write(
+        dir.join("replacement.generated"),
+        b"GENERATED-NOT-REAL-AUDIO",
+    )
+    .unwrap();
+    fs::rename(dir.join("replacement.generated"), dir.join("audio.mp4")).unwrap();
+    let replacement = crate::playback_api::api_get_meeting_audio(app(), &state, "a".into())
+        .await
+        .unwrap();
+    assert_eq!(replacement.path, first.path);
+    assert_ne!(replacement.playback_revision, first.playback_revision);
+    fs::remove_file(dir.join("audio.mp4")).unwrap();
+    let absent = crate::playback_api::api_get_meeting_audio(app(), &state, "a".into())
+        .await
+        .unwrap();
+    assert!(absent.path.is_none());
+    assert!(absent.playback_revision.is_none());
+}
+
+#[tokio::test]
+async fn abandoned_diarize_meeting_waiter_retains_admission_until_blocking_reader_drains() {
+    use std::sync::{Arc, Barrier};
+    let f = fixture().await;
+    meeting(&f, "a").await;
+    let state = crate::state::AppState {
+        db_manager: crate::state::Db(f.pool.clone()),
+    };
+    let started = Arc::new(Barrier::new(2));
+    let finish = Arc::new(Barrier::new(2));
+    *crate::diarization_reader::BARRIERS.lock().unwrap() = Some((started.clone(), finish.clone()));
+    let waiter = tokio::spawn(async move {
+        crate::diarization_reader::diarize_meeting(&state, "a".into(), None, None, None, None).await
+    });
+    tokio::task::spawn_blocking(move || {
+        started.wait();
+    })
+    .await
+    .unwrap();
+    waiter.abort();
+    let _ = waiter.await;
+    let retained = crate::diarization::try_operation_guard().is_err();
+    tokio::task::spawn_blocking(move || {
+        finish.wait();
+    })
+    .await
+    .unwrap();
+    let _drained = crate::diarization::operation_guard().await;
+    assert!(retained,"diarize_meeting must not release offline admission while its blocking file reader is alive");
+    *crate::diarization_reader::BARRIERS.lock().unwrap() = None;
 }

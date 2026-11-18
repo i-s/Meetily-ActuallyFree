@@ -564,7 +564,7 @@ impl RecordingSaver {
         // Every populated source plus transcript/metadata has committed. Only
         // now is it safe to remove the meeting's recovery checkpoints.
         if let Some(folder) = &self.meeting_folder {
-            if let Err(error) = super::incremental_saver::cleanup_checkpoints(folder.to_string_lossy().into_owned()).await {
+            if let Err(error) = super::incremental_saver::cleanup_finalized_checkpoints(folder.to_string_lossy().into_owned()).await {
                 warn!("Could not clean completed checkpoints: {error}");
             }
         }

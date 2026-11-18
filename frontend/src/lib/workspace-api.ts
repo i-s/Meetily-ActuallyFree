@@ -240,6 +240,7 @@ export const saveMeetingNotes = (meetingId: string, markdown: string | null, jso
 
 export interface MeetingAudio {
   path: string | null;
+  playbackRevision?: string | null;
   micPath: string | null;
   systemPath: string | null;
 }

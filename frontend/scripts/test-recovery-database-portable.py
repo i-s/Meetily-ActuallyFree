@@ -100,7 +100,7 @@ mod audio {{
 #[cfg(test)] #[path="{ROOT}/frontend/tests/native/recovery-api.rs"] mod recovery_api_tests;
 #[cfg(test)] #[path="{ROOT}/frontend/tests/native/notes-versions.rs"] mod notes_versions_tests;
 '''.replace(repr(ffmpeg), '"' + ffmpeg + '"'))
-        subprocess.run(['cargo', 'test', '--manifest-path', str(work / 'Cargo.toml'), *(sys.argv[1:] or ['recovery']), '--', '--test-threads=1'], check=True)
+        subprocess.run(['cargo', 'test', '--offline', '--manifest-path', str(work / 'Cargo.toml'), *(sys.argv[1:] or ['recovery']), '--', '--test-threads=1'], check=True)
         allowed = {(p['name'], p['version'], p.get('source')) for p in lock['package']}
         actual = tomllib.loads((work / 'Cargo.lock').read_text())
         assert all(p['name'] == 'meetily-recovery-db' or (p['name'], p['version'], p.get('source')) in allowed for p in actual['package'])

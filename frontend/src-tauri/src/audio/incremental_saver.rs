@@ -337,27 +337,39 @@ pub async fn has_recoverable_audio(meeting_folder: String) -> Result<bool, Strin
     }).await.map_err(|e| e.to_string())?
 }
 
-/// Clean up checkpoint files after successful recording or recovery
-/// This command is called by the frontend after successful save to clean up checkpoint files
+/// Independent IPC cleanup shares admission with saved-audio readers/deletion.
 #[tauri::command]
 pub async fn cleanup_checkpoints(meeting_folder: String) -> Result<(), String> {
     let operation = crate::diarization::operation_guard().await;
     tokio::task::spawn_blocking(move || {
         let _operation = operation;
-        let folder = PathBuf::from(meeting_folder);
-        let root = folder.join(".checkpoints");
-        for track in ["audio", "mic", "system"] {
-            let directory = if track == "audio" && !root.join("audio").is_dir() { root.clone() } else { root.join(track) };
-            if !directory.is_dir() { continue; }
-            match super::track_commit::validate_committed_track(Some(&directory), &folder.join(format!("{track}.mp4"))) {
-                Ok(Some(_)) => super::track_commit::cleanup_checkpoint_track(&directory, &folder.join(format!("{track}.mp4")))?,
-                Ok(None) => {}, // Unknown/legacy audio is never authority to delete input.
-                Err(error) => warn!("Keeping checkpoint track {}: {}", track, error),
-            }
-        }
-        let _ = std::fs::remove_dir(&root);
-        Ok(())
+        cleanup_checkpoint_files(std::path::Path::new(&meeting_folder))
     }).await.map_err(|e| e.to_string())?
+}
+
+/// Native Stop already owns engine lifecycle while finalizing this recording.
+/// It must not acquire offline here: refinement owns offline before lifecycle.
+/// Unlike independent recovery/IPC, this owner just committed every final track
+/// and metadata; the same proof checks still govern each checkpoint unlink.
+pub(super) async fn cleanup_finalized_checkpoints(meeting_folder: String) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || {
+        cleanup_checkpoint_files(std::path::Path::new(&meeting_folder))
+    }).await.map_err(|e| e.to_string())?
+}
+
+fn cleanup_checkpoint_files(folder: &std::path::Path) -> Result<(), String> {
+    let root = folder.join(".checkpoints");
+    for track in ["audio", "mic", "system"] {
+        let directory = if track == "audio" && !root.join("audio").is_dir() { root.clone() } else { root.join(track) };
+        if !directory.is_dir() { continue; }
+        match super::track_commit::validate_committed_track(Some(&directory), &folder.join(format!("{track}.mp4"))) {
+            Ok(Some(_)) => super::track_commit::cleanup_checkpoint_track(&directory, &folder.join(format!("{track}.mp4")))?,
+            Ok(None) => {}, // Unknown/legacy audio is never authority to delete input.
+            Err(error) => warn!("Keeping checkpoint track {}: {}", track, error),
+        }
+    }
+    let _ = std::fs::remove_dir(&root);
+    Ok(())
 }
 
 /// Check if a meeting folder has audio checkpoint files

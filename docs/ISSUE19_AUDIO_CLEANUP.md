@@ -179,3 +179,16 @@ bytes). Aggregation now deduplicates that already-traversed checkpoint scope whi
 still counting independent nested meeting folders. The abandoned-reader fixture
 uses the actual recovery command body and admission helpers with a deterministic
 blocking decoder adapter; it does not run FFmpeg or establish acoustic behavior.
+
+## R1 follow-up — 2026-11-19 (supersedes initial qualification gaps)
+
+See [ISSUE19_R1.md](ISSUE19_R1.md) for the reproduced Stop/offline lock inversion,
+separate internal finalization cleanup, unchanged-player focus/rate fix, scoped
+native event and file-identity observation, and the demonstrated Rust diarization
+waiter lifetime gap versus unqualified Tauri cancellation behavior. The requested
+portable FFmpeg harnesses have now actually run: shutdown **45/45**, complete
+recovery/SQLite **83/83**. Narrow native suite **14/14**, mounted playback **3/3**,
+full isolated frontend **54/54 files**. All fixtures are generated/disposable.
+The accepted bridge head is now supplied as
+`2d388cf15adb95f2d37ab1e9ff17b82df723e328`; preserve this standalone R1 commit for
+recheck first, then integrate that exact head only after P1/P2 acceptance.

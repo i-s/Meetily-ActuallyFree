@@ -36,7 +36,7 @@ export function TranscriptVersions({ meetingId, onChanged, onBeforeChange }: {
       setError(null);
     } catch (cause) { setError(String(cause)); }
   }, [meetingId]);
-  const savedAudioRevision = useSavedAudioRevision();
+  const savedAudioRevision = useSavedAudioRevision(meetingId);
   useEffect(() => { void refresh(); }, [refresh, savedAudioRevision]);
 
   const inspect = async (version: Version) => {

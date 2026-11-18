@@ -30,6 +30,20 @@ with tempfile.TemporaryDirectory(prefix='meetily-cleanup-test-build-') as folder
     lifecycle = common[common.index('pub(crate) fn try_engine_lifecycle_lock'):common.index('/// Keeps a batch transcription')]
     diarization = (native / 'diarization/mod.rs').read_text()
     offline = diarization[diarization.index('static OPERATION_LOCK:'):diarization.index('/// Record where the bundled')]
+    diarize_start = diarization.index('pub async fn diarize_meeting(')
+    diarize_command = diarization[diarize_start:diarization.index('/// Called under the native post-meeting', diarize_start)]
+    diarize_command = diarize_command.replace("tauri::State<'_, crate::state::AppState>", '&crate::state::AppState')
+    (work / 'diarization_reader.rs').write_text("""
+use std::sync::{Arc,Barrier,Mutex};
+pub static BARRIERS:Mutex<Option<(Arc<Barrier>,Arc<Barrier>)>>=Mutex::new(None);
+type MeetingDiarizationResult=();
+async fn operation_guard()->tokio::sync::MutexGuard<'static,()>{crate::diarization::operation_guard().await}
+async fn diarize_meeting_inner(_state:&crate::state::AppState,_meeting:String,_path:Option<String>,_count:Option<usize>,_threshold:Option<f32>,_engine:Option<String>,_version:Option<&str>)->Result<(),String>{
+    let (started,finish)=BARRIERS.lock().unwrap().as_ref().unwrap().clone();
+    tokio::task::spawn_blocking(move||{started.wait();finish.wait();}).await.map_err(|e|e.to_string())?;
+    Ok(())
+}
+""" + diarize_command)
     commands = (native / 'audio_cleanup_commands.rs').read_text().replace('#[tauri::command]\n', '').replace("tauri::State<'_, AppState>", '&AppState').replace('tauri::', 'crate::tauri::')
     (work / 'commands.rs').write_text(commands)
     recovery_source = (native / 'audio/incremental_saver.rs').read_text()
@@ -43,6 +57,12 @@ fn recover_recording_audio(_folder:&std::path::Path)->Result<AudioRecoveryStatus
     started.wait();finish.wait();Ok(AudioRecoveryStatus)
 }
 ''' + recovery_command)
+    api = (native / 'api/api.rs').read_text()
+    dto = api[api.index('pub struct MeetingAudio {'):api.index('/// Locates a meeting', api.index('pub struct MeetingAudio {'))]
+    api_start = api.index('pub async fn api_get_meeting_audio<')
+    playback_command = api[api_start:api.index('#[tauri::command]', api_start)]
+    playback_command = playback_command.replace("tauri::State<'_, AppState>", '&AppState').replace('use tauri::Manager;', 'use crate::tauri::Manager;')
+    (work / 'playback_api.rs').write_text('use serde::Serialize; use crate::tauri::{AppHandle,Runtime}; use crate::state::AppState;\n#[derive(Debug,Serialize)]\n' + dto + playback_command)
     migrations = sorted((ROOT / 'frontend/src-tauri/migrations').glob('*.sql'))
     if not any('post_call_queue' in p.name for p in migrations):
         path = work / 'queue.sql'
@@ -52,18 +72,27 @@ fn recover_recording_audio(_folder:&std::path::Path)->Result<AudioRecoveryStatus
     source.write_text(f'''#![allow(dead_code)]
 #[path="{native}/audio_cleanup.rs"] mod audio_cleanup;
 #[path="{work}/commands.rs"] mod commands;
+#[path="{work}/playback_api.rs"] mod playback_api;
 #[path="{work}/recovery_reader.rs"] mod recovery_reader;
+#[path="{work}/diarization_reader.rs"] mod diarization_reader;
 #[path="{ROOT}/frontend/tests/native/audio-cleanup.rs"] mod tests;
 #[path="{work}/migrations.rs"] mod migrations;
-mod state {{ pub struct Db(pub sqlx::SqlitePool); impl Db {{ pub fn pool(&self)->&sqlx::SqlitePool{{&self.0}} }} pub struct AppState{{pub db_manager:Db}} }}
+mod state {{ #[derive(Clone)] pub struct Db(pub sqlx::SqlitePool); impl Db {{ pub fn pool(&self)->&sqlx::SqlitePool{{&self.0}} }} pub struct AppState{{pub db_manager:Db}} }}
 mod tauri {{
     pub trait Runtime: Send + Sync + 'static {{}} pub struct TestRuntime; impl Runtime for TestRuntime {{}}
     pub struct AppHandle<R>(std::marker::PhantomData<R>);
     impl<R> Default for AppHandle<R> {{ fn default()->Self{{Self(std::marker::PhantomData)}} }}
-    pub trait Emitter {{ fn emit<T:serde::Serialize>(&self,_event:&str,_payload:T)->Result<(),String>{{Ok(())}} }}
+    pub trait Manager {{ fn asset_protocol_scope(&self)->AssetScope; }}
+    pub struct AssetScope; impl AssetScope {{ pub fn allow_directory(&self,_path:&std::path::Path,_recursive:bool)->Result<(),String>{{Ok(())}} }}
+    impl<R> Manager for AppHandle<R> {{ fn asset_protocol_scope(&self)->AssetScope{{AssetScope}} }}
+    pub static EMITTED:std::sync::Mutex<Vec<serde_json::Value>>=std::sync::Mutex::new(Vec::new());
+    pub trait Emitter {{ fn emit<T:serde::Serialize>(&self,_event:&str,payload:T)->Result<(),String>{{ EMITTED.lock().unwrap().push(serde_json::to_value(payload).unwrap()); Ok(()) }} }}
     impl<R> Emitter for AppHandle<R> {{}}
 }}
+mod database {{ pub mod transcript_versions {{ pub async fn checkpoint_current(_pool:&sqlx::SqlitePool,_meeting:&str)->Result<(),String>{{Ok(())}} }} }}
 mod audio {{
+ pub mod retranscription {{ pub fn recording_in_person(_folder:&std::path::Path)->Result<bool,String>{{Ok(false)}} }}
+ #[path="{native}/audio/playback_identity.rs"] pub mod playback_identity;
  pub mod common {{
  use once_cell::sync::Lazy; use std::sync::Arc; use tokio::sync::{{Mutex as AsyncMutex,OwnedMutexGuard}};
  static ENGINE_LIFECYCLE_LOCK:Lazy<Arc<AsyncMutex<()>>>=Lazy::new(||Arc::new(AsyncMutex::new(())));

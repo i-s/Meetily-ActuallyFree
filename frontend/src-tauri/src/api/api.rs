@@ -431,6 +431,8 @@ pub async fn api_get_meetings<R: Runtime>(
 pub struct MeetingAudio {
     /// Mixed playback track (`audio.mp4`, or the imported file).
     pub path: Option<String>,
+    /// Metadata identity for non-destructive focus revalidation and replacement.
+    pub playback_revision: Option<String>,
     pub mic_path: Option<String>,
     pub system_path: Option<String>,
 }
@@ -450,6 +452,7 @@ pub async fn api_get_meeting_audio<R: Runtime>(
 
     let none = MeetingAudio {
         path: None,
+        playback_revision: None,
         mic_path: None,
         system_path: None,
     };
@@ -483,8 +486,12 @@ pub async fn api_get_meeting_audio<R: Runtime>(
         })
         .map(|path| path.to_string_lossy().to_string())
     });
+    let playback_revision = playback.as_deref()
+        .map(|path| crate::audio::playback_identity::revision(std::path::Path::new(path)))
+        .transpose().map_err(|e| format!("Could not revalidate saved playback audio: {e}"))?;
     let audio = MeetingAudio {
         path: playback,
+        playback_revision,
         mic_path: existing("mic.mp4"),
         system_path: existing("system.mp4"),
     };
