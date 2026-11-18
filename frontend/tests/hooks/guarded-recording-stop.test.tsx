@@ -8,6 +8,7 @@ const storage = new Map<string, string>();
 Object.assign(globalThis, { window: Object.assign(events, { location: { pathname: '/home' }, clearTimeout, setTimeout }),
   sessionStorage: { getItem: (k: string) => storage.get(k) ?? null, setItem: (k: string, v: string) => storage.set(k, v), removeItem: (k: string) => storage.delete(k) } });
 let enabled = true;
+let failStopOnce = false;
 let current: RecordingLease | null = null;
 let dataGate: Promise<void> | undefined;
 const calls: { name: string; args: any }[] = [];
@@ -21,6 +22,7 @@ mock.module('@tauri-apps/api/core', () => ({ invoke: async (name: string, args: 
   if (name === 'get_recording_preferences') return {};
   if (name === 'get_database_directory') { await dataGate; return '/synthetic'; }
   if (name === 'stop_recording') {
+    if (failStopOnce) { failStopOnce = false; throw new Error('Synthetic Stop transport failure'); }
     if (args.args.expected && (!enabled || JSON.stringify(args.args.expected) !== JSON.stringify(current))) return false;
     current = null; return true;
   }
@@ -45,7 +47,7 @@ const b: RecordingLease = { generation: 'native-B', owner: null };
 const props = { isRecording: true, isRecordingDisabled: false, onRecordingStart: noop,
   onRecordingStop: () => { fallbackStops++; }, onStopInitiated: () => { stopInitiated++; } };
 const flush = async () => { for (let i = 0; i < 20; i++) await Promise.resolve(); };
-function reset() { storage.clear(); calls.length = 0; enabled = true; successes = 0; stopInitiated = 0; fallbackStops = 0; dataGate = undefined; }
+function reset() { failStopOnce = false; storage.clear(); calls.length = 0; enabled = true; successes = 0; stopInitiated = 0; fallbackStops = 0; dataGate = undefined; }
 
 test('actual routed Controls preserve A lease and rejected stale stop has no UI/save effects on manual B', async () => {
   reset(); window.location.pathname = '/home'; current = a;
@@ -81,4 +83,17 @@ test('actual Controls recheck disable after awaited directory and never submit u
     await act(async () => { events.dispatchEvent(new CustomEvent('af-stop-recording', { detail: {} })); await flush(); });
     expect(calls.some(c => c.name === 'stop_recording')).toBe(false);
   } finally { dataGate = undefined; act(() => view!.unmount()); }
+});
+
+
+test('explicit manual routed Stop can be retried after a transport failure without remount', async () => {
+  reset(); current = a; window.location.pathname = '/'; failStopOnce = true;
+  let view!: ReturnType<typeof create>;
+  await act(async () => { view = create(<RecordingControls {...props} />); });
+  try {
+    await act(async () => { requestRecordingStop(noop); await flush(); });
+    expect(current).toEqual(a); expect(successes).toBe(0); expect(fallbackStops).toBe(1);
+    await act(async () => { requestRecordingStop(noop); await flush(); });
+    expect(current).toBeNull(); expect(successes).toBe(1); expect(fallbackStops).toBe(1);
+  } finally { act(() => view.unmount()); }
 });

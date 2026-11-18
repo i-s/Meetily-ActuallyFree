@@ -161,6 +161,95 @@ must not share a process. Standalone TypeScript and the bounded Next production
 export run sequentially; the latter is not a native desktop build or installer.
 Final counts, exact tree, commands and logs are reported with the merge commit.
 
+## Combined R1: Stop revocation and routed synchronization
+
+Review base: `f6a9525`. Both P2s are corrected locally; this does not qualify a
+real client or alter capture, transcript identity, migrations, or #14.
+
+### Native owner-specific Stop authority
+
+`recording_ownership::Authority` retains bounded facts for only Zoom and Discord,
+plus a current-take confirmed-exit flag and sticky revocation. Exact generation /
+full owner / Labs enablement remain necessary, but are no longer sufficient:
+Stop also requires a qualified, permitted native **End for that owner**. A matching
+End arriving during the awaited capture startup is retained through lease
+publication; there is no requirement that an already ended call still be Active
+at commit. Start's active-call validator is not reused for Stop. Unconfirmed inactive, Unknown,
+another session's End, missing owner, keep-recording and stale generations cannot
+claim the take. Stable inactive may retain an already confirmed owner End; it
+cannot invent one. A valid End still uses the ordinary Stop/save path.
+
+Zoom publishes the original session removed by its tracker's confirmed End;
+Discord publishes its own explicit End/session. Source permission/qualification
+loss, Labs disable, a competing session, or withdrawal of an already confirmed
+End revoke automatic Stop for the current take. Re-enable/requalification or a
+replayed old End cannot restore it. Unknown before End does not fabricate exit;
+Unknown after End withdraws that grant. A revoked take stays available to explicit
+manual Stop or keep-recording; no permission toggle silently reacquires ownership.
+
+Settings publication and observation publication use `SETTINGS -> recording
+AUTHORITY` lock order. Source revocation is applied under the same short authority
+mutex as lease claim, before publishing new settings. Observations compute current
+permissions while holding SETTINGS, rather than republishing a scan's cached
+`enabled=true`. Claim never reads adapter/settings locks while holding AUTHORITY.
+The engine lifecycle lock still serializes Stop/start and all post-claim effects.
+Real observations remain `qualified:false`; there is no qualification override.
+
+### Routed Stop ownership
+
+The launcher now persists Stop on the recorder route too, since its Controls may
+not be mounted/synchronized. One valid pending slot is first-wins for storage /
+event collisions: an old guarded request is never replaced with a newer lease or
+manual fallback. Controls subscribe before draining, retain storage while initial
+`isRecording=false`/starting/stopping prevents dispatch, and claim it only once
+ready. A false mount followed by remount still leaves the exact request durable.
+A per-mounted-Controls request identity suppresses identical event/storage delivery;
+native generation/exit claim is the final cross-remount effect guard. Failed manual
+delivery clears its deduplication claim, so explicit manual retry does not require
+a remount.
+
+Explicit manual button/launcher intent remains manual (`'1'` routed marker or
+`{kind:'manual'}` event). A bare/missing event, invalid lease, or an explicitly passed
+undefined expected lease is rejected, not converted to manual. Legacy valid guarded
+event/routed shapes retain their exact lease. Storage failure can retain an event
+in mounted Controls, but cannot promise durability across a WebView loss. No idle
+snapshot substitutes another take's lease. State sync remains owned by the existing
+recorder hook; no new poller or native recorder is added.
+
+### Red -> green evidence
+
+- Initial extended real Controls/hook/service -> production Rust bridge: **18 pass,
+  12 fail**, reproducing source-only disable (Labs still on), disable/re-enable,
+  Unknown, qualification loss, competing session, and both false-mount routes.
+- Native correction alone: **28 pass, 2 fail** (only the two routed sync repros).
+- Expanded Controls red run: **28 pass, 5 fail** (sync, remount/stale A, storage/event
+  collision, missing-event/manual semantics). After Controls correction: 33 passed.
+- Additional native withdrawal/replayed-End test: **13 pass, 1 fail**, then green.
+- Explicit manual retry after transport failure: focused Controls **2 pass, 1 fail**
+  before clearing the failed manual claim; **3 pass** afterward.
+- End during admitted capture before lease publication: **39 pass, 2 fail** before
+  preserving that exact End; this also verifies the hook's immediate guarded Stop
+  when its start reply arrives after the call ended.
+- Final expanded bridge: **41 pass, 0 fail**, **414 assertions**. Stop is queued at
+  the native engine lock using a semaphore handshake, not delayed only in JS.
+  Both sources cover valid End, source-only disable/re-enable, qualification loss,
+  Unknown, withdrawn/replayed End, competing sessions, unrelated-source permission
+  isolation, keep-recording, manual override and stale A/current B. Rejection
+  preserves capture/save counts, native take, success/manual callbacks and notices.
+- Portable native Stop **14**, start authority/source/settings **34**, lifecycle /
+  provenance **38**, all passed. Frontend **43/43 isolated files**, **218 tests** passed; the bridge
+  fixture is intentionally skipped there and run separately with its Rust binary.
+  Standalone TypeScript passed. No Next/heavy desktop build was run for R1.
+
+The bridge now compiles actual `source_automation_enabled`, settings publication
+and observation-publication bodies as well as the existing production authorization
+paths. Settings transport/disk I/O and qualified source snapshots are test adapters;
+it does not run the whole native monitor or real Tauri/WebView. Native post-claim
+hardware drain/save is still replaced by generated-file/count adapters. Separate
+FFmpeg/SQLite/identity suites from the merge are not claimed as rerun R1 integration.
+No new independent delegate review was run (user prohibited subagents); author
+self-review and regression evidence are ready for coordinator re-review.
+
 ### Remaining gates
 
 No full native desktop/macOS SDK compile or actual Tauri IPC, capture hardware,

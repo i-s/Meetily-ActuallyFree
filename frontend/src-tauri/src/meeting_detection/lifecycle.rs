@@ -2,6 +2,7 @@
 //! Adapters supply independent source keys; no first-app-wins arbitration here.
 use super::evidence::{Observation, Presence, Probe, Tracker, Transition};
 use serde::Serialize;
+use crate::audio::recording_ownership::SourcePresence;
 use std::sync::{LazyLock, Mutex};
 use std::time::Instant;
 
@@ -51,6 +52,7 @@ pub fn suspend(enabled: bool) -> Snapshot {
     state.snapshot.revision += 1;
     for source in &mut state.snapshot.sources {
         source.presence = "unknown".into();
+        super::publish_automation_observation(&source.source, false, SourcePresence::Unknown);
         source.reason = if enabled { "monitor_restarting" } else { "detection_disabled" }.into();
         if source.source == "zoom" {
             super::zoom_observation::observe(&source.presence, &source.reason, source.session_id.as_deref());
@@ -82,19 +84,23 @@ pub fn observe_sources(generation: u64, observations: &[Observation]) -> Option<
 
 impl State {
     fn observe(&mut self, now: u64, observations: &[Observation]) -> Snapshot {
+        let mut ended = std::collections::BTreeMap::new();
         for transition in self.tracker.update(now, observations) {
             match transition {
                 Transition::Started { session_id, observation } => {
                     let id = format!("{}:{}:{session_id}", self.epoch, observation.key);
                     self.sessions.insert(observation.key, id);
                 }
-                Transition::Ended { observation, .. } => { self.sessions.remove(&observation.key); },
+                Transition::Ended { observation, .. } => {
+                    if let Some(session) = self.sessions.remove(&observation.key) { ended.insert(observation.key, session); }
+                },
             }
         }
         for source in &mut self.snapshot.sources {
             if !observations.iter().any(|o| o.key == source.source) {
                 source.presence = "unknown".into();
                 source.reason = "adapter_not_observed".into();
+                super::publish_automation_observation(&source.source, source.qualified, SourcePresence::Unknown);
             }
         }
         for observation in observations {
@@ -107,6 +113,13 @@ impl State {
                 // This is not persisted, and there is no production override.
                 qualified: false,
             };
+            let presence = match (source.presence.as_str(), source.session_id.as_deref(), ended.get(&source.source)) {
+                ("active", Some(session), _) => SourcePresence::Active(session),
+                ("inactive", None, Some(session)) => SourcePresence::End(session),
+                ("inactive", None, None) => SourcePresence::Inactive,
+                _ => SourcePresence::Unknown,
+            };
+            super::publish_automation_observation(&source.source, source.qualified, presence);
             self.snapshot.sources.retain(|s| s.source != observation.key);
             if source.source == "zoom" {
                 super::zoom_observation::observe(&source.presence, &source.reason, source.session_id.as_deref());

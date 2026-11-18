@@ -901,8 +901,8 @@ async fn stop_recording_inner<R: Runtime>(
     }
 
     // Engine lifecycle lock is held by EVERY caller. This short authority
-    // claim linearizes the exact generation/owner and automation enablement
-    // against native disable/release. Reject before any event/UI/save effect.
+    // claim linearizes the exact generation/owner, source-specific confirmed
+    // exit, permission/qualification revocation and native disable/release. Reject before any event/UI/save effect.
     if !super::recording_ownership::claim_stop(args.expected.as_ref()) {
         log::info!("Rejected stale or disabled automated recording stop");
         return Ok(StopOutcome::AlreadyStopped);

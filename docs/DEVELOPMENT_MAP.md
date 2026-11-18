@@ -23,7 +23,9 @@ shared recorder path: one explicit intent/reservation/recovery protocol, native
 source-specific opt-in/qualification, epoch-ticket admission, guarded Stop and
 keep-recording. Read it alongside both preserved source/journal notes. It records
 actual cross-language coverage separately from serializer/standalone/physical gates.
-#14 remains separate.
+#14 remains separate. The combined note's R1 section covers source-specific native
+Stop revocation/confirmed-exit authority and durable routed Stop through Controls'
+initial state sync, including queued native-lock and remount regressions.
 
 Zoom's source-specific AX candidate, composable lifecycle snapshots, session-bound
 start/Stop ownership, manual override and provisional timing are documented in

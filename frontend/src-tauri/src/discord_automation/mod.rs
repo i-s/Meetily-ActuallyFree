@@ -238,6 +238,13 @@ pub fn initialize<R: Runtime>(app: &AppHandle<R>) {
                 },
                 cue_transition: cue,
             };
+            let presence = match (status.state, status.transition, status.session_id.as_deref()) {
+                ("active", _, Some(session)) => crate::audio::recording_ownership::SourcePresence::Active(session),
+                ("inactive", "end", Some(session)) => crate::audio::recording_ownership::SourcePresence::End(session),
+                ("inactive", _, None) => crate::audio::recording_ownership::SourcePresence::Inactive,
+                _ => crate::audio::recording_ownership::SourcePresence::Unknown,
+            };
+            crate::meeting_detection::publish_automation_observation("discord", status.qualified, presence);
             *STATUS.lock().unwrap() = Some(status.clone());
             if let Some(j) = JOURNAL.lock().unwrap().as_mut() {
                 j.sample(status.clone(), from_ms, now_ms());

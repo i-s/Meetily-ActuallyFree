@@ -51,31 +51,55 @@ export function launchRecording(navigate: (href: string) => void, options: { gro
   navigate('/');
 }
 
-/** Stop and save, the same way the record card's Stop button does. */
-export function requestRecordingStop(navigate: (href: string) => void, expected?: RecordingLease) {
-  if (window.location.pathname === '/') {
-    window.dispatchEvent(new CustomEvent(STOP_RECORDING_EVENT, { detail: expected }));
-    return;
-  }
+export type RecordingStopRequest = { expected?: RecordingLease };
+
+/** A missing/malformed automated lease is not manual intent. The legacy routed
+ * "1" and typed manual event are explicit user requests; bare events are not.
+ */
+export function readRecordingStopRequest(payload: unknown): RecordingStopRequest | null {
   try {
-    sessionStorage.setItem(STOP_REQUEST_KEY, expected ? JSON.stringify({ expected }) : '1');
-  } catch {
-    // Without storage the user can still stop from the recorder.
-  }
-  navigate('/');
+    if (payload === '1') return {};
+    const value = typeof payload === 'string' ? JSON.parse(payload) : payload;
+    if (value?.kind === 'manual') return {};
+    if (validRecordingLease(value?.expected)) return { expected: value.expected };
+    if (validRecordingLease(value)) return { expected: value };
+  } catch { /* Corrupt routing never becomes manual. */ }
+  return null;
 }
 
-/** Preserve a routed automated request verbatim, including its old generation.
- * Invalid payloads are discarded, NEVER downgraded to an unguarded manual Stop.
+/** One durable pending slot: the first valid request wins a storage/event
+ * collision. Never replace an old guarded lease with another lease or manual
+ * fallback while the recorder page is still synchronizing native state.
  */
-export function takeRecordingStopRequest(): { expected?: RecordingLease } | null {
+export function queueRecordingStopRequest(request: RecordingStopRequest): RecordingStopRequest {
   try {
-    const value = sessionStorage.getItem(STOP_REQUEST_KEY);
+    const pending = readRecordingStopRequest(sessionStorage.getItem(STOP_REQUEST_KEY));
+    if (pending) return pending;
+    sessionStorage.setItem(STOP_REQUEST_KEY, request.expected ? JSON.stringify({ expected: request.expected }) : '1');
+  } catch { /* A mounted Controls listener can still retain the event locally. */ }
+  return request;
+}
+
+/** Stop and save through the recorder card; persist even on the recorder route
+ * because Controls may not have mounted or received its initial native sync.
+ */
+export function requestRecordingStop(navigate: (href: string) => void, expected?: RecordingLease) {
+  const request = arguments.length > 1 ? (validRecordingLease(expected) ? { expected } : null) : {};
+  if (!request) return;
+  const pending = queueRecordingStopRequest(request);
+  if (window.location.pathname === '/') {
+    window.dispatchEvent(new CustomEvent(STOP_RECORDING_EVENT, { detail: pending.expected ?? { kind: 'manual' } }));
+  } else navigate('/');
+}
+
+/** Consume only when Controls is ready to dispatch. Until then storage owns
+ * the exact request across state sync, unmount/remount and event delivery.
+ */
+export function takeRecordingStopRequest(): RecordingStopRequest | null {
+  try {
+    const request = readRecordingStopRequest(sessionStorage.getItem(STOP_REQUEST_KEY));
     sessionStorage.removeItem(STOP_REQUEST_KEY);
-    if (value === '1') return {};
-    if (!value) return null;
-    const parsed = JSON.parse(value);
-    return validRecordingLease(parsed.expected) ? parsed : null;
+    return request;
   } catch { return null; }
 }
 export function validRecordingLease(value: unknown): value is RecordingLease {

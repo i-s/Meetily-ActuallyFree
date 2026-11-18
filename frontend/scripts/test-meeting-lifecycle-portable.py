@@ -36,6 +36,9 @@ def main():
             (work / f"src/{name}.rs").write_text(path.read_text().replace("#[tauri::command]", ""))
         (work / "src/lib.rs").write_text(f'''#![allow(dead_code)]
 fn zoom_automation_enabled()->bool {{ true }}
+fn publish_automation_observation(source:&str,qualified:bool,presence:audio::recording_ownership::SourcePresence<'_>) {{
+ audio::recording_ownership::observe_source(source,true,qualified,presence);
+}}
 static MONITOR_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 #[path="{DETECTION}/evidence.rs"] mod evidence;
 #[path="{DETECTION}/zoom.rs"] mod zoom;

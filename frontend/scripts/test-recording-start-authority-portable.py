@@ -51,6 +51,14 @@ pub fn fixture(session:Option<String>, presence:String, qualified:bool) {
  let mut state=STATE.lock().unwrap(); state.snapshot.enabled=true;
  state.monitor_generation=super::MONITOR_GENERATION.load(std::sync::atomic::Ordering::SeqCst);
  state.snapshot.automation_enabled=super::zoom_automation_enabled(); state.snapshot.revision+=1;
+ let previous=state.snapshot.sources.iter().find(|s|s.source=="zoom").and_then(|s|s.session_id.as_deref());
+ let observed=match (presence.as_str(),session.as_deref(),previous) {
+  ("active",Some(id),_)=>SourcePresence::Active(id),
+  ("inactive",None,Some(id))=>SourcePresence::End(id),
+  ("inactive",None,None)=>SourcePresence::Inactive,
+  _=>SourcePresence::Unknown,
+ };
+ super::publish_automation_observation("zoom",qualified,observed);
  state.snapshot.sources=vec![SourceState{source:"zoom".into(),app:"Zoom".into(),process:"us.zoom.xos".into(),presence,reason:"synthetic".into(),session_id:session,qualified}];
 }
 '''
@@ -62,9 +70,22 @@ pub fn fixture(session:Option<String>, presence:String, qualified:bool) {
 #[derive(Clone,serde::Serialize,serde::Deserialize)]
 pub struct Status{pub enabled:bool,pub qualified:bool,pub state:String,pub session_id:Option<String>,pub transition:String}
 static STATUS:Mutex<Option<Status>>=Mutex::new(None);
-pub fn fixture(value:Status){*STATUS.lock().unwrap()=Some(value);}
+pub fn fixture(value:Status){
+ use crate::audio::recording_ownership::SourcePresence;
+ crate::meeting_detection::fixture_permission("discord",value.enabled);
+ let presence=match (value.state.as_str(),value.transition.as_str(),value.session_id.as_deref()) {
+  ("active",_,Some(id))=>SourcePresence::Active(id),
+  ("inactive","end",Some(id))=>SourcePresence::End(id),
+  ("inactive",_,None)=>SourcePresence::Inactive,
+  _=>SourcePresence::Unknown,
+ };
+ crate::meeting_detection::publish_automation_observation("discord",value.qualified,presence);
+ *STATUS.lock().unwrap()=Some(value);
+}
 pub fn get_discord_automation_status()->Status{STATUS.lock().unwrap().clone().unwrap_or(Status{enabled:false,qualified:false,state:"unknown".into(),session_id:None,transition:"none".into()})}
 ''' + owner)
+    detection = (ROOT / 'frontend/src-tauri/src/meeting_detection.rs').read_text()
+    permissions = detection[detection.index('fn source_automation_enabled('):detection.index('/// Payload emitted')]
     manager = '''
 struct Manager;
 impl Manager {
@@ -85,6 +106,7 @@ pub static IS_STOPPING:AtomicBool=AtomicBool::new(false);
 pub static CAPTURES:AtomicU64=AtomicU64::new(0);
 pub static SAVES:AtomicU64=AtomicU64::new(0);
 pub static HOLD:AtomicBool=AtomicBool::new(false);
+pub static HOLD_COMMIT:AtomicBool=AtomicBool::new(false);
 pub static FAIL:AtomicBool=AtomicBool::new(false);
 pub static ENTERED:tokio::sync::Semaphore=tokio::sync::Semaphore::const_new(0);
 pub static RELEASE:tokio::sync::Semaphore=tokio::sync::Semaphore::const_new(0);
@@ -96,6 +118,10 @@ pub static RELEASE:tokio::sync::Semaphore=tokio::sync::Semaphore::const_new(0);
 ''' + boundary + '''
     if FAIL.load(Ordering::SeqCst) { return Err("Synthetic device startup failure".into()); }
     CAPTURES.fetch_add(1,Ordering::SeqCst);
+    if HOLD_COMMIT.load(Ordering::SeqCst) {
+        ENTERED.add_permits(1);
+        RELEASE.acquire().await.unwrap().forget();
+    }
 ''' + commit + '''
     drop(engine_lifecycle_guard);
     Ok(recording_lease)
@@ -122,13 +148,27 @@ pub mod audio {{
  #[path="{work}/src/commands.rs"] pub mod recording_commands;
  pub mod common {{
   static ENGINE:tokio::sync::Mutex<()>=tokio::sync::Mutex::const_new(());
-  pub async fn acquire_engine_lifecycle_lock()->tokio::sync::MutexGuard<'static,()> {{ENGINE.lock().await}}
+  pub static QUEUED:tokio::sync::Semaphore=tokio::sync::Semaphore::const_new(0);
+  pub async fn acquire_engine_lifecycle_lock()->tokio::sync::MutexGuard<'static,()> {{QUEUED.add_permits(1);ENGINE.lock().await}}
  }}
 }}
 mod diarization{{pub mod online{{pub fn stop(){{}}}}}}
 pub mod meeting_detection {{
- pub static OPT_IN:std::sync::atomic::AtomicBool=std::sync::atomic::AtomicBool::new(true);
- pub fn zoom_automation_enabled()->bool{{OPT_IN.load(std::sync::atomic::Ordering::SeqCst)}}
+ use std::sync::atomic::{{AtomicBool,Ordering}};
+ #[derive(Clone)]
+ pub struct MeetingDetectionSettings {{enabled:bool,zoom_automation:bool,discord_automation:bool,meeting_apps:Vec<String>,ignored_apps:Vec<String>}}
+ static SETTINGS:std::sync::LazyLock<std::sync::Mutex<Option<MeetingDetectionSettings>>>=std::sync::LazyLock::new(||std::sync::Mutex::new(Some(MeetingDetectionSettings{{enabled:true,zoom_automation:true,discord_automation:true,meeting_apps:vec!["zoom".into()],ignored_apps:vec![]}})));
+ static MONITOR_PAUSED:AtomicBool=AtomicBool::new(false);
+ // Fixture transport feeds the actual production settings publication body.
+ pub struct OptIn;
+ pub static OPT_IN:OptIn=OptIn;
+ impl OptIn {{pub fn store(&self,enabled:bool,_order:Ordering){{fixture_permission("zoom",enabled);}}}}
+ pub fn fixture_permission(source:&str,enabled:bool){{
+  let mut settings=SETTINGS.lock().unwrap().clone().unwrap();
+  if source=="zoom"{{settings.zoom_automation=enabled;}}else{{settings.discord_automation=enabled;}}
+  apply_automation_settings(&settings);
+ }}
+ {permissions}
  static MONITOR_GENERATION:std::sync::atomic::AtomicU64=std::sync::atomic::AtomicU64::new(0);
  #[path="{ROOT}/frontend/src-tauri/src/meeting_detection/evidence.rs"] pub mod evidence;
  #[path="{work}/src/zoom_observation.rs"] pub mod zoom_observation;

@@ -6,6 +6,7 @@ use serde_json::{json, Value};
 use std::io::{BufRead, Write};
 use std::sync::{Mutex, atomic::Ordering};
 static OUTPUT:Mutex<()>=Mutex::new(());
+static ENGINE_HOLD:tokio::sync::Mutex<Option<tokio::sync::MutexGuard<'static,()>>>=tokio::sync::Mutex::const_new(None);
 fn app()->AppHandle<()> { AppHandle(std::marker::PhantomData) }
 fn expected(args:&Value)->Result<authority::StartRequest,String>{serde_json::from_value(args["expected"].clone()).map_err(|e|e.to_string())}
 async fn command(name:&str,args:Value)->Result<Value,String>{
@@ -49,13 +50,21 @@ async fn command(name:&str,args:Value)->Result<Value,String>{
             let _lock=common::acquire_engine_lifecycle_lock().await;
             ownership::claim_stop(None);ownership::set_meeting_automation_enabled(true);
             commands::IS_RECORDING.store(false,Ordering::SeqCst);commands::IS_STOPPING.store(false,Ordering::SeqCst);
-            commands::HOLD.store(false,Ordering::SeqCst);commands::FAIL.store(false,Ordering::SeqCst);
+            commands::HOLD.store(false,Ordering::SeqCst);commands::HOLD_COMMIT.store(false,Ordering::SeqCst);commands::FAIL.store(false,Ordering::SeqCst);
             commands::CAPTURES.store(0,Ordering::SeqCst);commands::SAVES.store(0,Ordering::SeqCst);
             Ok(Value::Null)
         },
+        "fixture_engine_hold"=>{
+            *ENGINE_HOLD.lock().await=Some(common::acquire_engine_lifecycle_lock().await);
+            common::QUEUED.forget_permits(common::QUEUED.available_permits());
+            Ok(Value::Null)
+        },
+        "fixture_stop_queued"=>{common::QUEUED.acquire().await.unwrap().forget();Ok(Value::Null)},
+        "fixture_engine_release"=>{ENGINE_HOLD.lock().await.take();Ok(Value::Null)},
+        "fixture_hold_commit"=>{commands::HOLD_COMMIT.store(true,Ordering::SeqCst);Ok(Value::Null)},
         "fixture_hold"=>{commands::HOLD.store(true,Ordering::SeqCst);Ok(Value::Null)},
         "fixture_entered"=>{commands::ENTERED.acquire().await.unwrap().forget();Ok(Value::Null)},
-        "fixture_release"=>{commands::HOLD.store(false,Ordering::SeqCst);commands::RELEASE.add_permits(1);Ok(Value::Null)},
+        "fixture_release"=>{commands::HOLD.store(false,Ordering::SeqCst);commands::HOLD_COMMIT.store(false,Ordering::SeqCst);commands::RELEASE.add_permits(1);Ok(Value::Null)},
         "fixture_fail"=>{commands::FAIL.store(args["fail"].as_bool().unwrap(),Ordering::SeqCst);Ok(Value::Null)},
         "fixture_stopping"=>{commands::IS_STOPPING.store(args["stopping"].as_bool().unwrap(),Ordering::SeqCst);Ok(Value::Null)},
         "fixture_counts"=>Ok(json!({"captures":commands::CAPTURES.load(Ordering::SeqCst),"saves":commands::SAVES.load(Ordering::SeqCst)})),

@@ -128,18 +128,43 @@ fn save_settings_to_disk(settings: &MeetingDetectionSettings) -> Result<(), Stri
     std::fs::write(&path, json).map_err(|e| e.to_string())
 }
 
-/// The Discord worker has its own lifetime; changing generic/Zoom detection
-/// settings must not mint a new Discord call or override a manual Stop.
-pub(crate) fn zoom_automation_enabled() -> bool {
-    !MONITOR_PAUSED.load(Ordering::SeqCst) && SETTINGS.lock().unwrap().as_ref()
-        .is_some_and(|settings| settings.enabled && settings.zoom_automation)
+fn source_automation_enabled(settings: Option<&MeetingDetectionSettings>, source: &str) -> bool {
+    if MONITOR_PAUSED.load(Ordering::SeqCst) { return false; }
+    settings.is_some_and(|s| s.enabled && match source {
+        "zoom" => s.zoom_automation
+            && s.meeting_apps.iter().any(|app| app.trim().eq_ignore_ascii_case("zoom"))
+            && !s.ignored_apps.iter().any(|app| ["zoom", "zoom.us", "us.zoom.xos"].contains(&app.trim().to_lowercase().as_str())),
+        "discord" => s.discord_automation && !s.ignored_apps.iter()
+            .any(|app| !app.trim().is_empty() && "discord".contains(&app.trim().to_lowercase())),
+        _ => false,
+    })
 }
 
+pub(crate) fn zoom_automation_enabled() -> bool {
+    source_automation_enabled(SETTINGS.lock().unwrap().as_ref(), "zoom")
+}
 pub(crate) fn discord_automation_enabled() -> bool {
-    if MONITOR_PAUSED.load(Ordering::SeqCst) { return false; }
-    let guard = SETTINGS.lock().unwrap();
-    guard.as_ref().is_some_and(|s| s.enabled && s.discord_automation &&
-        !s.ignored_apps.iter().any(|k| !k.trim().is_empty() && "discord".contains(&k.trim().to_lowercase())))
+    source_automation_enabled(SETTINGS.lock().unwrap().as_ref(), "discord")
+}
+
+/// Settings -> recording authority is the only lock order. A scan finishing
+/// after source disable must not republish its cached enabled=true permission.
+pub(crate) fn publish_automation_observation(source: &str, qualified: bool,
+    presence: crate::audio::recording_ownership::SourcePresence<'_>) {
+    let settings = SETTINGS.lock().unwrap();
+    crate::audio::recording_ownership::observe_source(source,
+        source_automation_enabled(settings.as_ref(), source), qualified, presence);
+}
+
+fn apply_automation_settings(settings: &MeetingDetectionSettings) {
+    let mut guard = SETTINGS.lock().unwrap();
+    // Revoke before publishing settings, at the same authority mutex used
+    // by Stop claim. Re-enable cannot restore the current take's authority.
+    for source in ["zoom", "discord"] {
+        crate::audio::recording_ownership::set_source_enabled(source,
+            source_automation_enabled(Some(settings), source));
+    }
+    *guard = Some(settings.clone());
 }
 
 /// Payload emitted when a meeting app is detected.
@@ -523,10 +548,7 @@ fn start_monitor<R: Runtime>(app: &AppHandle<R>) {
 /// if the user had it enabled.
 pub fn initialize<R: Runtime>(app: &AppHandle<R>) {
     let settings = load_settings_from_disk();
-    {
-        let mut guard = SETTINGS.lock().unwrap();
-        *guard = Some(settings.clone());
-    }
+    apply_automation_settings(&settings);
     if settings.enabled {
         start_monitor(app);
     }
@@ -552,10 +574,7 @@ pub async fn set_meeting_detection_settings<R: Runtime>(
     settings.interval_secs = settings.interval_secs.clamp(3, 3600);
 
     save_settings_to_disk(&settings)?;
-    {
-        let mut guard = SETTINGS.lock().unwrap();
-        *guard = Some(settings.clone());
-    }
+    apply_automation_settings(&settings);
 
     // Apply immediately: (re)start or stop the monitor.
     if settings.enabled {
@@ -578,7 +597,13 @@ pub async fn start_meeting_detection<R: Runtime>(app: AppHandle<R>) -> Result<()
 /// Manually stop the monitor.
 #[tauri::command]
 pub async fn stop_meeting_detection<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
-    MONITOR_PAUSED.store(true, Ordering::SeqCst);
+    {
+        let _settings = SETTINGS.lock().unwrap();
+        for source in ["zoom", "discord"] { crate::audio::recording_ownership::set_source_enabled(source, false); }
+        // Publish pause only after revocation, and prevent an in-progress scan
+        // from restoring cached permissions between those two operations.
+        MONITOR_PAUSED.store(true, Ordering::SeqCst);
+    }
     MONITOR_GENERATION.fetch_add(1, Ordering::SeqCst);
     crate::audio::recording_ownership::set_meeting_automation_enabled(false);
     let _ = app.emit("meeting-lifecycle", lifecycle::suspend(false));
