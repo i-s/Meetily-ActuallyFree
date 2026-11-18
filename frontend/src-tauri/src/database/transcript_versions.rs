@@ -337,11 +337,15 @@ pub async fn select(
                 .copied()
                 .filter(|first| normalized.iter().all(|link| link.0 == first.0))
         });
+        // A recorded but deleted identity is not absent evidence: the INSERT
+        // leaves it unlinked. Conflicting normalized mappings likewise must not
+        // fall through to generic display-name reconstruction.
         if let Some((person, _)) = mapping {
             sqlx::query("INSERT OR IGNORE INTO person_speakers(person_id,meeting_id,speaker_label) SELECT id,?,? FROM people WHERE id=?")
                 .bind(meeting).bind(label).bind(person).execute(&mut *tx).await.map_err(|e| e.to_string())?;
-        }
-        if crate::database::repositories::speaker_identity::is_person_name(label) {
+        } else if normalized.is_empty()
+            && crate::database::repositories::speaker_identity::is_person_name(label)
+        {
             crate::database::repositories::speaker_identity::ensure_label_identity(
                 &mut tx, meeting, label,
             )
@@ -1097,5 +1101,332 @@ mod tests {
             segments(&pool, "m", &source.0).await.unwrap()[0].id,
             source.1.unwrap()
         );
+    }
+    #[tokio::test]
+    async fn r2_deleted_named_contact_is_not_recreated_on_restore() {
+        let pool = pool().await;
+        sqlx::raw_sql("UPDATE transcripts SET speaker='Alice'; INSERT INTO people(id,display_name,normalized_name) VALUES('deleted-person','Alice','alice'); INSERT INTO person_speakers VALUES('deleted-person','m','Alice');").execute(&pool).await.unwrap();
+        let initial = list(&pool, "m").await.unwrap();
+        let candidate = ready(&pool).await;
+        select(&pool, "m", &candidate, initial.revision)
+            .await
+            .unwrap();
+        // The contact is not currently used by this projection, so production
+        // delete_person removes its record without relabelling historical JSON.
+        sqlx::raw_sql("DELETE FROM person_speakers WHERE person_id='deleted-person'; DELETE FROM people WHERE id='deleted-person';").execute(&pool).await.unwrap();
+        select(
+            &pool,
+            "m",
+            &initial.selected_id,
+            list(&pool, "m").await.unwrap().revision,
+        )
+        .await
+        .unwrap();
+        let contacts: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM people WHERE normalized_name='alice'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            contacts, 0,
+            "restoring a snapshot recreated the deleted contact"
+        );
+        let restored = selected(&pool, "m").await.unwrap();
+        assert_eq!(restored.segments[0].speaker.as_deref(), Some("Alice"));
+        assert_eq!(restored.segments[0].text, "RU/EN original API");
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM person_speakers WHERE meeting_id='m'"
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn r2_ambiguous_normalized_curated_links_do_not_guess_a_person() {
+        let pool = pool().await;
+        sqlx::query("UPDATE transcripts SET speaker='alice'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let initial = list(&pool, "m").await.unwrap();
+        // Existing baseline made before speaker_links_json migration.
+        sqlx::query("UPDATE transcript_versions SET speaker_links_json=NULL WHERE id=?")
+            .bind(&initial.selected_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        // Ordinary speaker controls can curate differently-spelled labels to
+        // distinct contacts in the current editable projection.
+        sqlx::raw_sql("INSERT INTO people(id,display_name,normalized_name) VALUES('p1','Alice','alice'),('p2','Other display','other'); UPDATE transcripts SET speaker='ALICE'; INSERT INTO transcripts VALUES('second','m','second','t',2,3,1,'Alice'); INSERT INTO person_speakers VALUES('p1','m','ALICE'),('p2','m','Alice');").execute(&pool).await.unwrap();
+        let candidate = ready(&pool).await;
+        select(
+            &pool,
+            "m",
+            &candidate,
+            list(&pool, "m").await.unwrap().revision,
+        )
+        .await
+        .unwrap();
+        select(
+            &pool,
+            "m",
+            &initial.selected_id,
+            list(&pool, "m").await.unwrap().revision,
+        )
+        .await
+        .unwrap();
+        let person: Option<String> = sqlx::query_scalar(
+            "SELECT person_id FROM person_speakers WHERE meeting_id='m' AND speaker_label='alice'",
+        )
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            person, None,
+            "ambiguous curated links silently fell back to a display-name identity"
+        );
+        let restored = selected(&pool, "m").await.unwrap();
+        assert_eq!(restored.segments.len(), 1);
+        assert_eq!(restored.segments[0].speaker.as_deref(), Some("alice"));
+        assert_eq!(restored.segments[0].text, "RU/EN original API");
+        let people: Vec<(String, String, String)> =
+            sqlx::query_as("SELECT id,display_name,normalized_name FROM people ORDER BY id")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            people,
+            vec![
+                ("p1".into(), "Alice".into(), "alice".into()),
+                ("p2".into(), "Other display".into(), "other".into())
+            ]
+        );
+    }
+    #[tokio::test]
+    async fn r2_exact_curated_mapping_wins_over_normalized_conflict() {
+        let pool = pool().await;
+        sqlx::raw_sql("UPDATE transcripts SET speaker='Alice'; INSERT INTO people(id,display_name,normalized_name,notes) VALUES('p1','Alice','alice','keep p1'),('p2','Curated identity','curated','keep p2'); INSERT INTO person_speakers VALUES('p2','m','Alice'),('p1','m','ALICE');").execute(&pool).await.unwrap();
+        let initial = list(&pool, "m").await.unwrap();
+        let candidate = ready(&pool).await;
+        select(&pool, "m", &candidate, initial.revision)
+            .await
+            .unwrap();
+        select(
+            &pool,
+            "m",
+            &initial.selected_id,
+            list(&pool, "m").await.unwrap().revision,
+        )
+        .await
+        .unwrap();
+        let person: String = sqlx::query_scalar(
+            "SELECT person_id FROM person_speakers WHERE meeting_id='m' AND speaker_label='Alice'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(person, "p2");
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SELECT notes FROM people WHERE id='p1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            "keep p1"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SELECT notes FROM people WHERE id='p2'")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            "keep p2"
+        );
+    }
+
+    #[tokio::test]
+    async fn r2_unambiguous_normalized_curated_mapping_is_restored() {
+        let pool = pool().await;
+        sqlx::query("UPDATE transcripts SET speaker='alice'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let initial = list(&pool, "m").await.unwrap();
+        sqlx::query("UPDATE transcript_versions SET speaker_links_json=NULL WHERE id=?")
+            .bind(&initial.selected_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::raw_sql("INSERT INTO people(id,display_name,normalized_name) VALUES('name-guess','Alice','alice'),('curated','Different display','different'); UPDATE transcripts SET speaker='ALICE'; INSERT INTO person_speakers VALUES('curated','m','ALICE');").execute(&pool).await.unwrap();
+        let candidate = ready(&pool).await;
+        select(
+            &pool,
+            "m",
+            &candidate,
+            list(&pool, "m").await.unwrap().revision,
+        )
+        .await
+        .unwrap();
+        select(
+            &pool,
+            "m",
+            &initial.selected_id,
+            list(&pool, "m").await.unwrap().revision,
+        )
+        .await
+        .unwrap();
+        assert_eq!(sqlx::query_scalar::<_,String>("SELECT person_id FROM person_speakers WHERE meeting_id='m' AND speaker_label='alice'").fetch_one(&pool).await.unwrap(),"curated");
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM people")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn r2_no_evidence_still_uses_normalized_existing_contact() {
+        let pool = pool().await;
+        sqlx::raw_sql("INSERT INTO people(id,display_name,normalized_name,notes) VALUES('p','Alice','alice','keep Alice'),('unrelated','Bob','bob','keep Bob');").execute(&pool).await.unwrap();
+        let candidate = begin(&pool, "m", &serde_json::json!({})).await.unwrap();
+        finish(
+            &pool,
+            &candidate,
+            &[segment("new-alice", "unchanged words", "alice")],
+        )
+        .await
+        .unwrap();
+        set_status(&pool, &candidate, "ready", None).await.unwrap();
+        select(
+            &pool,
+            "m",
+            &candidate,
+            list(&pool, "m").await.unwrap().revision,
+        )
+        .await
+        .unwrap();
+        assert_eq!(sqlx::query_scalar::<_,String>("SELECT person_id FROM person_speakers WHERE meeting_id='m' AND speaker_label='alice'").fetch_one(&pool).await.unwrap(),"p");
+        let people: Vec<(String, String)> =
+            sqlx::query_as("SELECT id,notes FROM people ORDER BY id")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            people,
+            vec![
+                ("p".into(), "keep Alice".into()),
+                ("unrelated".into(), "keep Bob".into())
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn r2_foreign_meeting_mapping_evidence_does_not_affect_restoration() {
+        let pool = pool().await;
+        sqlx::query("UPDATE transcripts SET speaker='Alice' WHERE meeting_id='m'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let initial = list(&pool, "m").await.unwrap();
+        sqlx::query("UPDATE transcript_versions SET speaker_links_json=NULL WHERE id=?")
+            .bind(&initial.selected_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::raw_sql("INSERT INTO people(id,display_name,normalized_name,notes) VALUES('p','Alice','alice','keep p'),('foreign','Other identity','other','keep foreign'); INSERT INTO person_speakers VALUES('foreign','other','Alice');").execute(&pool).await.unwrap();
+        // Even a malformed legacy parent link must not import another meeting's
+        // curated mapping into this meeting's evidence set.
+        sqlx::query("INSERT INTO transcript_versions(id,meeting_id,kind,status,created_at,parent_id,segments_json,speaker_links_json) VALUES('foreign-history','other','corrections','ready','2099',?,'[]',?)")
+            .bind(&initial.selected_id).bind(serde_json::json!([["foreign","Alice"]]).to_string()).execute(&pool).await.unwrap();
+        let candidate = ready(&pool).await;
+        select(&pool, "m", &candidate, initial.revision)
+            .await
+            .unwrap();
+        select(
+            &pool,
+            "m",
+            &initial.selected_id,
+            list(&pool, "m").await.unwrap().revision,
+        )
+        .await
+        .unwrap();
+        assert_eq!(sqlx::query_scalar::<_,String>("SELECT person_id FROM person_speakers WHERE meeting_id='m' AND speaker_label='Alice'").fetch_one(&pool).await.unwrap(),"p");
+        assert_eq!(sqlx::query_scalar::<_,String>("SELECT person_id FROM person_speakers WHERE meeting_id='other' AND speaker_label='Alice'").fetch_one(&pool).await.unwrap(),"foreign");
+        let before = list(&pool, "other").await.unwrap();
+        assert!(
+            select(&pool, "other", &initial.selected_id, before.revision)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            list(&pool, "other").await.unwrap().revision,
+            before.revision
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SELECT notes FROM people WHERE id='foreign'")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            "keep foreign"
+        );
+    }
+
+    #[tokio::test]
+    async fn r2_no_evidence_contact_creation_and_links_roll_back_with_selection() {
+        let pool = pool().await;
+        let initial = list(&pool, "m").await.unwrap();
+        let candidate = begin(&pool, "m", &serde_json::json!({})).await.unwrap();
+        finish(
+            &pool,
+            &candidate,
+            &[segment("new-alice", "unchanged words", "Alice")],
+        )
+        .await
+        .unwrap();
+        set_status(&pool, &candidate, "ready", None).await.unwrap();
+        let versions = list(&pool, "m").await.unwrap().versions.len();
+        sqlx::raw_sql("CREATE TRIGGER fail_identity_selection BEFORE UPDATE OF version_id ON transcript_selection BEGIN SELECT RAISE(ABORT,'synthetic identity failure'); END;").execute(&pool).await.unwrap();
+        assert!(select(&pool, "m", &candidate, initial.revision)
+            .await
+            .is_err());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM people")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM person_speakers")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            0
+        );
+        let unchanged = list(&pool, "m").await.unwrap();
+        assert_eq!(unchanged.revision, initial.revision);
+        assert_eq!(unchanged.selected_id, initial.selected_id);
+        assert_eq!(unchanged.versions.len(), versions);
+        assert_eq!(text(&pool).await, "RU/EN original API");
+        sqlx::raw_sql("DROP TRIGGER fail_identity_selection")
+            .execute(&pool)
+            .await
+            .unwrap();
+        select(&pool, "m", &candidate, initial.revision)
+            .await
+            .unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM people WHERE normalized_name='alice'"
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            1
+        );
+        assert_eq!(sqlx::query_scalar::<_,i64>("SELECT count(*) FROM person_speakers WHERE meeting_id='m' AND speaker_label='Alice'").fetch_one(&pool).await.unwrap(),1);
     }
 }

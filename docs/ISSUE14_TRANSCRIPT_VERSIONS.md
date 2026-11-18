@@ -206,6 +206,16 @@ new-call scheduling belong to #15; current native offline guards are unchanged.
   curated mappings override display-name reconstruction. Old snapshots can use
   associated correction checkpoints/current links; historical associations already
   destroyed by an older build cannot be invented.
+- R2 narrows generic identity reconstruction to **absent mapping evidence**.
+  A valid exact mapping wins, otherwise an unambiguous normalized mapping can be
+  restored. If its recorded contact no longer exists, leave the label unlinked;
+  if normalized mappings conflict, do not guess via contact display names. Neither
+  case creates a replacement person or changes the restored text/speaker label.
+  With no matching evidence, the ordinary normalized helper still reuses or
+  creates a contact. Evidence reads and projection writes stay meeting-scoped;
+  unrelated people/mappings are not modified. This is not a global deletion
+  tombstone or a new voice/name classifier: missing historical evidence cannot
+  establish a past deletion. The ordinary no-evidence policy remains intentional.
 - The post-call handoff consumes native ready results on remount and stores a
   meeting-specific ready/deferred marker only after successful callbacks. Failed
   refresh remains visible with an explicit retry which does not rerun ASR. Failed
@@ -311,6 +321,28 @@ The page tests use an extended Bun timeout on this host; an initial harness run
 hit the default 5-second timeout under I/O contention and was not a pass. The
 passing runs are separate completed invocations. Injected storage errors in the
 page suite are expected assertions, not a successful-write claim.
+
+### R2 mapping-evidence verification on 2026-11-18
+
+Both exact reviewer repros from `/tmp/issue14-r2-edges-dblo57jm/src/versions.rs`
+were copied into production repository tests and failed before the guard: restoring
+an Alice snapshot created one replacement contact; ambiguous `ALICE`/`Alice`
+curation selected `p1` for `alice`. Both now pass, with unchanged restored text and
+labels. The unused-contact deletion repro uses the reviewer's SQL state transition
+equivalent to normal `delete_person` after the contact is no longer linked to the
+selected projection; it is not a Tauri/UI deletion qualification.
+
+- Production repository + actual shared normalized helper: **25 passed**, including
+  seven R2 regressions/controls: deleted contact, conflicting curation, exact
+  precedence, unique normalized restoration, no-evidence existing contact,
+  foreign-meeting isolation, and atomic rollback/no-evidence contact creation.
+- Existing recovery API/repository/real FFmpeg suite: **13 passed**, **60 filtered**;
+  fixtures are generated nonprivate audio, not real meetings/model inference.
+- Normal version-workflow Bun group: **6 passed**, transport mocked.
+- Rustfmt and `git diff --check` passed. No dependency/schema/interface change.
+- No new Next, full native, packaging or other heavy build was run for R2. R1's
+  prior build results are historical; native type/link and combined Mac/#10 gates
+  remain open as documented above.
 
 ### Final combined Mac qualification (NOT RUN here)
 

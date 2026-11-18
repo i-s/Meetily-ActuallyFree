@@ -133,6 +133,9 @@ R1 adds editor-safe in-place refresh, snapshot contact mappings, version-aware
 retained task anchors, consumed per-meeting handoff/retry, fresh local language
 detection and manifest-required dual-source checks. #15 owns queue/preemption;
 #16 owns term corrections.
+R2 preserves deleted/conflicted contact-mapping evidence during restore: only
+absent evidence permits ordinary normalized contact reconstruction. See the
+feature note for exact/normalized controls, meeting isolation and rollback tests.
 
 Summary-generated title ownership, placeholder rejection and completion refresh
 are documented in [SUMMARY_GENERATED_TITLES.md](SUMMARY_GENERATED_TITLES.md).
