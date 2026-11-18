@@ -36,8 +36,10 @@ else:
     assert_eq!(answer.evidence[0].time, 12.0);
     assert_eq!(serde_json::to_value(&answer).unwrap()["evidence"][0]["sequenceId"], 1);
     assert_eq!(answer.notes_revision, Some(7));
+    assert_eq!(answer.vocabulary_revision, Some(3));
     let prompt = std::fs::read_to_string(binary.with_extension("input")).unwrap();
     assert!(!prompt.contains("UNTRUSTED_PROVENANCE") && prompt.contains("You"));
+    assert!(prompt.contains("approved_vocabulary") && prompt.contains("Ёлка API") && prompt.contains("OpenAPI"));
     assert!(!prompt.contains("/synthetic/current"));
     std::fs::remove_file(binary.with_extension("input")).unwrap();
     let mut stale = request.clone(); stale.target = "recording:/synthetic/other".into();

@@ -17,6 +17,7 @@ export interface LiveAnswer {
   uncertain: boolean;
   evidence: Array<{ id: string; sequenceId: number; time: number; text: string }>;
   notesRevision: number | null;
+  vocabularyRevision?: number | null;
   asOfSeconds: number;
   fromSeconds: number;
 }

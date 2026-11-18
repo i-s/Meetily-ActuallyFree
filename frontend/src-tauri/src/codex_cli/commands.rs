@@ -123,12 +123,16 @@ pub async fn codex_live_ask(
             .unwrap_or_default(),
         revision: notes.map(|n| n.revision).unwrap_or(0),
     };
+    let approved = crate::database::repositories::vocabulary::VocabularyRepository::approved_global(state.db_manager.pool())
+        .await.map_err(|_| "Cannot verify approved vocabulary. Nothing was sent; review Personal vocabulary and retry.")?;
+    let vocabulary = super::vocabulary::ApprovedVocabulary::global(&approved.terms, approved.revision)?;
     let path = codex_cli_get_path().await?;
     let home = isolated_auth_home().await?;
-    service::ask(
+    service::ask_with_vocabulary(
         request,
         &canonical,
         &committed,
+        &vocabulary,
         path.as_deref(),
         &home,
         &job.token,

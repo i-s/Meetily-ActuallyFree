@@ -67,6 +67,7 @@ export function LiveCodexChat({ lines, onJumpTo }: { lines: QuestionLine[]; onJu
           sourceStatus: [
             `Available speech ${stamp(answer.fromSeconds)}–${stamp(answer.asOfSeconds)}; ASR may lag. Whole turns only.`,
             answer.uncertain ? 'Insufficient/uncertain evidence.' : '',
+            answer.vocabularyRevision != null ? `Personal vocabulary · revision ${answer.vocabularyRevision} (approved spellings only, not speech evidence).` : '',
             answer.notesRevision !== null ? `Personal Notes · revision ${answer.notesRevision} (whole-meeting Notes, not window-timed speech or proof of agreement; no speech timestamp).` : 'Personal Notes not cited.',
           ].filter(Boolean).join(' '),
         };

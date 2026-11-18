@@ -33,7 +33,7 @@ tempfile="={versions['tempfile']}"
     (work / 'src/commands.rs').write_text((SOURCE / 'commands.rs').read_text().replace('#[tauri::command]', ''))
     recording = (ROOT / 'frontend/src-tauri/src/audio/recording_commands.rs').read_text()
     recording = recording[recording.index('pub(crate) fn current_text_clock()'):recording.index('/// Get accumulated transcript segments from current recording session')]
-    modules = '\n'.join(f'#[path="{SOURCE}/{name}.rs"] pub mod {name};' for name in ('cli', 'context', 'jobs', 'service'))
+    modules = '\n'.join(f'#[path="{SOURCE}/{name}.rs"] pub mod {name};' for name in ('cli', 'context', 'jobs', 'service', 'vocabulary'))
     (work / 'src/lib.rs').write_text(modules + f'''
 extern crate self as tauri;
 pub struct State<'a,T>(pub &'a T);
@@ -66,7 +66,13 @@ pub mod audio {{
     {recording}
   }}
 }}
-pub mod database {{pub mod repositories {{pub mod notes_document {{
+pub mod database {{pub mod repositories {{
+  pub mod vocabulary {{
+    pub struct VocabularyRepository;
+    pub struct Approved {{pub terms:String,pub revision:i64}}
+    impl VocabularyRepository {{pub async fn approved_global(_pool:&())->Result<Approved,String>{{Ok(Approved{{terms:"Ёлка API\\nOpenAPI".into(),revision:3}})}}}}
+  }}
+  pub mod notes_document {{
     pub struct Notes {{pub markdown:Option<String>,pub revision:i64}}
     pub async fn read(_pool:&(),target:&str)->Result<Option<Notes>,String>{{crate::test_runtime::TARGETS.lock().unwrap().push(target.into());Ok(Some(Notes{{markdown:Some("My idea, not agreed".into()),revision:7}}))}}
 }}}}}}

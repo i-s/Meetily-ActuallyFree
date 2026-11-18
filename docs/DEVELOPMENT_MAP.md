@@ -137,6 +137,17 @@ R2 preserves deleted/conflicted contact-mapping evidence during restore: only
 absent evidence permits ordinary normalized contact reconstruction. See the
 feature note for exact/normalized controls, meeting isolation and rollback tests.
 
+Issue #16's independent transcript correction → explicit **Запомнить** flow,
+revision-CAS personal vocabulary editing, legacy approval provenance, unchanged
+local Whisper consumers, separate bounded Codex spelling snapshots and #15's
+shared summary seam are documented in
+[ISSUE16_CONFIRMED_VOCABULARY.md](ISSUE16_CONFIRMED_VOCABULARY.md). Read it before
+changing vocabulary writers or provider context. `get_global` includes legacy
+local-ASR hints; Codex must use the proof-bearing `approved_global` snapshot.
+Ordinary corrections and declined confirmation never learn terms. Parakeet has
+no hints; Whisper uses a 224-token prefix, not the whole storage character limit.
+Synthetic persistence/dispatch tests do not qualify real ASR/model accuracy.
+
 Issue #12's live/library Notes editor, session-keyed autosave, transactional
 save/recovery association, independent data ownership, revisioned read interfaces
 for #13/#15/#18, portable coverage and deferred physical Mac gates are documented

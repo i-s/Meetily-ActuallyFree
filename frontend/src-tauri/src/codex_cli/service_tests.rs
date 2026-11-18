@@ -184,3 +184,27 @@ async fn network_auth_and_quota_errors_are_visible_without_diagnostics_or_fallba
         assert!(!error.contains("SECRET"));
     }
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn vocabulary_consumer_uses_confirmed_spelling_in_synthetic_fake_response() {
+    // This checks actual process input/output, not real-model semantic quality.
+    let (dir, binary) = fixture("data=prompt.split('APPROVED_VOCABULARY_DATA_JSON:\\n',1)[1].split('\\nEND_APPROVED_VOCABULARY',1)[0]; terms=json.loads(data); assert terms['source']=='approved_vocabulary'; assert terms['scope']=='global'; assert terms['revision']==9; assert terms['terms']==['Ёлка API','OpenAPI','SRE']; print(json.dumps({'type':'item.completed','item':{'type':'agent_message','text':json.dumps({'answer':'OpenAPI / Ёлка API: only a spelling guide, no agreement in speech.','transcript_ids':[],'notes_used':False,'uncertain':True})}})); print(json.dumps({'type':'turn.completed'}))", "Logged in using ChatGPT");
+    let r = request();
+    let v = super::super::vocabulary::ApprovedVocabulary::global("Ёлка API\nOpenAPI\nSRE",9).unwrap();
+    let answer = ask_with_vocabulary(r.clone(), &canonical(&r), &r.user_notes, &v, Some(&binary), &dir.path().join("auth"), &CancellationToken::new(), ||true).await.unwrap();
+    assert!(answer.answer.contains("OpenAPI") && answer.answer.contains("Ёлка API"));
+    assert!(answer.evidence.is_empty() && answer.uncertain && answer.notes_revision.is_none());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn shared_summary_helper_keeps_vocabulary_separate_from_saved_speech_and_notes() {
+    // #15 owns the normal summary dispatch/queue. Exercise its shared prompt
+    // seam with the same isolated process adapter, without implementing a queue.
+    let (dir,binary)=fixture("data=prompt.split('APPROVED_VOCABULARY_DATA_JSON:\\n',1)[1].split('\\nEND_APPROVED_VOCABULARY',1)[0]; v=json.loads(data); assert v['terms']==['OpenAPI','Ёлка API']; assert v['snapshot_id']=='vocabulary:global:11'; assert 'SAVED_SPEECH: Discussed Open API' in prompt; assert 'USER_NOTES: My idea, not agreed' in prompt; print(json.dumps({'type':'item.completed','item':{'type':'agent_message','text':'OpenAPI spelling supplied; no agreement established by vocabulary.'}})); print(json.dumps({'type':'turn.completed'}))", "Logged in using ChatGPT");
+    let v=super::super::vocabulary::ApprovedVocabulary::global("OpenAPI\nЁлка API",11).unwrap();
+    let prompt=v.augment_prompt("SAVED_SPEECH: Discussed Open API\nUSER_NOTES: My idea, not agreed").unwrap();
+    let result=cli::generate(Some(&binary),&dir.path().join("auth"),cli::DEFAULT_MODEL,"Synthetic saved-meeting summary",&prompt,Some(&CancellationToken::new())).await.unwrap();
+    assert_eq!(result,"OpenAPI spelling supplied; no agreement established by vocabulary.");
+}
