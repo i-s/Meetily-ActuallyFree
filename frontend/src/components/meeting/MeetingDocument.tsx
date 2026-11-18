@@ -57,6 +57,8 @@ type SummaryStatus = 'idle' | 'processing' | 'summarizing' | 'regenerating' | 'c
 
 export interface MeetingDocumentProps {
   meetingId: string;
+  transcriptChanging?: boolean;
+  registerTranscriptPreparation?: (prepare: () => Promise<void>) => (() => void);
   aiSummary: any;
   summaryUserEdited: boolean;
   onSummaryChange: (summary: any, source: 'user' | 'system') => void;
@@ -138,6 +140,8 @@ export function MeetingDocument(props: MeetingDocumentProps) {
 
 function NotesTab({
   meetingId,
+  transcriptChanging,
+  registerTranscriptPreparation,
   aiSummary,
   summaryUserEdited,
   onSummaryChange,
@@ -247,6 +251,22 @@ function NotesTab({
     setUserEdited(true);
   });
 
+  const notesConversion = useRef<() => Promise<void>>(async () => {});
+  const summaryConversion = useRef<() => Promise<void>>(async () => {});
+  const registerNotesFlush = useCallback((flush: () => Promise<void>) => {
+    notesConversion.current = flush;
+    return () => { notesConversion.current = async () => {}; };
+  }, []);
+  const registerSummaryFlush = useCallback((flush: () => Promise<void>) => {
+    summaryConversion.current = flush;
+    return () => { summaryConversion.current = async () => {}; };
+  }, []);
+  useEffect(() => registerTranscriptPreparation?.(async () => {
+    await Promise.all([notesConversion.current(), summaryConversion.current()]);
+    const saved = await Promise.all([notesSaver.flush(), summarySaver.flush()]);
+    if (saved.some((ok) => !ok)) throw new Error('Save pending notes and summary edits before changing transcript versions. Retry after storage recovers.');
+  }), [registerTranscriptPreparation, notesSaver.flush, summarySaver.flush]);
+
   const generating = summaryStatus === 'processing' || summaryStatus === 'summarizing' || summaryStatus === 'regenerating';
   const hasSummary = !!aiSummary && !!markdown.trim();
 
@@ -315,6 +335,8 @@ function NotesTab({
           {notes.loaded ? (
             <NotesEditor
               key={`notes-${meetingId}`}
+              editable={!transcriptChanging}
+              registerFlush={registerNotesFlush}
               initialBlocks={notes.json}
               initialMarkdown={notes.markdown}
               placeholder="Write your own notes. They stay yours: summaries never overwrite them."
@@ -479,6 +501,8 @@ function NotesTab({
           ) : hasSummary ? (
             <NotesEditor
               key={`summary-${meetingId}-${revision}`}
+              editable={!transcriptChanging}
+              registerFlush={registerSummaryFlush}
               initialBlocks={blocks}
               initialMarkdown={blocks ? null : markdown}
               placeholder="The summary is empty."

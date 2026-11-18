@@ -92,10 +92,16 @@ Pending summary generation blocks selection/correction. Existing summary result,
 backup and user-edited flag are archived with the old projection before selected
 summary/cache data is cleared. Archived summary text is readable in version review;
 it is not silently restored or presented as a summary of new text. Meeting detail
-reloads after selection/correction so in-memory summary and paginated transcript
-state cannot disagree. Contact speaker links are reconciled transactionally to
-selected labels without deleting curated contacts. Notes, meeting-owned tasks,
-title, audio retention settings and capture/recovery files are not rewritten.
+refreshes the React transcript projection after selection/correction without a
+window reload. Both rich-text conversions and serialized autosaves drain before
+native selection/correction, with editors briefly read-only. Failed persistence
+blocks mutation and retains the draft for retry. A native-success/view-refresh
+failure has a separate refresh retry, not another destructive operation. Notes
+stay mounted, while the archived selected summary is cleared in child and parent
+state; pending summary edits are saved before that archive is made. Contact links
+are reconciled transactionally without deleting curated contacts. Notes, task
+contents/completion/curation, title, audio retention and capture/recovery files
+are not rewritten; task navigation anchors alone follow the selected projection.
 
 ## Source and speaker contract
 
@@ -179,11 +185,48 @@ reservation/lifetime; `diarization::diarize_version` only refines a candidate.
 Product text requests should capture **meeting + selected version + revision**
 and reject/mark stale a result whose revision no longer matches at publication.
 #15 must not obtain refined text by assuming the last finished ASR is selected.
-#16 can schedule through the same candidate/repository interface; this patch is
+#15 owns queue/preemption and can schedule through the same candidate/repository
+interface; #16 owns term corrections and can consume `correct_transcript_text`.
+This patch is
 not a durable priority queue, OS background service, resumable inference checkpoint
 or battery scheduler. Starting refinement during recording is rejected and state
 is rechecked before processing. Preemption of an already executing model call and
-new-call scheduling belong to #16; current native offline guards are unchanged.
+new-call scheduling belong to #15; current native offline guards are unchanged.
+
+## R1 integration corrections
+
+- Additive migration `20261118001401_transcript_version_references.sql` stores
+  curated speaker/contact mappings in snapshots and retains each task's original
+  source version, row ID and audio time. Version selection updates only task
+  navigation, never task text/completion/curation. An original anchor wins on
+  restore; otherwise only a selected segment containing the saved time is linked.
+  Missing/gap anchors fall back to audio time or the meeting, not a deleted row.
+- Contact reconciliation uses the same normalized/Unicode-aware identity helper
+  as ordinary person operations, extracted without changing its policy. Explicit
+  curated mappings override display-name reconstruction. Old snapshots can use
+  associated correction checkpoints/current links; historical associations already
+  destroyed by an older build cannot be invented.
+- The post-call handoff consumes native ready results on remount and stores a
+  meeting-specific ready/deferred marker only after successful callbacks. Failed
+  refresh remains visible with an explicit retry which does not rerun ASR. Failed
+  or interrupted jobs leave explicit later enhancement available. A changed
+  meeting gets separate component state and storage; Enhance remains available
+  for a deliberately requested later pass even after a handoff was consumed.
+- The normal summary-language resolver deliberately does not read or write the
+  old meeting-only detected-language cache. It runs cheap local detection on its
+  current text instead, so switch/correction cannot reuse a prior text's hint.
+  Explicit language settings take precedence; recording metadata is untouched.
+- A call manifest declaring retained `mic_audio_file` or `system_audio_file`
+  requires both physical source files. One missing **or both missing** fails even
+  with a mixed playback file. Genuine legacy mixed-only recordings remain anonymous.
+
+Combined #10 regression requirements remain OPEN, not replaced by these checks:
+resolve/validate original-recording policy **before `ensure_wav`**; force an
+external temporary WAV; exercise malformed JSON and valid nonobject manifests;
+exercise generated `You` inside both `Alice + You` and unmatched `You + Guest`
+through versioned candidate **then selection**. Forbidden generated identity must
+not survive, while genuinely authored names/text remain in separately recoverable
+corrections. #10 owns those policy/composite fixes. No unaccepted branch is pulled.
 
 ## Verification and limits
 
@@ -197,7 +240,7 @@ SQLite**, not an audio accuracy fixture:
   interruption, opaque metadata/source-map retention through correction and restore,
   and read/select without audio. No GTK/Tauri/ASR engine is simulated
   as passing. The same core tests are also native unit tests.
-- From `frontend`, run the two `tests/transcript-versions/*.test.tsx` files as
+- From `frontend`, run each `tests/transcript-versions/*.test.ts(x)` file as
   separate Bun invocations: normal review/select/correction controls, audio-missing
   state, stale error, post-call native-start entrypoint, remount and cancellation.
 - `frontend/scripts/test-retranscription-sources-portable.py`: extracts production
@@ -211,7 +254,7 @@ SQLite**, not an audio accuracy fixture:
   checks; record their actual exit/results in the handoff. Installed/physical/model
   qualification is not implied by any device-free pass.
 
-### Device-free results on 2026-11-18
+### Baseline device-free results (head `3cd862a`, before R1 changes)
 
 - Production SQLite version repository: **15 passed** (synthetic RU/EN text).
 - Extracted production source/identity helpers: **7 passed** (empty source-file
@@ -234,6 +277,40 @@ Snapshot retention currently has no automatic pruning; storage failures are
 reported, not permission to overwrite a prior selected version. Native inference,
 model accuracy, installed-app behavior and #10 policy integration are not
 established by these device-free checks.
+
+### R1 verification on 2026-11-18
+
+Red regressions were reproduced against `3cd862a`/the pre-fix normal callers:
+page reload and unflushed drafts, normalized contact loss, dangling task source,
+ready-remount/hidden refresh failure, stale detected language and both declared
+tracks missing. A separate legacy-snapshot red reproduced curated-link loss;
+fractional task navigation reproduced `1.25` seconds being truncated to `1`.
+
+Current targeted checks:
+
+- Production SQLite version repository and shared normalized identity helper:
+  **18 passed**, including old/new association snapshots, task restore, absent/gap
+  anchors, original source-version retention and reference rollback.
+- Production source/identity helper suite: **9 passed**, synthetic text and empty
+  track placeholders only. No acoustic/model test is implied.
+- Separate Bun invocations: version UI **6 passed**; actual PageContent +
+  MeetingDocument/NotesTab + autosave + version controls **3 passed** (rich-editor
+  widget and native transport mocked, including delayed conversion and injected
+  storage failure); handoff **7 passed**; normal summary-language resolver **2
+  passed** without a provider call; task-list navigation **1 passed** with exact
+  fractional time, audio-only fallback and meeting-only fallback.
+- Existing recovery API/repository suite: **13 passed**, real SQLite and FFmpeg
+  generated nonprivate fixtures; **53 filtered**. Recovery semantics are unchanged.
+- Standalone TypeScript passed. The production Next build also validates types
+  and lint; final result is recorded in the coordinator handoff.
+- Native edited modules parse with Rustfmt; full Tauri/native type/link tests
+  remain unqualified here because GTK/pkg-config prerequisites are absent, as
+  recorded above. No packages were installed to disguise that limit.
+
+The page tests use an extended Bun timeout on this host; an initial harness run
+hit the default 5-second timeout under I/O contention and was not a pass. The
+passing runs are separate completed invocations. Injected storage errors in the
+page suite are expected assertions, not a successful-write claim.
 
 ### Final combined Mac qualification (NOT RUN here)
 
@@ -262,8 +339,9 @@ no packaging or Mac operations are part of this implementation batch.
    Exercise #9 audio-only and post-commit recovery retries before/after selection;
    an old recovery draft must not restore its rows over the selected version.
 6. Confirm no audio or text-provider request is made by refinement. #15's approved
-   subscriber CLI authorization, unavailable-network behavior and #16's priority
-   queue require their own qualification; they are not established by this patch.
+   subscriber CLI authorization, unavailable-network behavior and #15's priority
+   queue require their own qualification, as do #16 term corrections; none is
+   established by this patch.
 
 AC on quality-before/after and physical local/remote attribution remains **open**
 until that evidence exists. No real model/audio tests, Mac qualification, installer,

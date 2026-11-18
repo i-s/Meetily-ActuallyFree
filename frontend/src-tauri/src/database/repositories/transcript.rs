@@ -363,6 +363,7 @@ mod tests {
             speaker: Some(speaker.into()),
         };
         sqlx::raw_sql(include_str!("../../../migrations/20261118001400_transcript_versions.sql")).execute(&pool).await.unwrap();
+        sqlx::raw_sql(include_str!("../../../migrations/20261118001401_transcript_version_references.sql")).execute(&pool).await.unwrap();
         let meeting = TranscriptsRepository::save_transcript(&pool, "Test", &[make_turn("Alice"), make_turn("Speaker 2")], None, None)
             .await.unwrap();
         let linked: Vec<String> = sqlx::query_scalar("SELECT speaker_label FROM person_speakers WHERE meeting_id = ?")
@@ -407,6 +408,7 @@ mod issue9_recovery_tests {
         let pool = sqlx::sqlite::SqlitePoolOptions::new().max_connections(1).connect(":memory:").await.unwrap();
         sqlx::raw_sql("CREATE TABLE meetings (id TEXT PRIMARY KEY, title TEXT, created_at TEXT, updated_at TEXT, folder_path TEXT, title_is_manual INTEGER); CREATE TABLE transcripts (id TEXT PRIMARY KEY, meeting_id TEXT, transcript TEXT, timestamp TEXT, audio_start_time REAL, audio_end_time REAL, duration REAL, speaker TEXT); CREATE TABLE people (id TEXT PRIMARY KEY, display_name TEXT NOT NULL, normalized_name TEXT NOT NULL UNIQUE, notes TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL); CREATE TABLE person_speakers (person_id TEXT NOT NULL, meeting_id TEXT NOT NULL, speaker_label TEXT NOT NULL, UNIQUE(meeting_id, speaker_label));").execute(&pool).await.unwrap();
         sqlx::raw_sql(include_str!("../../../migrations/20261118001400_transcript_versions.sql")).execute(&pool).await.unwrap();
+        sqlx::raw_sql(include_str!("../../../migrations/20261118001401_transcript_version_references.sql")).execute(&pool).await.unwrap();
         pool
     }
     #[tokio::test]

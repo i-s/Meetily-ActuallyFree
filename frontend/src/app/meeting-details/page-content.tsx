@@ -57,6 +57,7 @@ export default function PageContent({
   shouldAutoGenerate = false,
   onAutoGenerateComplete,
   onSummaryReady,
+  onSummaryInvalidated,
   onMeetingUpdated,
   onRefetchTranscripts,
   segments,
@@ -75,6 +76,7 @@ export default function PageContent({
   shouldAutoGenerate?: boolean;
   onAutoGenerateComplete?: () => void;
   onSummaryReady?: (summary: Summary) => void;
+  onSummaryInvalidated?: () => void;
   onMeetingUpdated?: () => Promise<void>;
   onRefetchTranscripts?: () => Promise<void>;
   segments?: TranscriptSegmentData[];
@@ -106,6 +108,18 @@ export default function PageContent({
   const [regenerateRequest, setRegenerateRequest] = useState<{ open: boolean; context: string; reason?: string } | null>(null);
 
   const meetingData = useMeetingData({ meeting, summaryData });
+  const prepareDocument = useRef<() => Promise<void>>(async () => {});
+  const [transcriptChanging, setTranscriptChanging] = useState(false);
+  const registerTranscriptPreparation = useCallback((prepare: () => Promise<void>) => {
+    prepareDocument.current = prepare;
+    return () => { prepareDocument.current = async () => {}; };
+  }, []);
+  const beforeTranscriptChange = async () => {
+    setTranscriptChanging(true);
+    try { await prepareDocument.current(); }
+    catch (error) { setTranscriptChanging(false); throw error; }
+    return () => setTranscriptChanging(false);
+  };
   const templates = useTemplates();
   const meetingOperations = useMeetingOperations({ meeting });
   const audio = useMeetingAudio(meeting.id);
@@ -297,7 +311,7 @@ export default function PageContent({
   // Deep link from search or an action item: the line itself, or the line
   // spoken at the linked time. Load pages until it is present, then show it.
   const focusLineId = useMemo(() => {
-    if (focusTranscriptId) return focusTranscriptId;
+    if (focusTranscriptId && transcriptSegments.some((segment) => segment.id === focusTranscriptId)) return focusTranscriptId;
     if (focusTime == null) return null;
     let match: string | null = null;
     for (const segment of transcriptSegments) {
@@ -411,10 +425,14 @@ export default function PageContent({
         onTranscriptChanged={() => refreshAfterSpeakerChange()}
       />
 
-      <TranscriptVersions key={meeting.id} meetingId={meeting.id} onChanged={async () => {
-        // Clear all loaded derived state, not only paginated transcript rows.
-        // The durable selection transaction already archived the old summary.
-        window.location.reload();
+      <TranscriptVersions key={meeting.id} meetingId={meeting.id} onBeforeChange={beforeTranscriptChange} onChanged={async () => {
+        // Native already archived the flushed summary. Refresh just the selected
+        // projection; keeping this tree mounted preserves notes/editor ownership.
+        meetingData.setAiSummary(null);
+        onSummaryInvalidated?.();
+        await onRefetchTranscripts?.();
+        announceChange('people');
+        announceChange('actions', { meetingId: meeting.id });
       }} />
 
       <div
@@ -472,6 +490,8 @@ export default function PageContent({
         >
           <MeetingDocument
             meetingId={meeting.id}
+            transcriptChanging={transcriptChanging}
+            registerTranscriptPreparation={registerTranscriptPreparation}
             aiSummary={meetingData.aiSummary}
             summaryUserEdited={summaryUserEdited}
             onSummaryChange={handleSummaryChange}

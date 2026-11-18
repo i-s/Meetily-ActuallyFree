@@ -250,6 +250,12 @@ fn find_retranscription_sources(folder: &Path, fallback: &Path) -> Result<Vec<Re
             negative_threshold: 0.10,
         }]);
     }
+    let metadata = recording_metadata(folder)?;
+    let retained_call_sources = ["mic_audio_file", "system_audio_file"].iter()
+        .any(|key| metadata.get(key).is_some_and(|value| !value.is_null()));
+    if retained_call_sources && !(mic_path.is_file() && system_path.is_file()) {
+        return Err(anyhow!("A retained call source track is missing. Restore both microphone and system tracks before refinement."));
+    }
     if mic_path.is_file() != system_path.is_file() {
         return Err(anyhow!("A retained call source track is missing. Restore both microphone and system tracks before refinement; mixed fallback could lose a speaker."));
     }
@@ -1330,4 +1336,25 @@ mod issue14_source_tests {
         std::fs::write(folder.path().join("transcripts.json"), b"[]").unwrap();
         assert!(saved_sources(folder.path()).is_err());
     }
+    #[test]
+    fn r1_manifest_requires_both_retained_call_tracks_even_when_both_are_missing() {
+        let folder = tempfile::tempdir().unwrap();
+        std::fs::write(folder.path().join("audio.mp4"), []).unwrap();
+        std::fs::write(folder.path().join("metadata.json"), r#"{"mic_audio_file":"mic.mp4","system_audio_file":"system.mp4","in_person":false}"#).unwrap();
+        assert!(saved_sources(folder.path()).is_err());
+        std::fs::write(folder.path().join("mic.mp4"), []).unwrap();
+        assert!(saved_sources(folder.path()).is_err());
+        std::fs::write(folder.path().join("system.mp4"), []).unwrap();
+        assert!(saved_sources(folder.path()).is_ok());
+    }
+    #[test]
+    fn r1_legacy_mixed_only_audio_still_refines_anonymously() {
+        let folder = tempfile::tempdir().unwrap();
+        let mixed = folder.path().join("audio.mp4");
+        std::fs::write(&mixed, []).unwrap();
+        let sources = find_retranscription_sources(folder.path(),&mixed).unwrap();
+        assert_eq!(sources[0].source_id,"mixed");
+        assert_eq!(sources[0].speaker_hint,None);
+    }
+
 }

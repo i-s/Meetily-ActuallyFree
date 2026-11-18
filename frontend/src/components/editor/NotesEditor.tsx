@@ -88,6 +88,7 @@ export interface NotesEditorProps {
   className?: string;
   /** Called once the initial content is in the editor. */
   onReady?: () => void;
+  registerFlush?: (flush: () => Promise<void>) => (() => void);
 }
 
 export function NotesEditor({
@@ -98,6 +99,7 @@ export function NotesEditor({
   onChange,
   className,
   onReady,
+  registerFlush,
 }: NotesEditorProps) {
   const [theme] = useAppTheme();
   const dark = themeInfo(theme).dark;
@@ -141,12 +143,17 @@ export function NotesEditor({
   // If converting to markdown ever fails, keep the last good markdown rather
   // than saving an empty one next to the (still correct) blocks.
   const lastMarkdown = useRef(initialMarkdown ?? '');
+  const conversions = useRef<Promise<void>>(Promise.resolve());
+  useEffect(() => registerFlush?.(async () => { await conversions.current; }), [registerFlush]);
   useEffect(() => {
-    return editor.onChange(async () => {
+    return editor.onChange(() => {
       if (!loaded.current || !onChangeRef.current) return;
-      const result = await blocksToMarkdownSafely(editor, editor.document, { source: 'notes-editor', fallbackMarkdown: lastMarkdown.current });
-      if (result.ok && result.markdown !== undefined) lastMarkdown.current = result.markdown;
-      onChangeRef.current?.({ json: editor.document, markdown: result.markdown ?? lastMarkdown.current });
+      const document = structuredClone(editor.document);
+      conversions.current = conversions.current.then(async () => {
+        const result = await blocksToMarkdownSafely(editor, document, { source: 'notes-editor', fallbackMarkdown: lastMarkdown.current });
+        if (result.ok && result.markdown !== undefined) lastMarkdown.current = result.markdown;
+        onChangeRef.current?.({ json: document, markdown: result.markdown ?? lastMarkdown.current });
+      });
     });
   }, [editor]);
 

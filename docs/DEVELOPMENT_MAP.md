@@ -129,6 +129,10 @@ The feature note also names the #10 seam: opaque recording metadata and per-row
 capture source maps survive candidate/correction/restore; generated labels are
 not manual identity. #10's accepted session-policy resolution must cover the
 shared native inner path, before the candidate-only restrictive adapter.
+R1 adds editor-safe in-place refresh, snapshot contact mappings, version-aware
+retained task anchors, consumed per-meeting handoff/retry, fresh local language
+detection and manifest-required dual-source checks. #15 owns queue/preemption;
+#16 owns term corrections.
 
 Summary-generated title ownership, placeholder rejection and completion refresh
 are documented in [SUMMARY_GENERATED_TITLES.md](SUMMARY_GENERATED_TITLES.md).

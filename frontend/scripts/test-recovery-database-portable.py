@@ -60,7 +60,7 @@ mod state {{
     impl DbManager {{ pub fn pool(&self)->&sqlx::SqlitePool{{&self.0}} }}
 }}
 mod api;
-mod database {{ #[path="{ROOT}/frontend/src-tauri/src/database/transcript_versions.rs"] pub mod transcript_versions; pub mod repositories {{ pub mod person {{
+mod database {{ #[path="{ROOT}/frontend/src-tauri/src/database/transcript_versions.rs"] pub mod transcript_versions; pub mod repositories {{ #[path="{ROOT}/frontend/src-tauri/src/database/repositories/speaker_identity.rs"] pub mod speaker_identity; pub mod person {{
     pub struct PeopleRepository;
     impl PeopleRepository {{ pub async fn link_named_speakers(_tx:&mut sqlx::Transaction<'_,sqlx::Sqlite>,_meeting:&str)->Result<(),sqlx::Error>{{Ok(())}} }}
 }} }} }}

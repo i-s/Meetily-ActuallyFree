@@ -14,3 +14,7 @@ mod api {
 }
 #[path = "../../../frontend/src-tauri/src/database/transcript_versions.rs"]
 mod transcript_versions;
+
+#[path = "../../../frontend/src-tauri/src/database/repositories/speaker_identity.rs"]
+pub mod speaker_identity;
+mod database { pub mod repositories { pub use crate::speaker_identity; } }

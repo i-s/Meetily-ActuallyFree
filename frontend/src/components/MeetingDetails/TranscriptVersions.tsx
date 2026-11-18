@@ -10,8 +10,9 @@ type Versions = { selected_id: string; revision: number; versions: Version[]; au
 
 /** The selected editable transcript is separate from immutable snapshots. A
  * candidate is never silently applied, including after reopening this page. */
-export function TranscriptVersions({ meetingId, onChanged }: {
+export function TranscriptVersions({ meetingId, onChanged, onBeforeChange }: {
   meetingId: string; onChanged: () => Promise<void> | void;
+  onBeforeChange?: () => Promise<() => void>;
 }) {
   const [data, setData] = useState<Versions | null>(null);
   const [review, setReview] = useState<Version | null>(null);
@@ -19,6 +20,12 @@ export function TranscriptVersions({ meetingId, onChanged }: {
   const [segments, setSegments] = useState<Segment[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [refreshPending, setRefreshPending] = useState(false);
+  const refreshProjection = async () => {
+    setRefreshPending(true);
+    await onChanged();
+    setRefreshPending(false);
+  };
   const [editing, setEditing] = useState<{ revision: number; segments: Segment[] } | null>(null);
   const [editId, setEditId] = useState('');
   const [editText, setEditText] = useState('');
@@ -46,13 +53,15 @@ export function TranscriptVersions({ meetingId, onChanged }: {
   const select = async () => {
     if (!review || reviewRevision === null) return;
     setBusy(true);
+    let release: (() => void) | undefined;
     try {
+      release = await onBeforeChange?.();
       await invoke('select_transcript_version', { meetingId, versionId: review.id, expectedRevision: reviewRevision });
       setReview(null);
       await refresh();
-      await onChanged();
+      await refreshProjection();
     } catch (cause) { setError(String(cause)); }
-    finally { setBusy(false); }
+    finally { release?.(); setBusy(false); }
   };
   const editCurrent = async () => {
     setBusy(true);
@@ -66,11 +75,13 @@ export function TranscriptVersions({ meetingId, onChanged }: {
   const saveCorrection = async () => {
     if (!editing) return;
     setBusy(true);
+    let release: (() => void) | undefined;
     try {
+      release = await onBeforeChange?.();
       await invoke('correct_transcript_text', { meetingId, transcriptId: editId, text: editText, expectedRevision: editing.revision });
-      setEditing(null); await refresh(); await onChanged();
+      setEditing(null); await refresh(); await refreshProjection();
     } catch (cause) { setError(String(cause)); }
-    finally { setBusy(false); }
+    finally { release?.(); setBusy(false); }
   };
   return (
     <details className="max-h-[55vh] overflow-auto rounded-xl border border-af-border p-3" onToggle={(event) => { if (event.currentTarget.open) void refresh(); }}>
@@ -78,7 +89,13 @@ export function TranscriptVersions({ meetingId, onChanged }: {
       <p className="my-2 text-sm text-af-text-2">Live text and corrections stay separate from refined results. Review a snapshot before selecting it. No automatic merging of text or speaker corrections is performed.</p>
       {data && !data.audio_available && <p role="status" className="text-sm text-af-text-2">Saved audio is unavailable. Reprocessing is disabled; saved text versions remain readable.</p>}
       <Button variant="ghost" disabled={busy} onClick={() => void refresh()}>Refresh versions</Button>
-      <Button variant="ghost" disabled={busy || !data || !!editing} onClick={() => void editCurrent()}>Correct selected text</Button>
+      {refreshPending && <Button disabled={busy} onClick={async () => {
+        setBusy(true);
+        try { await refreshProjection(); setError(null); }
+        catch (cause) { setError(String(cause)); }
+        finally { setBusy(false); }
+      }}>Retry selected view refresh</Button>}
+      <Button variant="ghost" disabled={busy || refreshPending || !data || !!editing} onClick={() => void editCurrent()}>Correct selected text</Button>
       {editing && <section aria-label="Correct selected transcript" className="space-y-2">
         <p className="text-sm">Correction changes only this selected line's text, not its speaker, ID or timestamps. The previous text and any summary are saved as a corrections snapshot.</p>
         <select aria-label="Transcript line to correct" value={editId} onChange={(event) => {
@@ -94,7 +111,7 @@ export function TranscriptVersions({ meetingId, onChanged }: {
       <ul className="space-y-2">
         {data?.versions.map((version) => <li key={version.id} className="text-sm">
           <span>{version.kind} · {version.status} · {new Date(version.created_at).toLocaleString()}{data.selected_id === version.id ? ' · selected (editable)' : ''}</span>
-          {version.status === 'ready' && <Button variant="ghost" disabled={busy || !!editing} onClick={() => void inspect(version)}>Review snapshot</Button>}
+          {version.status === 'ready' && <Button variant="ghost" disabled={busy || refreshPending || !!editing} onClick={() => void inspect(version)}>Review snapshot</Button>}
           {version.status === 'running' && <Button variant="ghost" onClick={async () => {
             try { await invoke('cancel_retranscription_command', { meetingId, versionId: version.id }); await refresh(); }
             catch (cause) { setError(String(cause)); }

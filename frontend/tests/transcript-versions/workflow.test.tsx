@@ -76,3 +76,15 @@ test('refreshing the list cannot bless a stale review with a newer revision', as
   expect(calls).toContainEqual(['select_transcript_version', { meetingId: 'm', versionId: 'refined', expectedRevision: 7 }]);
   expect(changed).toBe(0);
 });
+
+ test('R1 committed selection refresh can retry without selecting a second time', async () => {
+  let rejects = true;
+  await act(async () => { root = create(<TranscriptVersions meetingId="m" onChanged={async () => { changed++; if (rejects) throw new Error('refresh unavailable'); }} />); });
+  await act(async () => button('Review snapshot').props.onClick());
+  await act(async () => button('Save current corrections').props.onClick());
+  expect(JSON.stringify(root!.toJSON())).toContain('refresh unavailable');
+  rejects = false;
+  await act(async () => button('Retry selected view refresh').props.onClick());
+  expect(changed).toBe(2);
+  expect(calls.filter(([name]) => name === 'select_transcript_version')).toHaveLength(1);
+ });

@@ -48,6 +48,16 @@ pub async fn current(
         .collect())
 }
 
+async fn speaker_links(conn: &mut SqliteConnection, meeting: &str) -> Result<String, String> {
+    let links: Vec<(String, String)> =
+        sqlx::query_as("SELECT person_id,speaker_label FROM person_speakers WHERE meeting_id = ?")
+            .bind(meeting)
+            .fetch_all(conn)
+            .await
+            .map_err(|e| e.to_string())?;
+    serde_json::to_string(&links).map_err(|e| e.to_string())
+}
+
 pub async fn ensure(conn: &mut SqliteConnection, meeting: &str) -> Result<(), String> {
     let selected: Option<String> =
         sqlx::query_scalar("SELECT version_id FROM transcript_selection WHERE meeting_id = ?")
@@ -60,8 +70,9 @@ pub async fn ensure(conn: &mut SqliteConnection, meeting: &str) -> Result<(), St
     }
     let segments = current(conn, meeting).await?;
     let id = Uuid::new_v4().to_string();
-    sqlx::query("INSERT INTO transcript_versions(id, meeting_id, kind, status, created_at, segments_json) VALUES (?, ?, 'live', 'ready', ?, ?)")
-        .bind(&id).bind(meeting).bind(chrono::Utc::now().to_rfc3339()).bind(serde_json::to_string(&segments).map_err(|e| e.to_string())?)
+    let links = speaker_links(conn, meeting).await?;
+    sqlx::query("INSERT INTO transcript_versions(id, meeting_id, kind, status, created_at, segments_json, speaker_links_json) VALUES (?, ?, 'live', 'ready', ?, ?, ?)")
+        .bind(&id).bind(meeting).bind(chrono::Utc::now().to_rfc3339()).bind(serde_json::to_string(&segments).map_err(|e| e.to_string())?).bind(links)
         .execute(&mut *conn).await.map_err(|e| e.to_string())?;
     sqlx::query("INSERT INTO transcript_selection(meeting_id, version_id) VALUES (?, ?)")
         .bind(meeting)
@@ -251,24 +262,93 @@ pub async fn select(
     if changed != 1 {
         return Err("Transcript changed in another operation. Refresh versions and review again; nothing was replaced.".into());
     }
-    let json: String = sqlx::query_scalar("SELECT segments_json FROM transcript_versions WHERE id = ? AND meeting_id = ? AND status = 'ready'")
+    let (json, saved_links): (String, Option<String>) = sqlx::query_as("SELECT segments_json,speaker_links_json FROM transcript_versions WHERE id = ? AND meeting_id = ? AND status = 'ready'")
         .bind(version).bind(meeting).fetch_one(&mut *tx).await.map_err(|e| e.to_string())?;
     let target: Vec<TranscriptSegment> = serde_json::from_str(&json).map_err(|e| e.to_string())?;
-    checkpoint(&mut tx, meeting, true).await?;
+    // A pre-migration baseline may not have its own mapping, but an exact
+    // checkpoint made when leaving it can still preserve its curated identity.
+    let historical_links: Vec<String> = if saved_links.is_none() {
+        sqlx::query_scalar("SELECT speaker_links_json FROM transcript_versions WHERE meeting_id=? AND parent_id=? AND kind='corrections' AND speaker_links_json IS NOT NULL ORDER BY created_at DESC,id DESC")
+            .bind(meeting).bind(version).fetch_all(&mut *tx).await.map_err(|e| e.to_string())?
+    } else {
+        Vec::new()
+    };
+    let current_links = speaker_links(&mut tx, meeting).await?;
+    let checkpoint_id = checkpoint(&mut tx, meeting, true).await?;
+    // Capture the source before deleting canonical rows. Existing audio_time is
+    // authoritative; older tasks can recover it from their still-present row.
+    sqlx::query("INSERT OR IGNORE INTO action_item_transcript_sources(action_id,version_id,transcript_id,audio_time) SELECT a.id,?,a.transcript_id,COALESCE(a.audio_time,t.audio_start_time) FROM action_items a LEFT JOIN transcripts t ON t.id=a.transcript_id AND t.meeting_id=a.meeting_id WHERE a.meeting_id=?")
+        .bind(&checkpoint_id).bind(meeting).execute(&mut *tx).await.map_err(|e| e.to_string())?;
+    sqlx::query("UPDATE action_items SET audio_time=COALESCE(audio_time,(SELECT audio_time FROM action_item_transcript_sources WHERE action_id=action_items.id)) WHERE meeting_id=?")
+        .bind(meeting).execute(&mut *tx).await.map_err(|e| e.to_string())?;
     sqlx::query("DELETE FROM transcripts WHERE meeting_id = ?")
         .bind(meeting)
         .execute(&mut *tx)
         .await
         .map_err(|e| e.to_string())?;
-    for s in target {
+    for s in &target {
         sqlx::query("INSERT INTO transcripts(id, meeting_id, transcript, timestamp, audio_start_time, audio_end_time, duration, speaker) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
-            .bind(s.id).bind(meeting).bind(s.text).bind(s.timestamp).bind(s.audio_start_time).bind(s.audio_end_time).bind(s.duration).bind(s.speaker)
+            .bind(&s.id).bind(meeting).bind(&s.text).bind(&s.timestamp).bind(s.audio_start_time).bind(s.audio_end_time).bind(s.duration).bind(&s.speaker)
             .execute(&mut *tx).await.map_err(|e| e.to_string())?;
     }
-    sqlx::query("DELETE FROM person_speakers WHERE meeting_id = ? AND speaker_label NOT IN (SELECT DISTINCT speaker FROM transcripts WHERE meeting_id = ? AND speaker IS NOT NULL)")
-        .bind(meeting).bind(meeting).execute(&mut *tx).await.map_err(|e| e.to_string())?;
-    sqlx::query("INSERT OR IGNORE INTO person_speakers(person_id, meeting_id, speaker_label) SELECT DISTINCT p.id, t.meeting_id, t.speaker FROM transcripts t JOIN people p ON p.display_name = t.speaker WHERE t.meeting_id = ?")
+    // Prefer the original exact anchor when restoring; otherwise use only a
+    // segment containing the saved source time. Gaps fall back to audio/meeting.
+    sqlx::query("UPDATE action_items SET transcript_id=COALESCE((SELECT t.id FROM action_item_transcript_sources a JOIN transcripts t ON t.id=a.transcript_id AND t.meeting_id=action_items.meeting_id WHERE a.action_id=action_items.id),(SELECT t.id FROM transcripts t WHERE t.meeting_id=action_items.meeting_id AND t.audio_start_time<=action_items.audio_time AND t.audio_end_time>action_items.audio_time ORDER BY t.audio_start_time DESC,t.id LIMIT 1)) WHERE meeting_id=?")
         .bind(meeting).execute(&mut *tx).await.map_err(|e| e.to_string())?;
+    sqlx::query("DELETE FROM person_speakers WHERE meeting_id = ?")
+        .bind(meeting)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+    // Snapshot links win, including curated associations whose display name is
+    // unrelated. Older snapshots reuse surviving current label associations.
+    let mut links: Vec<(String, String)> = if let Some(saved) = saved_links {
+        serde_json::from_str(&saved).map_err(|e| e.to_string())?
+    } else {
+        let mut preserved = Vec::new();
+        for history in historical_links {
+            preserved.extend(
+                serde_json::from_str::<Vec<(String, String)>>(&history)
+                    .map_err(|e| e.to_string())?,
+            );
+        }
+        preserved.extend(
+            serde_json::from_str::<Vec<(String, String)>>(&current_links)
+                .map_err(|e| e.to_string())?,
+        );
+        preserved
+    };
+    // The most recent explicit mapping for a spelling wins; unrelated older
+    // labels remain recoverable for legacy baselines without their own mapping.
+    let mut known_labels = std::collections::HashSet::new();
+    links.retain(|(_, label)| known_labels.insert(label.clone()));
+    for label in target.iter().filter_map(|s| s.speaker.as_deref()) {
+        let exact = links.iter().find(|(_, source)| source == label);
+        let normalized: Vec<_> = links
+            .iter()
+            .filter(|(_, source)| {
+                crate::database::repositories::speaker_identity::normalize_person_name(source)
+                    == crate::database::repositories::speaker_identity::normalize_person_name(label)
+            })
+            .collect();
+        let mapping = exact.or_else(|| {
+            normalized
+                .first()
+                .copied()
+                .filter(|first| normalized.iter().all(|link| link.0 == first.0))
+        });
+        if let Some((person, _)) = mapping {
+            sqlx::query("INSERT OR IGNORE INTO person_speakers(person_id,meeting_id,speaker_label) SELECT id,?,? FROM people WHERE id=?")
+                .bind(meeting).bind(label).bind(person).execute(&mut *tx).await.map_err(|e| e.to_string())?;
+        }
+        if crate::database::repositories::speaker_identity::is_person_name(label) {
+            crate::database::repositories::speaker_identity::ensure_label_identity(
+                &mut tx, meeting, label,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        }
+    }
     sqlx::query("UPDATE transcript_selection SET version_id = ? WHERE meeting_id = ?")
         .bind(version)
         .bind(meeting)
@@ -300,7 +380,7 @@ async fn checkpoint(
     conn: &mut SqliteConnection,
     meeting: &str,
     clear_derived: bool,
-) -> Result<(), String> {
+) -> Result<String, String> {
     let pending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM summary_processes WHERE meeting_id = ? AND status NOT IN ('completed', 'failed', 'cancelled', 'error')")
         .bind(meeting).fetch_one(&mut *conn).await.map_err(|e| e.to_string())?;
     if clear_derived && pending > 0 {
@@ -311,10 +391,12 @@ async fn checkpoint(
     let summary: Option<String> = sqlx::query_scalar("SELECT json_object('result', result, 'result_backup', result_backup, 'user_edited', user_edited) FROM summary_processes WHERE meeting_id = ?")
         .bind(meeting).fetch_optional(&mut *conn).await.map_err(|e| e.to_string())?;
     let old = current(conn, meeting).await?;
+    let links = speaker_links(conn, meeting).await?;
+    let checkpoint_id = Uuid::new_v4().to_string();
     // Always checkpoint the editable projection, even when edits came from a
     // legacy writer. Never mutate the immutable live/refined baseline.
-    sqlx::query("INSERT INTO transcript_versions(id, meeting_id, kind, status, created_at, parent_id, segments_json, summary_json, settings_json) SELECT ?, ?, 'corrections', 'ready', ?, s.version_id, ?, ?, v.settings_json FROM transcript_selection s JOIN transcript_versions v ON v.id = s.version_id WHERE s.meeting_id = ?")
-        .bind(Uuid::new_v4().to_string()).bind(meeting).bind(chrono::Utc::now().to_rfc3339()).bind(serde_json::to_string(&old).map_err(|e| e.to_string())?).bind(summary).bind(meeting)
+    sqlx::query("INSERT INTO transcript_versions(id, meeting_id, kind, status, created_at, parent_id, segments_json, summary_json, settings_json, speaker_links_json) SELECT ?, ?, 'corrections', 'ready', ?, s.version_id, ?, ?, v.settings_json, ? FROM transcript_selection s JOIN transcript_versions v ON v.id = s.version_id WHERE s.meeting_id = ?")
+        .bind(&checkpoint_id).bind(meeting).bind(chrono::Utc::now().to_rfc3339()).bind(serde_json::to_string(&old).map_err(|e| e.to_string())?).bind(summary).bind(links).bind(meeting)
         .execute(&mut *conn).await.map_err(|e| e.to_string())?;
     if clear_derived {
         sqlx::query("DELETE FROM transcript_chunks WHERE meeting_id = ?")
@@ -328,7 +410,7 @@ async fn checkpoint(
             .await
             .map_err(|e| e.to_string())?;
     }
-    Ok(())
+    Ok(checkpoint_id)
 }
 
 #[derive(Serialize)]
@@ -424,10 +506,16 @@ mod tests {
         pool
     }
     async fn initialize_fixture(pool: &SqlitePool) {
-        sqlx::raw_sql("CREATE TABLE meetings(id TEXT PRIMARY KEY, folder_path TEXT); CREATE TABLE transcripts(id TEXT PRIMARY KEY, meeting_id TEXT, transcript TEXT, timestamp TEXT, audio_start_time REAL, audio_end_time REAL, duration REAL, speaker TEXT); CREATE TABLE people(id TEXT PRIMARY KEY, display_name TEXT); CREATE TABLE person_speakers(person_id TEXT, meeting_id TEXT, speaker_label TEXT, UNIQUE(meeting_id, speaker_label)); CREATE TABLE transcript_chunks(meeting_id TEXT); CREATE TABLE summary_processes(meeting_id TEXT, status TEXT, result TEXT, result_backup TEXT, user_edited INTEGER); INSERT INTO meetings VALUES ('m', NULL); INSERT INTO meetings VALUES ('other', NULL); INSERT INTO transcripts VALUES ('live-row', 'm', 'RU/EN original API', '2026-11-18T10:00:01Z', 1, 2, 1, 'You');")
+        sqlx::raw_sql("CREATE TABLE meetings(id TEXT PRIMARY KEY, folder_path TEXT); CREATE TABLE transcripts(id TEXT PRIMARY KEY, meeting_id TEXT, transcript TEXT, timestamp TEXT, audio_start_time REAL, audio_end_time REAL, duration REAL, speaker TEXT); CREATE TABLE people(id TEXT PRIMARY KEY, display_name TEXT, normalized_name TEXT, notes TEXT, created_at TEXT, updated_at TEXT); CREATE TABLE action_items(id TEXT PRIMARY KEY, meeting_id TEXT, transcript_id TEXT, audio_time REAL, text TEXT, done INTEGER, edited INTEGER); CREATE TABLE person_speakers(person_id TEXT, meeting_id TEXT, speaker_label TEXT, UNIQUE(meeting_id, speaker_label)); CREATE TABLE transcript_chunks(meeting_id TEXT); CREATE TABLE summary_processes(meeting_id TEXT, status TEXT, result TEXT, result_backup TEXT, user_edited INTEGER); INSERT INTO meetings VALUES ('m', NULL); INSERT INTO meetings VALUES ('other', NULL); INSERT INTO transcripts VALUES ('live-row', 'm', 'RU/EN original API', '2026-11-18T10:00:01Z', 1, 2, 1, 'You');")
             .execute(pool).await.unwrap();
         sqlx::raw_sql(include_str!(
             "../../migrations/20261118001400_transcript_versions.sql"
+        ))
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::raw_sql(include_str!(
+            "../../migrations/20261118001401_transcript_version_references.sql"
         ))
         .execute(pool)
         .await
@@ -867,6 +955,147 @@ mod tests {
         assert_eq!(
             list(&pool, "m").await.unwrap().selected_id,
             current.version_id
+        );
+    }
+    #[tokio::test]
+    async fn r1_selection_reconciles_normalized_names_and_restores_curated_links() {
+        let pool = pool().await;
+        sqlx::raw_sql("INSERT INTO people(id,display_name) VALUES ('alice-person','Alice'), ('curated','Different Display Name'); INSERT INTO person_speakers VALUES ('curated','m','You');").execute(&pool).await.unwrap();
+        let initial = list(&pool, "m").await.unwrap();
+        // Model a version created before the additive association migration.
+        sqlx::query("UPDATE transcript_versions SET speaker_links_json=NULL WHERE id=?")
+            .bind(&initial.selected_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let candidate = begin(&pool, "m", &serde_json::json!({})).await.unwrap();
+        finish(&pool, &candidate, &[segment("new", "new words", "alice")])
+            .await
+            .unwrap();
+        set_status(&pool, &candidate, "ready", None).await.unwrap();
+        select(&pool, "m", &candidate, initial.revision)
+            .await
+            .unwrap();
+        let owner: Option<String> =
+            sqlx::query_scalar("SELECT person_id FROM person_speakers WHERE speaker_label='alice'")
+                .fetch_optional(&pool)
+                .await
+                .unwrap();
+        assert_eq!(owner.as_deref(), Some("alice-person"));
+        select(
+            &pool,
+            "m",
+            &initial.selected_id,
+            list(&pool, "m").await.unwrap().revision,
+        )
+        .await
+        .unwrap();
+        let owner: Option<String> =
+            sqlx::query_scalar("SELECT person_id FROM person_speakers WHERE speaker_label='You'")
+                .fetch_optional(&pool)
+                .await
+                .unwrap();
+        assert_eq!(owner.as_deref(), Some("curated"));
+    }
+    #[tokio::test]
+    async fn r1_selection_preserves_tasks_and_resolves_source_after_resegmentation() {
+        let pool = pool().await;
+        sqlx::raw_sql("INSERT INTO action_items VALUES ('task','m','live-row',NULL,'curated task',1,1),('absent','m','missing-row',NULL,'no anchor',0,1);").execute(&pool).await.unwrap();
+        let initial = list(&pool, "m").await.unwrap();
+        let candidate = ready(&pool).await;
+        select(&pool, "m", &candidate, initial.revision)
+            .await
+            .unwrap();
+        let anchor: (Option<String>, Option<f64>, String, i64, i64) = sqlx::query_as(
+            "SELECT transcript_id,audio_time,text,done,edited FROM action_items WHERE id='task'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            anchor,
+            (
+                Some("refined-row".into()),
+                Some(1.0),
+                "curated task".into(),
+                1,
+                1
+            )
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, Option<String>>(
+                "SELECT transcript_id FROM action_items WHERE id='absent'"
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            None
+        );
+        select(
+            &pool,
+            "m",
+            &initial.selected_id,
+            list(&pool, "m").await.unwrap().revision,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, Option<String>>(
+                "SELECT transcript_id FROM action_items WHERE id='task'"
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            Some("live-row".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn r1_task_gaps_fall_back_to_audio_and_selection_failure_rolls_back_references() {
+        let pool = pool().await;
+        sqlx::query("INSERT INTO action_items VALUES ('task','m','live-row',9,'keep task',1,1)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let candidate = ready(&pool).await;
+        let state = list(&pool, "m").await.unwrap();
+        sqlx::raw_sql("CREATE TRIGGER fail_selection BEFORE UPDATE OF version_id ON transcript_selection BEGIN SELECT RAISE(ABORT,'synthetic reference failure'); END;").execute(&pool).await.unwrap();
+        assert!(select(&pool, "m", &candidate, state.revision)
+            .await
+            .is_err());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM action_item_transcript_sources")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT transcript_id FROM action_items WHERE id='task'"
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            "live-row"
+        );
+        sqlx::raw_sql("DROP TRIGGER fail_selection")
+            .execute(&pool)
+            .await
+            .unwrap();
+        select(&pool, "m", &candidate, state.revision)
+            .await
+            .unwrap();
+        let anchor: (Option<String>, Option<f64>) =
+            sqlx::query_as("SELECT transcript_id,audio_time FROM action_items WHERE id='task'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(anchor, (None, Some(9.0)));
+        let source:(String,Option<String>)=sqlx::query_as("SELECT version_id,transcript_id FROM action_item_transcript_sources WHERE action_id='task'").fetch_one(&pool).await.unwrap();
+        assert_eq!(
+            segments(&pool, "m", &source.0).await.unwrap()[0].id,
+            source.1.unwrap()
         );
     }
 }
