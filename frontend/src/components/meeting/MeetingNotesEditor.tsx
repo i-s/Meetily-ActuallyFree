@@ -2,7 +2,7 @@
 
 import { useEffect, useState, useSyncExternalStore } from 'react';
 import { NotesEditor } from '@/components/editor/NotesEditor';
-import { editNotes, flushNotes, getNotesSnapshot, loadNotes, readNotesDocument, saveReviewedNotes, subscribeNotes, type NotesDocument } from '@/lib/notes-store';
+import { editNotes, flushNotes, getNotesSnapshot, loadNotes, readNotesDocument, recoverNotesDraft, saveReviewedNotes, subscribeNotes, type NotesDocument } from '@/lib/notes-store';
 
 /** Shared by the normal live panel and library detail view. Keep ASR updates
  * outside this document's ownership: they must never remount its editor. */
@@ -46,6 +46,11 @@ export function MeetingNotesEditor({ target }: { target: string }) {
           void saveReviewedNotes(target, review.revision).then(() => setReview(null)).catch(error => setReviewError(String(error)));
         }}>Replace reviewed version with my draft</button>
       </div>}
+      {snapshot.recoveryDrafts?.map(draft => <div key={draft.key} className="mb-3 rounded border border-af-border p-3 text-xs">
+        <p>Retained recovery draft</p>
+        <pre className="my-2 max-h-40 overflow-auto whitespace-pre-wrap">{draft.converting ? JSON.stringify(draft.content.json, null, 2) : draft.content.markdown}</pre>
+        <button type="button" className="underline" onClick={() => { void recoverNotesDraft(target, draft.key); }}>Open this draft (retain the others)</button>
+      </div>)}
       {snapshot.loaded && <NotesEditor
         key={`${target}:${retry}`}
         initialBlocks={snapshot.content.json}

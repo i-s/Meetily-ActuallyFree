@@ -7,172 +7,236 @@ export interface NotesSnapshot {
   content: NotesContent;
   state: 'loading' | 'saved' | 'pending' | 'saving' | 'error';
   error: string | null;
+  recoveryDrafts?: Array<{ key: string; content: NotesContent; converting: boolean }>;
+}
+interface DraftRef { key: string; raw?: string; legacy?: boolean }
+interface Draft {
+  target: string;
+  content: NotesContent;
+  revision: number;
+  converting: boolean;
+  supersedes?: DraftRef[];
 }
 interface Entry {
   snapshot: NotesSnapshot;
   revision: number;
   generation: number;
   dirty: boolean;
-  draftAlias?: string;
-  draftAliasRaw?: string;
+  journal?: DraftRef;
+  sources: DraftRef[];
   converting: boolean;
   timer?: ReturnType<typeof setTimeout>;
   loading?: Promise<void>;
   saving?: Promise<void>;
   listeners: Set<() => void>;
 }
-const entries = new Map<string, Entry>();
-const draftKey = (target: string) => `af-notes-v1:${target}`;
+const draftPrefix = (target: string) => `af-notes-v2:draft:${encodeURIComponent(target)}:`;
+const receiptPrefix = (target: string) => `af-notes-v2:receipt:${encodeURIComponent(target)}:`;
+const legacyKey = (target: string) => `af-notes-v1:${target}`;
 const message = (e: unknown) => e instanceof Error ? e.message : String(e);
-function entryFor(target: string): Entry {
-  let entry = entries.get(target);
-  if (!entry) {
-    entry = { snapshot: { loaded: false, content: { markdown: '', json: null }, state: 'loading', error: null }, revision: 0, generation: 0, dirty: false, converting: false, listeners: new Set() };
-    entries.set(target, entry);
-  }
-  return entry;
-}
-function publish(entry: Entry, patch: Partial<NotesSnapshot>) {
-  entry.snapshot = { ...entry.snapshot, ...patch };
-  entry.listeners.forEach(fn => fn());
-}
-function journal(target: string, entry: Entry) {
-  // Synchronous JSON backup precedes async markdown conversion and IPC. Each
-  // session has a distinct key; a new recording never clears another draft.
-  localStorage.setItem(draftKey(target), JSON.stringify({ content: entry.snapshot.content, revision: entry.revision, converting: entry.converting, inheritedAlias: entry.draftAlias ? { target: entry.draftAlias, raw: entry.draftAliasRaw } : undefined }));
-  if (entry.draftAlias && localStorage.getItem(draftKey(entry.draftAlias)) === entry.draftAliasRaw) {
-    localStorage.removeItem(draftKey(entry.draftAlias));
-    entry.draftAlias = undefined;
-    entry.draftAliasRaw = undefined;
-  }
-}
-export const readNotesDocument = (target: string) => invoke<NotesDocument | null>('api_read_notes_document', { target });
-export const currentRecordingNotesTarget = async () => {
-  const folder = await invoke<string | null>('get_meeting_folder_path');
-  if (!folder) throw new Error('The recording has no durable Notes identity yet. Retry after recording starts.');
-  return `recording:${folder}`;
-};
-export const getNotesSnapshot = (target: string) => entryFor(target).snapshot;
-export function subscribeNotes(target: string, listener: () => void) {
-  const entry = entryFor(target);
-  entry.listeners.add(listener);
-  return () => { entry.listeners.delete(listener); };
-}
-export function loadNotes(target: string, refresh = false): Promise<void> {
-  const entry = entryFor(target);
-  // Transcript/version/summary refetches may ask for a refresh. The Notes
-  // document owns its dirty draft (including conversion and in-flight writes),
-  // not the projection being refreshed; never replace it with committed text.
-  if (entry.snapshot.loaded && (!refresh || entry.dirty || entry.saving)) return Promise.resolve();
-  if (entry.loading) return entry.loading;
-  publish(entry, { loaded: false, state: 'loading', error: null });
-  entry.loading = (async () => {
-    try {
-      const alias = target.startsWith('meeting:')
-        ? await invoke<string | null>('api_notes_recording_target', { meetingId: target.slice(8) }) : null;
-      if (alias && entries.has(alias)) await flushNotes(alias);
-      const stored = await readNotesDocument(target);
-      const own = localStorage.getItem(draftKey(target));
-      const aliasDraft = alias ? localStorage.getItem(draftKey(alias)) : null;
-      // Two independently edited journals require human reconciliation, never
-      // guessing which session's changes should replace the other.
-      if (own && aliasDraft) {
-        const inherited = JSON.parse(own).inheritedAlias;
-        if (inherited?.target !== alias || inherited?.raw !== aliasDraft) throw new Error('Two Notes recovery drafts exist. Reopen the recorder and copy its Notes before continuing.');
-      }
-      entry.draftAlias = aliasDraft ? alias! : undefined;
-      entry.draftAliasRaw = aliasDraft ?? undefined;
-      const raw = own || aliasDraft;
-      const draft = raw ? JSON.parse(raw) as { content: NotesContent; revision: number; converting: boolean } : null;
-      if (draft && (typeof draft.content?.markdown !== 'string' || !Number.isInteger(draft.revision))) throw new Error('Invalid Notes recovery draft. It has been retained.');
-      entry.revision = draft?.revision ?? stored?.revision ?? 0;
-      entry.dirty = !!draft;
-      entry.converting = !!draft?.converting;
-      publish(entry, { loaded: true, content: draft?.content ?? { markdown: stored?.markdown ?? '', json: stored?.json ?? null }, state: draft ? 'pending' : 'saved', error: null });
-      // The editor reconverts recovered exact JSON before any write or text read.
-      if (draft && !entry.converting) void flushNotes(target);
-    } catch (e) {
-      publish(entry, { state: 'error', error: message(e) });
-    } finally { entry.loading = undefined; }
-  })();
-  return entry.loading;
-}
 
-/** Exact editor JSON is journaled immediately; only the latest conversion wins. */
-export function editNotes(target: string, content: NotesContent, markdown: Promise<string>) {
-  const entry = entryFor(target);
-  const generation = ++entry.generation;
-  entry.dirty = true;
-  entry.converting = true;
-  publish(entry, { content, state: 'pending', error: null });
-  try { journal(target, entry); }
-  catch (e) { publish(entry, { state: 'error', error: `Recovery backup failed: ${message(e)}` }); }
-  void markdown.then(value => {
-    if (generation !== entry.generation) return;
-    entry.converting = false;
-    publish(entry, { content: { ...content, markdown: value }, state: 'pending' });
-    try { journal(target, entry); }
-    catch (e) { publish(entry, { state: 'error', error: `Recovery backup failed: ${message(e)}` }); }
-    clearTimeout(entry.timer);
-    entry.timer = setTimeout(() => void flushNotes(target), 400);
-  }).catch(e => {
-    if (generation === entry.generation) publish(entry, { state: 'error', error: message(e) });
-  });
-}
-
-/** One writer per identity, owned outside React; navigation does not cancel it. */
-export async function flushNotes(target: string): Promise<void> {
-  const entry = entryFor(target);
-  clearTimeout(entry.timer);
-  if (entry.saving) return entry.saving;
-  if (!entry.dirty || entry.converting || !entry.snapshot.loaded) return;
-  entry.saving = (async () => {
-    while (entry.dirty && !entry.converting) {
-      const generation = entry.generation;
-      const content = entry.snapshot.content;
-      publish(entry, { state: 'saving', error: null });
-      try {
-        const revision = await invoke<number>('api_write_notes_document', { target, ...content, expectedRevision: entry.revision });
-        entry.revision = revision;
-        if (generation === entry.generation) {
-          localStorage.removeItem(draftKey(target));
-          if (entry.draftAlias && localStorage.getItem(draftKey(entry.draftAlias)) === entry.draftAliasRaw) localStorage.removeItem(draftKey(entry.draftAlias));
-          entry.draftAlias = undefined;
-          entry.draftAliasRaw = undefined;
-          entry.dirty = false;
-          publish(entry, { state: 'saved', error: null });
-        } else {
-          journal(target, entry);
-        }
-      } catch (e) {
-        publish(entry, { state: 'error', error: message(e) });
-        break;
+/** One instance per WebView. Tests use independent instances sharing Storage and
+ * native transport, not a shared JS Map masquerading as independent editors. */
+export function createNotesStore(options: { invoke?: typeof invoke; storage?: Storage } = {}) {
+  const transport = options.invoke ?? invoke;
+  const storage = () => options.storage ?? localStorage;
+  const entries = new Map<string, Entry>();
+  function entryFor(target: string): Entry {
+    let entry = entries.get(target);
+    if (!entry) {
+      entry = { snapshot: { loaded: false, content: { markdown: '', json: null }, state: 'loading', error: null }, revision: 0, generation: 0, dirty: false, sources: [], converting: false, listeners: new Set() };
+      entries.set(target, entry);
+    }
+    return entry;
+  }
+  function publish(entry: Entry, patch: Partial<NotesSnapshot>) {
+    entry.snapshot = { ...entry.snapshot, ...patch };
+    entry.listeners.forEach(fn => fn());
+  }
+  function uniqueRefs(refs: DraftRef[]) {
+    return refs.filter((ref, index) => refs.findIndex(other => other.key === ref.key && other.raw === ref.raw) === index);
+  }
+  function journal(target: string, entry: Entry) {
+    const previous = entry.journal;
+    const supersedes = uniqueRefs([...entry.sources, ...(previous ? [previous] : [])]);
+    const raw = JSON.stringify({ target, content: entry.snapshot.content, revision: entry.revision, converting: entry.converting, supersedes } satisfies Draft);
+    // Immutable, unguessably unique key per snapshot, never overwritten by this
+    // or any other writer. No getItem/removeItem compare-and-delete is assumed.
+    const key = `${draftPrefix(target)}${crypto.randomUUID()}`;
+    storage().setItem(key, raw);
+    entry.journal = { key };
+    // Only this instance creates previous.key. A crash between set and remove
+    // leaves two snapshots, linked by supersedes for deterministic recovery.
+    if (previous) storage().removeItem(previous.key);
+  }
+  function retire(refs: DraftRef[]) {
+    for (const ref of uniqueRefs(refs)) {
+      if (ref.legacy) {
+        // v1 keys are mutable across old WebViews. Keep them untouched and write
+        // an immutable exact-value receipt: B may replace the key between any
+        // read and remove. A different raw value is never covered by this receipt.
+        storage().setItem(`${receiptPrefix(ref.key.slice('af-notes-v1:'.length))}${crypto.randomUUID()}`, JSON.stringify(ref));
+      } else {
+        // v2 keys are immutable. A concurrent writer uses another key even if
+        // they edit the same target or recover this snapshot.
+        storage().removeItem(ref.key);
       }
     }
-  })().finally(() => { entry.saving = undefined; });
-  return entry.saving;
+  }
+  function recoveryCandidates(targets: string[]) {
+    const candidates: Array<{ ref: DraftRef; draft: Draft }> = [];
+    const receipts: DraftRef[] = [];
+    const keys = Array.from({ length: storage().length }, (_, index) => storage().key(index)).filter((key): key is string => key !== null);
+    for (const target of targets) {
+      const raw = storage().getItem(legacyKey(target));
+      if (raw) {
+        const draft = JSON.parse(raw);
+        const inherited = draft.inheritedAlias;
+        candidates.push({ ref: { key: legacyKey(target), raw, legacy: true }, draft: { ...draft, target, supersedes: inherited ? [{ key: legacyKey(inherited.target), raw: inherited.raw, legacy: true }] : [] } });
+      }
+    }
+    for (const key of keys) {
+      const target = targets.find(target => key.startsWith(draftPrefix(target)) || key.startsWith(receiptPrefix(target)));
+      if (!target) continue;
+      const raw = storage().getItem(key);
+      if (raw === null) continue;
+      if (key.startsWith(receiptPrefix(target))) receipts.push(JSON.parse(raw));
+      else {
+        const draft = JSON.parse(raw) as Draft;
+        if (draft.target !== target) throw new Error('Invalid Notes recovery identity. Draft retained.');
+        candidates.push({ ref: { key }, draft });
+      }
+    }
+    for (const { draft } of candidates) {
+      if (typeof draft.content?.markdown !== 'string' || !(draft.content.json === null || Array.isArray(draft.content.json)) || !Number.isSafeInteger(draft.revision) || draft.revision < 0) throw new Error('Invalid Notes recovery draft. It has been retained.');
+    }
+    const superseded = [...receipts, ...candidates.flatMap(({ draft }) => draft.supersedes ?? [])];
+    return candidates.filter(({ ref }) => !superseded.some(other => other.key === ref.key && other.raw === ref.raw));
+  }
+  const readNotesDocument = (target: string) => transport<NotesDocument | null>('api_read_notes_document', { target });
+  const currentRecordingNotesTarget = async () => {
+    const folder = await transport<string | null>('get_meeting_folder_path');
+    if (!folder) throw new Error('The recording has no durable Notes identity yet. Retry after recording starts.');
+    return `recording:${folder}`;
+  };
+  const getNotesSnapshot = (target: string) => entryFor(target).snapshot;
+  function subscribeNotes(target: string, listener: () => void) {
+    const entry = entryFor(target);
+    entry.listeners.add(listener);
+    return () => { entry.listeners.delete(listener); };
+  }
+  function loadNotes(target: string, refresh = false, recoveryKey?: string): Promise<void> {
+    const entry = entryFor(target);
+    // Transcript/version/summary refetches do not own dirty Notes, including
+    // conversions and native writes still in flight.
+    if (entry.snapshot.loaded && (!refresh || entry.dirty || entry.saving)) return Promise.resolve();
+    if (entry.loading) return entry.loading;
+    publish(entry, { loaded: false, state: 'loading', error: null, recoveryDrafts: undefined });
+    entry.loading = (async () => {
+      try {
+        const alias = target.startsWith('meeting:')
+          ? await transport<string | null>('api_notes_recording_target', { meetingId: target.slice(8) }) : null;
+        if (alias && entries.has(alias)) await flushNotes(alias);
+        const stored = await readNotesDocument(target);
+        const candidates = recoveryCandidates(alias ? [target, alias] : [target]);
+        if (candidates.length > 1 && !recoveryKey) {
+          publish(entry, { state: 'error', error: 'Multiple Notes recovery drafts exist. Review and choose a draft; other drafts will be retained.', recoveryDrafts: candidates.map(({ ref, draft }) => ({ key: ref.key, content: draft.content, converting: draft.converting })) });
+          return;
+        }
+        const selected = recoveryKey ? candidates.find(({ ref }) => ref.key === recoveryKey) : candidates[0];
+        if (recoveryKey && !selected) throw new Error('The selected Notes draft changed. Reload the recovery choices.');
+        entry.revision = selected?.draft.revision ?? stored?.revision ?? 0;
+        entry.dirty = !!selected;
+        entry.converting = !!selected?.draft.converting;
+        entry.sources = selected ? [selected.ref, ...(selected.draft.supersedes ?? [])] : [];
+        entry.snapshot = { ...entry.snapshot, content: selected?.draft.content ?? { markdown: stored?.markdown ?? '', json: stored?.json ?? null } };
+        if (selected) journal(target, entry);
+        publish(entry, { loaded: true, state: selected ? 'pending' : 'saved', error: null, recoveryDrafts: undefined });
+        if (selected && !entry.converting) void flushNotes(target);
+      } catch (e) {
+        publish(entry, { state: 'error', error: message(e) });
+      } finally { entry.loading = undefined; }
+    })();
+    return entry.loading;
+  }
+  const recoverNotesDraft = (target: string, key: string) => loadNotes(target, true, key);
+
+  /** Exact editor JSON is journaled before asynchronous conversion starts. */
+  function editNotes(target: string, content: NotesContent, markdown: Promise<string>) {
+    const entry = entryFor(target);
+    const generation = ++entry.generation;
+    entry.dirty = true;
+    entry.converting = true;
+    publish(entry, { content: structuredClone(content), state: 'pending', error: null });
+    try { journal(target, entry); }
+    catch (e) { publish(entry, { state: 'error', error: `Recovery backup failed: ${message(e)}` }); }
+    void markdown.then(value => {
+      if (generation !== entry.generation) return;
+      entry.converting = false;
+      publish(entry, { content: { ...entry.snapshot.content, markdown: value }, state: 'pending' });
+      try { journal(target, entry); }
+      catch (e) { publish(entry, { state: 'error', error: `Recovery backup failed: ${message(e)}` }); }
+      clearTimeout(entry.timer);
+      entry.timer = setTimeout(() => void flushNotes(target), 400);
+    }).catch(e => {
+      if (generation === entry.generation) publish(entry, { state: 'error', error: message(e) });
+    });
+  }
+
+  /** One writer per target in this WebView; SQLite revisions arbitrate others. */
+  async function flushNotes(target: string): Promise<void> {
+    const entry = entryFor(target);
+    clearTimeout(entry.timer);
+    if (entry.saving) return entry.saving;
+    if (!entry.dirty || entry.converting || !entry.snapshot.loaded) return;
+    entry.saving = (async () => {
+      while (entry.dirty && !entry.converting) {
+        const generation = entry.generation;
+        const content = entry.snapshot.content;
+        publish(entry, { state: 'saving', error: null });
+        try {
+          const revision = await transport<number>('api_write_notes_document', { target, ...content, expectedRevision: entry.revision });
+          entry.revision = revision;
+          if (generation === entry.generation) {
+            retire([...entry.sources, ...(entry.journal ? [entry.journal] : [])]);
+            entry.sources = [];
+            entry.journal = undefined;
+            entry.dirty = false;
+            publish(entry, { state: 'saved', error: null });
+          } else journal(target, entry);
+        } catch (e) {
+          publish(entry, { state: 'error', error: message(e) });
+          break;
+        }
+      }
+    })().finally(() => { entry.saving = undefined; });
+    return entry.saving;
+  }
+  async function saveReviewedNotes(target: string, reviewedRevision: number) {
+    const entry = entryFor(target);
+    if (!entry.snapshot.loaded || entry.converting) throw new Error('Notes conversion is still pending. Retry shortly.');
+    entry.revision = reviewedRevision;
+    entry.dirty = true;
+    journal(target, entry);
+    await flushNotes(target);
+    if (entry.snapshot.error) throw new Error(entry.snapshot.error);
+  }
+
+  /** Read boundary for #13/#15/#18: return one immutable committed document,
+   * never the current editor JSON paired with an earlier native read. */
+  async function notesForContext(target: string): Promise<NotesDocument & { source: 'user_notes' }> {
+    await loadNotes(target);
+    await flushNotes(target);
+    const entry = entryFor(target);
+    const generation = entry.generation;
+    const revision = entry.revision;
+    if (!entry.snapshot.loaded || entry.dirty || entry.converting || entry.snapshot.error) throw new Error(entry.snapshot.error || 'Notes are still being saved. Retry shortly.');
+    const committed = structuredClone(await readNotesDocument(target));
+    if (entries.get(target) !== entry || entry.generation !== generation || entry.revision !== revision || !entry.snapshot.loaded || entry.dirty || entry.converting || entry.snapshot.error) throw new Error('Notes changed or are pending while context was loading. Retry shortly.');
+    if ((committed?.revision ?? 0) !== revision) throw new Error('Notes changed in another editor. Reopen Notes before preparing context.');
+    return { markdown: committed?.markdown ?? '', json: committed?.json ?? null, revision, updatedAt: committed?.updatedAt, source: 'user_notes' };
+  }
+  return { readNotesDocument, currentRecordingNotesTarget, getNotesSnapshot, subscribeNotes, loadNotes, recoverNotesDraft, editNotes, flushNotes, saveReviewedNotes, notesForContext };
 }
 
-/** Explicit conflict resolution only: the UI shows the saved text first. The
- * reviewed revision still has to match, so another save cannot be overwritten. */
-export async function saveReviewedNotes(target: string, reviewedRevision: number) {
-  const entry = entryFor(target);
-  if (!entry.snapshot.loaded || entry.converting) throw new Error('Notes conversion is still pending. Retry shortly.');
-  entry.revision = reviewedRevision;
-  entry.dirty = true;
-  journal(target, entry);
-  await flushNotes(target);
-  if (entry.snapshot.error) throw new Error(entry.snapshot.error);
-}
-
-/** Read boundary for #13/#15/#18. Never silently return stale markdown while
- * conversion or saving failed. Native consumers can use the revisioned reader. */
-export async function notesForContext(target: string): Promise<NotesDocument & { source: 'user_notes' }> {
-  await loadNotes(target);
-  await flushNotes(target);
-  const entry = entryFor(target);
-  if (!entry.snapshot.loaded || entry.dirty || entry.converting || entry.snapshot.error) throw new Error(entry.snapshot.error || 'Notes are still being saved. Retry shortly.');
-  const committed = await readNotesDocument(target);
-  if ((committed?.revision ?? 0) !== entry.revision) throw new Error('Notes changed in another editor. Reopen Notes before preparing context.');
-  return { ...entry.snapshot.content, revision: entry.revision, source: 'user_notes' };
-}
+export const { readNotesDocument, currentRecordingNotesTarget, getNotesSnapshot, subscribeNotes, loadNotes, recoverNotesDraft, editNotes, flushNotes, saveReviewedNotes, notesForContext } = createNotesStore();

@@ -5,6 +5,8 @@ import { expect, mock, test } from 'bun:test';
 const storage = new Map<string, string>();
 const events = new Map<string, () => void>();
 Object.assign(globalThis, { localStorage: {
+  get length() { return storage.size; },
+  key: (index: number) => [...storage.keys()][index] ?? null,
   getItem: (key: string) => storage.get(key) ?? null,
   setItem: (key: string, value: string) => storage.set(key, value),
   removeItem: (key: string) => storage.delete(key),
@@ -56,7 +58,7 @@ test('normal live Notes entrypoint survives incoming phrases and navigation, exp
   });
   await act(async () => { root.update(live([{ id: 'asr-1', text: 'New incoming phrase', timestamp: '00:01', speaker: 'You' }])); });
   expect(editorMounts).toBe(mounts);
-  expect(storage.get('af-notes-v1:recording:/synthetic/ui')).toContain('My idea, not speech');
+  expect([...storage.values()].join('\n')).toContain('My idea, not speech');
   await act(async () => { await flushNotes('recording:/synthetic/ui'); });
   expect(JSON.stringify(root.toJSON())).toContain('disk full');
   expect(root.root.findAllByType('button').some(button => button.children.includes('Retry'))).toBe(true);
@@ -91,7 +93,7 @@ test('library projection-only updates keep the dirty Notes editor mounted before
   await act(async () => { root.update(<Projection version="refined" transcript="refined phrase" summary="refetched summary" />); });
   await act(async () => { root.update(<Projection version="refined" transcript="corrected phrase" summary="summary refreshed again" />); });
   expect(editorMounts).toBe(mounts);
-  const journal = JSON.parse(storage.get('af-notes-v1:meeting:projection-ui')!);
+  const journal = JSON.parse([...storage].find(([key]) => key.startsWith(`af-notes-v2:draft:${encodeURIComponent('meeting:projection-ui')}:`))![1]);
   expect(journal.content.markdown).toBe(exact);
   expect(journal.content.json).toEqual([{ type: 'paragraph', content: exact }]);
   await act(async () => { await flushNotes('meeting:projection-ui'); });
@@ -100,5 +102,23 @@ test('library projection-only updates keep the dirty Notes editor mounted before
   await act(async () => { root.unmount(); });
   await act(async () => { root = create(<Projection version="refined" transcript="corrected phrase" summary="reopened summary" />); });
   expect(root.root.findByType('textarea').props.defaultValue).toBe(exact);
+  await act(async () => { root.unmount(); });
+});
+
+
+test('normal Notes recovery offers independent journals without silently choosing or deleting one', async () => {
+  saved = null;
+  storage.set('af-notes-v1:meeting:recovery-ui', JSON.stringify({ content: { markdown: 'draft A', json: [{ content: 'A exact' }] }, revision: 0, converting: true }));
+  storage.set('af-notes-v1:recording:/synthetic/ui', JSON.stringify({ content: { markdown: 'draft B', json: [{ content: 'B exact' }] }, revision: 0, converting: true }));
+  let root!: ReactTestRenderer;
+  await act(async () => { root = create(<MeetingNotesEditor target="meeting:recovery-ui" />); });
+  expect(root.root.findAllByType('textarea')).toHaveLength(0);
+  expect(JSON.stringify(root.toJSON())).toContain('Multiple Notes recovery drafts');
+  expect(JSON.stringify(root.toJSON())).toContain('B exact');
+  const choices = root.root.findAllByType('button').filter(button => button.children.includes('Open this draft (retain the others)'));
+  expect(choices).toHaveLength(2);
+  await act(async () => { choices[0].props.onClick(); });
+  expect(root.root.findByType('textarea').props.defaultValue).toBe('draft A');
+  expect(storage.get('af-notes-v1:recording:/synthetic/ui')).toContain('B exact');
   await act(async () => { root.unmount(); });
 });

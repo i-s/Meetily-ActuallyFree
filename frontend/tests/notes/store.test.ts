@@ -1,7 +1,14 @@
 import { expect, mock, test } from 'bun:test';
 
 const storage = new Map<string, string>();
+function draftFor(target: string) {
+  const prefix = `af-notes-v2:draft:${encodeURIComponent(target)}:`;
+  const raw = [...storage].find(([key]) => key.startsWith(prefix))?.[1];
+  return raw ? JSON.parse(raw) : null;
+}
 Object.assign(globalThis, { localStorage: {
+  get length() { return storage.size; },
+  key: (index: number) => [...storage.keys()][index] ?? null,
   getItem: (key: string) => storage.get(key) ?? null,
   setItem: (key: string, value: string) => storage.set(key, value),
   removeItem: (key: string) => storage.delete(key),
@@ -39,7 +46,7 @@ test('rapid conversions and an in-flight save cannot overwrite the newest edit',
   await store.loadNotes(target);
   let finishOld!: (value: string) => void;
   store.editNotes(target, content('old'), new Promise(resolve => { finishOld = resolve; }));
-  expect(storage.get(`af-notes-v1:${target}`)).toContain('old');
+  expect(draftFor(target).content.markdown).toBe('old');
   store.editNotes(target, content('new'), Promise.resolve('new'));
   await settle();
   finishOld('old');
@@ -52,7 +59,7 @@ test('rapid conversions and an in-flight save cannot overwrite the newest edit',
   hold = null; release(); await saving;
   expect(documents.get(target).markdown).toBe('newest');
   expect(store.getNotesSnapshot(target).state).toBe('saved');
-  expect(storage.has(`af-notes-v1:${target}`)).toBe(false);
+  expect(draftFor(target)).toBeNull();
 });
 
 test('failed writes retain draft and retry without needing another edit', async () => {
@@ -62,7 +69,7 @@ test('failed writes retain draft and retry without needing another edit', async 
   store.editNotes(target, content('keep this'), Promise.resolve('keep this')); await settle();
   await store.flushNotes(target);
   expect(store.getNotesSnapshot(target).state).toBe('error');
-  expect(storage.has(`af-notes-v1:${target}`)).toBe(true);
+  expect(draftFor(target)).not.toBeNull();
   await expect(store.notesForContext(target)).rejects.toThrow('disk unavailable');
   fail = false; await store.flushNotes(target);
   expect((await store.notesForContext(target)).markdown).toBe('keep this');
@@ -73,7 +80,8 @@ test('a fresh store entry recovers last keystrokes through meeting-folder alias 
   await store.loadNotes('meeting:recovered');
   await store.flushNotes('meeting:recovered');
   expect(documents.get('meeting:recovered').markdown).toBe('recovered');
-  expect(storage.has('af-notes-v1:recording:/synthetic/recovered')).toBe(false);
+  // Mutable v1 data is retained; an immutable exact-value receipt suppresses replay.
+  expect(storage.has('af-notes-v1:recording:/synthetic/recovered')).toBe(true);
 });
 
 test('interrupted conversion recovers JSON and blocks stale context until reconverted', async () => {
@@ -145,7 +153,7 @@ test('interrupted alias-journal migration can resume without discarding a newer 
   await store.loadNotes('meeting:alias-copy');
   await store.flushNotes('meeting:alias-copy');
   expect(documents.get('meeting:alias-copy').markdown).toBe('latest');
-  expect(storage.has(`af-notes-v1:${alias}`)).toBe(false);
+  expect(storage.has(`af-notes-v1:${alias}`)).toBe(true);
 });
 
 test('projection refetch cannot replace dirty Notes during conversion, debounce or a native save', async () => {
@@ -161,7 +169,7 @@ test('projection refetch cannot replace dirty Notes during conversion, debounce 
   await store.loadNotes(target, true);
   expect(store.getNotesSnapshot(target).content).toEqual(edited);
   expect(documents.get(target).markdown).toBe(original.markdown);
-  expect(JSON.parse(storage.get(`af-notes-v1:${target}`)!).content).toEqual(edited);
+  expect(draftFor(target).content).toEqual(edited);
   converted(edited.markdown); await settle();
   await store.loadNotes(target, true);
   expect(store.getNotesSnapshot(target).content).toEqual(edited);

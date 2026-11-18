@@ -51,13 +51,29 @@ retry does not replace post-call Notes. Late live writes resolve to the committe
 meeting row. Neither ASR segments nor summary generation writes these tables.
 Source audio/checkpoint cleanup does not remove Notes.
 
-Each edit is also journaled synchronously at `af-notes-v1:<target>` in localStorage,
-with exact JSON, last complete Markdown, base revision and conversion-pending
-flag. The native `api_notes_recording_target` lets a library view discover the
-last-keystroke recording journal after Stop, reload, app restart or recovery.
-A recovered incomplete conversion is redone before text is used for AI/export.
-Successful persistence removes only the journal that was actually consumed;
-another editor's newer alias journal is not deleted.
+Each edit is also journaled synchronously as an immutable snapshot under
+`af-notes-v2:draft:<encoded-target>:<randomUUID>` in localStorage, with exact JSON,
+last complete Markdown, base revision, conversion-pending flag and explicit
+supersession references. No two writers update the same journal key. Updating a
+local snapshot creates a new key before retiring the previous immutable key.
+A crash between these steps leaves linked snapshots, not a missing draft. The
+native `api_notes_recording_target` also discovers the recording target's journals
+after Stop, reload, app restart or recovery. A recovered incomplete conversion is
+redone before text is used for AI/export.
+
+Native acknowledgement only retires the writer's own immutable keys and the
+explicit snapshots consumed by recovery. It cannot erase another writer's newer
+same-target or recording-alias key, even when writes interleave with cleanup.
+Unrelated surviving journals are never picked by timestamp: the UI shows their
+exact contents and requires an explicit recovery choice, retaining the others.
+
+Existing mutable `af-notes-v1:<target>` journals remain recoverable. They are
+**never removed** by new code: localStorage has no atomic compare-and-delete, so
+even comparing raw values before removal would race an older WebView writer.
+After committing a legacy snapshot, an immutable exact-value receipt suppresses
+replay of only that key/raw pair. A concurrent different raw value remains
+recoverable. Legacy raw data and these receipts are intentionally retained;
+new v2 keys and consumed immutable snapshots are cleaned up after saving.
 
 The UI distinguishes Loading, Unsaved changes, Saving, Saved locally and errors.
 Failed drafts remain available, with Retry even without another edit. A revision
@@ -80,10 +96,13 @@ corruption. Pre-existing saved meeting Notes need no manual migration.
   the revision contract rather than overwrite an editor's snapshot.
 - `api_notes_recording_target(meetingId)` → optional recording target for the
   meeting's last-keystroke journal, including library/recovery transitions.
-- `notesForContext(target)` in `lib/notes-store.ts` → current
+- `notesForContext(target)` in `lib/notes-store.ts` → committed snapshot
   `{source: "user_notes", markdown, json, revision}` after flush. It rejects if
-  loading, conversion, persistence or conflict failed; it never silently feeds
-  stale Markdown. Long-running AI jobs should retain this immutable revisioned
+  loading, conversion, persistence or conflict failed. It captures target/entry,
+  generation and revision before the native read, rechecks them and dirty/error
+  state afterwards, then returns a detached clone of the committed native
+  document, not mutable editor JSON. An edit during that await is an explicit
+  pending/stale refusal, never uncommitted or mixed Markdown/JSON. Long-running AI jobs should retain this immutable revisioned
   snapshot, separate from transcript inputs, and label it as the user's thoughts,
   not proof of a participant's promise or meeting agreement.
 - Existing `getMeetingNotes` / `api_get_meeting_notes` readers remain compatible
@@ -188,3 +207,75 @@ Repeat with an in-flight Notes conversion/write and a storage failure followed
 by Retry. Use #14's real entrypoints in the combined regression, not a fabricated
 projection wrapper. App-restart physical execution remains the final combined
 Mac build gate; existing SQLite disk close/reopen evidence is not a substitute.
+
+
+## Issue #12 R1 — snapshot and cross-WebView cleanup races
+
+Both review findings were reproduced as actual failing tests before fixing them,
+not merely accepted from static inspection. With only a store factory extraction
+(no behavior fix), `tests/notes/r1-races.test.ts` failed all four initial cases:
+normal context read with a concurrent edit (conversion complete/pending), and
+independent A/B stores sharing Storage with a held A save (meeting/recording
+keys). A's acknowledgement removed B's only recovery journal. The red run is a
+local diagnostic, not a committed private artifact.
+
+The fix uses the committed-only context boundary and immutable journal protocol
+above. `createNotesStore({invoke, storage})` makes the actual store instantiable
+for the harness; production still has one default instance per JS realm. The
+shared-storage tests use independent stores, a real shared Storage-shaped map,
+held native responses and fresh instances simulating loss of all JS state.
+Additional checks interleave a new writer *inside* removeItem, replace a legacy
+journal while its receipt is written, test both same-target and recording-alias
+migration, retain independent recovery choices across restart, and verify a
+returned context snapshot cannot change with later editor mutations. The normal
+shared editor also renders those recovery choices and never silently selects an
+empty or arbitrary document.
+
+### R1 verification and pending export
+
+- Red: the initial four delayed-read/shared-storage repros all failed before
+  behavior fixes. Green: the extended race file passes all **9 tests**, including
+  immediately pending conversion, own/alias recovery, storage-call interleavings,
+  independent recovery choices and detached committed context snapshots.
+- Final full isolated frontend suite: **36/36 files passed**, including 11 store,
+  9 race, 3 shared-editor entrypoint and 1 production-editor Notes tests.
+- Final standalone TypeScript validation and `git diff --check`: **passed**.
+- Serialized portable native verification: **6 Notes tests and 15 recovery tests
+  passed**, including real on-disk close/reopen. Selections overlap; no new native
+  product change is made for R1. Fixtures are synthetic, not private audio.
+- Production export: **pending**, not a product-code failure. The R1 Next attempt
+  was stopped during compilation when host memory pressure became severe and a
+  separate #14 production build was found running. No successful production
+  export is claimed. The coordinator confirmed #14 owns the current build slot
+  and #12 follows; the next attempt is a single retry at the committed R1 SHA,
+  after explicit resumption, with `NODE_OPTIONS=--max-old-space-size=2048` and
+  `CIRCLE_NODE_TOTAL=2`. No competing heavy build or worker polling is permitted.
+- Mac WebView behavior, physical recording/ASR continuity and the combined #14
+  <800 ms switch/correction plus app-restart regression remain unrun gates. No
+  packaging, DMG, Actions, push, install or Mac/private-data operation occurred.
+
+### Storage and lifetime assumptions
+
+- Each WebView has its own JS store. The app currently uses a main window and a
+  separate minibar WebView; code does not assume only one WebView can ever edit.
+  If WebViews share same-origin persistent localStorage, they may interleave at
+  every storage call. Individual setItem/getItem/removeItem operations are
+  treated as synchronous/atomic; **their sequences are not atomic**. No storage
+  mutex, storage-event ordering, Web Locks support or multi-call CAS is assumed.
+- All new writers create unique immutable keys with `crypto.randomUUID()`.
+  Another writer/recovery instance must copy a selected record to a fresh key,
+  never overwrite it. Retiring an immutable source therefore cannot delete a
+  later edit. This is a protocol invariant, not a hoped-for scheduling property.
+- Different origins/profiles may not share browser journals; native committed
+  Notes are still common. A journal can only be recovered from the profile that
+  persisted it. Cross-window behavior on target macOS WebViews remains a physical
+  gate; the synthetic shared Storage tests prove the interleaving protocol, not
+  macOS storage durability or OS power-loss semantics.
+- Legacy mutable data has no writer identity. Exact-value receipts preserve raw
+  records without unsafe deletion, but cannot infer the intention of an old
+  writer rewriting identical bytes. Receipts cover only already committed exact
+  snapshots. Legacy data/receipts may consume storage until a separately approved
+  cleanup/migration policy; no automatic destructive cleanup is introduced here.
+- Independent unsaved writers may still conflict at SQLite's revision check.
+  No automatic merge or last-writer-wins is claimed. Recovery retains the other
+  drafts and offers explicit choices; stale conversion/text never enters context.
