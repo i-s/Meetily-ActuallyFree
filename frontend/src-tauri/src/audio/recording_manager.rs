@@ -3,7 +3,7 @@ use tokio::sync::mpsc;
 use anyhow::Result;
 use log::{debug, error, info, warn};
 
-use super::devices::{AudioDevice, list_audio_devices};
+use super::devices::{AudioDevice, DeviceType, list_audio_devices};
 
 #[cfg(target_os = "macos")]
 use super::devices::get_safe_recording_devices_macos;
@@ -589,9 +589,14 @@ impl RecordingManager {
         // List current devices
         let available_devices = list_audio_devices().await?;
 
-        // Find the device by name
+        // A duplex endpoint commonly shares its name with the opposite direction.
+        // Never reinterpret an output as microphone (or vice versa) at reopen.
+        let hardware_type = match device_type {
+            DeviceMonitorType::Microphone => DeviceType::Input,
+            DeviceMonitorType::SystemAudio => DeviceType::Output,
+        };
         let device = available_devices.iter()
-            .find(|d| d.name == device_name)
+            .find(|d| d.name == device_name && d.device_type == hardware_type)
             .cloned();
 
         if let Some(device) = device {

@@ -8,10 +8,13 @@ let prefs = { microphone_enabled: true, system_audio_enabled: false };
 let release: (() => void) | undefined;
 let gate: Promise<void> | undefined;
 let fail = false;
+let readFailure = false;
+let readGate: Promise<void> | undefined;
+let readRelease: (() => void) | undefined;
 const calls: any[] = [];
 mock.module('@tauri-apps/api/core', () => ({ invoke: async (name: string, args: any) => {
   calls.push({ name, args });
-  if (name === 'get_recording_preferences') return { ...prefs };
+  if (name === 'get_recording_preferences') { const captured = { ...prefs }; await readGate; if (readFailure) throw new Error('Temporary read failure'); return captured; }
   if (name === 'set_recording_source_enabled') {
     await gate;
     if (fail) throw new Error('Synthetic disk write failure');
@@ -60,4 +63,25 @@ test('failed write leaves confirmed source off and fences immediate Start until 
   await act(async () => { current!.setEnabled('system', true); await flushRecordingSources(); await flush(); });
   expect(current!.sources?.system_audio_enabled).toBe(true);
   act(() => view.unmount());
+});
+
+
+test('temporary initial read error can be retried in-place and late read cannot replace fresh event', async () => {
+  readFailure = true;
+  let view!: ReturnType<typeof create>;
+  await act(async () => { view = create(<Probe />); await flush(); });
+  try {
+    expect(current!.sources).toBeNull();
+    expect(current!.error).toContain('Temporary read');
+    readFailure = false;
+    await act(async () => { await current!.retry(); await flush(); });
+    expect(current!.sources?.system_audio_enabled).toBe(true);
+    expect(current!.error).toBeNull();
+    readGate = new Promise<void>(resolve => { readRelease = resolve; });
+    await act(async () => { void current!.retry(); await flush(); });
+    await act(async () => { bus.dispatchEvent(new CustomEvent('meetily-recording-sources-changed', { detail: { microphone_enabled: true, system_audio_enabled: false } })); });
+    await act(async () => { readRelease!(); await flush(); });
+    expect(current!.sources?.system_audio_enabled).toBe(false);
+    expect(current!.error).toBeNull();
+  } finally { readFailure = false; readGate = undefined; act(() => view.unmount()); }
 });

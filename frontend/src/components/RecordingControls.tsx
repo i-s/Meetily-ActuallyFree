@@ -547,6 +547,12 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
         <div className="h-8 w-px shrink-0 self-center bg-af-border" />
 
         <div className={cn('flex items-center gap-2', isRecording ? 'min-w-0 flex-1' : 'shrink-0')}>
+          {!isRecording && recordingSources.error && (
+            <span role="alert" className="max-w-52 text-xs text-af-warning">
+              Could not load recording sources.{' '}
+              <button type="button" aria-label="Retry loading recording sources" className="underline" onClick={() => void recordingSources.retry()}>Retry</button>
+            </span>
+          )}
           <RecordingVoiceLane
             kind="mic"
             open={openLane === 'mic'}
@@ -587,6 +593,7 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
             macDefaultOutput={isMacOS}
             source={appAudioSupported ? <AppAudioSource choice={appAudio} variant="compact" live={isRecording} /> : undefined}
             hideDevice={onlyChosenApps}
+            previewScope={{ loaded: appAudio.loaded, onlyApps: appAudio.onlyApps, targets: appAudio.targets.map(target => target.executable) }}
             live={isRecording}
             captureIncluded={recordingState.systemAudioCaptured}
             muted={isRecording ? (!recordingState.systemAudioCaptured || isSystemAudioMuted) : !recordingSources.sources?.system_audio_enabled}

@@ -160,6 +160,7 @@ pub mod post_call {{
  pub mod worker {{pub static PRIORITY:std::sync::LazyLock<std::sync::Arc<super::priority::Priority>>=std::sync::LazyLock::new(||std::sync::Arc::new(super::priority::Priority::default()));}}
 }}
 pub mod audio {{
+ #[path="{AUDIO}/recording_source_admission.rs"] pub mod recording_source_admission;
  #[path="{work}/src/recording_ownership.rs"] pub mod recording_ownership;
  #[path="{work}/src/recording_start_authority.rs"] pub mod recording_start_authority;
  #[path="{AUDIO}/recording_start_sources.rs"] pub mod recording_start_sources;

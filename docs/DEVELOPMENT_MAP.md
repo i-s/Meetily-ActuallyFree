@@ -59,6 +59,9 @@ preference migration preserves old microphone-only capture; both Start commands
 filter source/device/app inputs before streams open. Live mute never adds an excluded
 source, and old room metadata/version identity restrictions remain separate. The
 note records source-scoped preview, synthetic coverage and pending physical gates.
+Its R1 section covers serialized read-triggered repair/rollback, short source/Start
+admission independent of inference, awaited chosen-app endpoint-preview teardown,
+typed reconnect, recoverable loading and frozen-source minibar controls.
 
 Manual controls, historical microphone-only in-person mode, fail-closed chosen-app
 capture, selected-process lifetime, FFmpeg checkpoint shutdown, storage failures,

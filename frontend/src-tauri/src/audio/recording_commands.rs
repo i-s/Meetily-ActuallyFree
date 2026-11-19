@@ -228,6 +228,7 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
 
     // Reserve before the engine lock: cancelling a background model must be
     // able to drain/release that lock before live model initialization.
+    let _source_start = super::recording_source_admission::SourceStart::begin().await;
     let _post_call_priority = crate::post_call::worker::PRIORITY.recording().await;
     let engine_lifecycle_guard = super::common::acquire_engine_lifecycle_lock().await;
 
@@ -600,6 +601,7 @@ pub async fn start_recording_with_lifecycle<R: Runtime>(
         return Err(error);
     }
     // Yield background inference before taking the lock shared with v1 barriers.
+    let _source_start = super::recording_source_admission::SourceStart::begin().await;
     let _post_call_priority = crate::post_call::worker::PRIORITY.recording().await;
     let engine_lifecycle_guard = super::common::acquire_engine_lifecycle_lock().await;
     // Claim before qualification/setup, under the SAME lock as settle/cancel.

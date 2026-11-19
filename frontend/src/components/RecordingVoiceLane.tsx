@@ -48,6 +48,7 @@ export function RecordingVoiceLane({
   onMute,
   source,
   hideDevice = false,
+  previewScope,
 }: {
   kind: 'mic' | 'output';
   open: boolean;
@@ -71,6 +72,7 @@ export function RecordingVoiceLane({
   /** Which audio to record, shown in the panel (system audio). */
   source?: React.ReactNode;
   hideDevice?: boolean;
+  previewScope?: { loaded: boolean; onlyApps: boolean; targets: string[] };
 }) {
   const [listOpen, setListOpen] = useState(false);
   const [meter, setMeter] = useState({ rms: 0, peak: 0, tick: 0 });
@@ -86,8 +88,10 @@ export function RecordingVoiceLane({
     if (!open) setListOpen(false);
   }, [open]);
 
+  const previewAllowed = kind === 'mic' || !previewScope || (previewScope.loaded && !previewScope.onlyApps);
+  const previewTargets = previewScope?.targets.join('\0') ?? '';
   useEffect(() => {
-    if (!open || live || muted) return;
+    if (!open || live || muted || !previewAllowed) return;
     let unlisten: (() => void) | undefined;
     let cancelled = false;
     const opts = optionsRef.current;
@@ -96,6 +100,7 @@ export function RecordingVoiceLane({
     const wantedType = kind === 'mic' ? 'input' : 'output';
 
     runLevelMonitor(async () => {
+      if (cancelled) return;
       await invoke('start_audio_level_monitoring', { deviceNames: wanted ? [wanted] : [], deviceType: wantedType });
     });
 
@@ -131,11 +136,12 @@ export function RecordingVoiceLane({
       cancelled = true;
       unlisten?.();
       setMeter({ rms: 0, peak: 0, tick: 0 });
-      runLevelMonitor(async () => {
-        await invoke('stop_audio_level_monitoring').catch(() => undefined);
-      });
+      // Cancel native admission now, even if an older Start IPC has not replied.
+      // Queue the acknowledgement so a later valid preview waits for teardown.
+      const stopped = invoke('stop_audio_level_monitoring').catch(() => undefined);
+      runLevelMonitor(async () => { await stopped; });
     };
-  }, [open, live, muted, savedValue, kind]);
+  }, [open, live, muted, savedValue, kind, previewAllowed, previewTargets]);
 
   // macOS has no output to pick, but the panel still opens for `source`.
   const canOpen = !macDefaultOutput || !!source;

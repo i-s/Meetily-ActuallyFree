@@ -7,10 +7,11 @@ let prefs = { microphone_enabled: true, system_audio_enabled: false };
 const calls: string[] = [];
 let starts = 0;
 let phase = 'idle';
+let sourceReadFails = false;
 const noop = () => {};
 mock.module('@tauri-apps/api/core', () => ({ invoke: async (name: string, args: any) => {
   calls.push(name);
-  if (name === 'get_recording_preferences') return { ...prefs };
+  if (name === 'get_recording_preferences') { if (sourceReadFails) throw new Error('Synthetic temporary read'); return { ...prefs }; }
   if (name === 'get_audio_devices') return [];
   if (name === 'set_recording_source_enabled') {
     prefs = { ...prefs, [args.source === 'microphone' ? 'microphone_enabled' : 'system_audio_enabled']: args.enabled };
@@ -74,4 +75,19 @@ test('routed model preparation locks the same source icons before native capture
     expect(view.root.findByProps({ 'data-lane': 'mic' }).props.disabled).toBe(true);
     expect(view.root.findByProps({ 'data-lane': 'output' }).props.disabled).toBe(true);
   } finally { phase = 'idle'; act(() => view.unmount()); }
+});
+
+
+test('temporary source read error offers a contextual retry without enabling Start first', async () => {
+  sourceReadFails = true;
+  let view!: ReturnType<typeof create>;
+  await act(async () => { view = create(<RecordingControls {...props} />); await flush(); });
+  try {
+    expect(view.root.findByProps({ 'aria-label': 'Start recording' }).props.disabled).toBe(true);
+    const retry = view.root.findByProps({ 'aria-label': 'Retry loading recording sources' });
+    sourceReadFails = false;
+    await act(async () => { retry.props.onClick(); await flush(); });
+    expect(view.root.findByProps({ 'aria-label': 'Start recording' }).props.disabled).toBe(false);
+    expect(view.root.findAllByProps({ 'aria-label': 'Retry loading recording sources' })).toHaveLength(0);
+  } finally { sourceReadFails = false; act(() => view.unmount()); }
 });

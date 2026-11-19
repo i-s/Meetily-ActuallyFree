@@ -11,31 +11,39 @@ const CHANGED = 'meetily-recording-sources-changed';
 export function useRecordingSources() {
   const [sources, setSources] = useState<RecordingSources | null>(null);
   const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   const mounted = useRef(false);
   const revision = useRef(0);
 
+  const accept = useCallback((value: unknown) => {
+    const next = recordingSources(value);
+    revision.current++;
+    if (mounted.current) { setSources(next); setError(null); }
+  }, []);
+
+  const retry = useCallback(async () => {
+    const before = ++revision.current;
+    try {
+      const value = await invoke('get_recording_preferences');
+      if (mounted.current && before === revision.current) accept(value);
+    } catch (error) {
+      if (mounted.current && before === revision.current) setError(String(error));
+    }
+  }, [accept]);
+
   useEffect(() => {
     mounted.current = true;
-    const accept = (value: unknown) => {
-      const next = recordingSources(value);
-      revision.current++;
-      if (mounted.current) setSources(next);
-    };
     const local = (event: Event) => accept((event as CustomEvent).detail);
     window.addEventListener(CHANGED, local);
     const unlisten = listen<RecordingSources>('recording-sources-changed', event => accept(event.payload));
-    const before = revision.current;
-    void invoke('get_recording_preferences').then(value => {
-      if (mounted.current && before === revision.current) accept(value);
-    }).catch(error => {
-      if (mounted.current) toast.error('Could not load recording sources', { description: String(error) });
-    });
+    void retry();
     return () => {
       mounted.current = false;
+      revision.current++;
       window.removeEventListener(CHANGED, local);
       void unlisten.then(stop => stop()).catch(console.error);
     };
-  }, []);
+  }, [accept, retry]);
 
   const setEnabled = useCallback((source: 'microphone' | 'system', enabled: boolean) => {
     setSaving(true);
@@ -46,5 +54,5 @@ export function useRecordingSources() {
     }).finally(() => { if (mounted.current) setSaving(false); });
   }, []);
 
-  return { sources, saving, setEnabled };
+  return { sources, saving, error, retry, setEnabled };
 }
