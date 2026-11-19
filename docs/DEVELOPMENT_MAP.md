@@ -273,7 +273,11 @@ Read [ISSUE13_CODEX_LIVE.md](ISSUE13_CODEX_LIVE.md) before reusing this provider
 #15/#16: it documents the dedicated private CODEX_HOME/one-time separate login,
 real CLI 0.167.2 global-AGENTS leak reproduction and isolation controls, bounded
 process ownership, stable interfaces and remaining real-subscription/physical Mac
-gates. The live path has no summary-provider/API/key fallback and reads no other
+gates. The [#22 compatibility follow-up](ISSUE22_CODEX_COMPATIBILITY.md) replaces
+one-version equality with shared local parser/capability checks, scratch HOME,
+real 0.167.2/0.170.0 request/tool/leak controls and a loopback-only Linux test
+runner; visible Settings presentation remains deferred to the owner choice.
+The live path has no summary-provider/API/key fallback and reads no other
 meetings, contacts or audio. Saved-library/group AI is a separate legacy path.
 
 ## 4. Optional download ownership and UI synchronization

@@ -81,12 +81,15 @@ A residual global-instructions leak in that adapter was reproduced and fixed her
 
 ## Isolation discovery, auth contract and one-time owner action
 
-**Qualified CLI version: `codex-cli 0.167.2`, Unix process-group platforms only.**
-Other versions/platforms fail closed until their emitted requests and cleanup
-semantics are qualified. The executable is a trusted installed dependency; its
-version string is not a cryptographic attestation or an OS sandbox for a malicious
-binary. macOS desktop behavior remains a physical gate; Windows is intentionally
-unavailable rather than claiming descendant cleanup without a Job Object.
+**Compatibility follow-up:** [issue #22](ISSUE22_CODEX_COMPATIBILITY.md) replaces
+exact-version equality with shared local capability/parser preflight and records
+real credential-free request controls for both `codex-cli 0.167.2` and `0.170.0`.
+Unix process-group platforms only; macOS desktop behavior remains a physical gate.
+The historical #13 qualification results below still describe its original source.
+The executable is a trusted installed dependency; help/parser acceptance and its
+version string are not cryptographic attestation or an OS sandbox for a malicious
+binary. Windows is intentionally unavailable rather than claiming descendant
+cleanup without a Job Object.
 
 A real-CLI localhost test initially failed: shared `CODEX_HOME/AGENTS.md` reached
 its outgoing request despite `--ignore-user-config`, `--ignore-rules` and

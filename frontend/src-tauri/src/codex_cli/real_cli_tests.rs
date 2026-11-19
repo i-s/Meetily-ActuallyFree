@@ -4,20 +4,47 @@ use super::*;
 #[tokio::test]
 #[ignore = "requires installed CLI; synthetic auth home + localhost only"]
 async fn real_binary_dedicated_home_excludes_personalization_and_advertises_no_tools() {
-    contract(false, false).await;
+    contract(false, false, false).await;
 }
 #[tokio::test]
 #[ignore = "requires installed CLI; synthetic auth home + localhost only"]
 async fn real_binary_accepts_recovered_stream_without_losing_isolation() {
-    contract(true, false).await;
+    contract(true, false, false).await;
 }
 #[tokio::test]
 #[ignore = "requires installed CLI; unsafe positive control uses synthetic home + localhost only"]
 async fn real_binary_shared_home_positive_control_proves_global_agents_loading() {
-    contract(false, true).await;
+    contract(false, true, false).await;
 }
 
-async fn contract(interrupt_first_stream: bool, shared_home_control: bool) {
+#[tokio::test]
+#[ignore = "requires installed CLI; synthetic home and local parser/status only"]
+async fn real_binary_capability_probe_is_signed_out_and_rejects_unknown_execution_option() {
+    let binary = std::env::var_os("MEETILY_CODEX_TEST_BINARY").map(PathBuf::from).unwrap();
+    let dir = tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
+    let auth = dir.path().join("auth");
+    let status = probe(binary.to_str(), &auth).await;
+    assert!(status.installed, "{status:?}");
+    if let Ok(expected) = std::env::var("MEETILY_CODEX_EXPECT_VERSION") {
+        assert_eq!(status.version.as_deref(), Some(expected.as_str()));
+    }
+    assert_eq!(status.readiness, "signed_out", "{status:?}");
+    assert!(!status.logged_in);
+    assert!(!auth.join("auth.json").exists(), "fixture must never acquire credentials");
+    let mut args = generation_args("default");
+    args.pop();
+    args.extend(["--meetily-unsupported-negative-control", "--help"]);
+    let output = run(checked_command(&binary, &args, dir.path(), &auth).await.unwrap(), None, PROBE_TIMEOUT, None).await.unwrap();
+    assert!(!output.success, "real parser accepted an unknown execution option");
+}
+
+#[tokio::test]
+#[ignore = "requires installed CLI; synthetic localhost tool-advertisement positive control"]
+async fn real_binary_enabling_shell_is_detected_in_outgoing_tools() {
+    contract(false, false, true).await;
+}
+
+async fn contract(interrupt_first_stream: bool, shared_home_control: bool, tools_control: bool) {
     use tokio::io::{AsyncBufReadExt, BufReader};
     let binary = std::env::var_os("MEETILY_CODEX_TEST_BINARY")
         .map(PathBuf::from)
@@ -106,11 +133,8 @@ async fn contract(interrupt_first_stream: bool, shared_home_control: bool) {
                     && serialized.contains("SYNTHETIC_USER_NOTES_PERSONAL_IDEA"),
                 "authorized meeting/Notes were lost"
             );
-            assert_eq!(
-                request["tools"],
-                serde_json::json!([]),
-                "CLI advertised tools"
-            );
+            let tools = request["tools"].as_array().expect("tools must be an array");
+            assert_eq!(tools.is_empty(), !tools_control, "text-only/tool positive control");
             let message = serde_json::json!({"id":"msg_fixture", "type":"message", "role":"assistant", "status":"completed", "content":[{"type":"output_text", "text":"Synthetic summary", "annotations":[]}]});
             let events = [
                 serde_json::json!({"type":"response.created", "response":{"id":"resp_fixture", "status":"in_progress", "output":[]}}),
@@ -136,7 +160,11 @@ async fn contract(interrupt_first_stream: bool, shared_home_control: bool) {
     let mut args = generation_args("gpt-5.4");
     args.pop();
     // This test-only routing override never enters a product command.
-    args.extend(["-c", "model_provider=\"fixture\"", "-c", &provider, "-"]);
+    args.extend(["-c", "model_provider=\"fixture\"", "-c", &provider]);
+    if tools_control {
+        args.extend(["-c", "features.shell_tool=true"]);
+    }
+    args.push("-");
     let mut cmd = command(&binary, &args, &cwd, selected_home);
     cmd.env("HOME", &shared).env("USERPROFILE", &shared);
     let client = run(cmd, Some("SYNTHETIC_MEETING_BUDGET_42. Separate user_notes: SYNTHETIC_USER_NOTES_PERSONAL_IDEA, not agreed. Return a synthetic summary.".into()), Duration::from_secs(30), None);

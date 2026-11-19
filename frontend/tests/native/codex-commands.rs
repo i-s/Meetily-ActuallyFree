@@ -11,7 +11,7 @@ import sys, json
 from pathlib import Path
 if sys.argv[1:] == ['login','status']: print('Logged in using ChatGPT')
 elif sys.argv[1:] == ['--version']: print('codex-cli 0.167.2')
-elif sys.argv[1:] == ['exec','--help']: print('--ephemeral --ignore-user-config --ignore-rules')
+elif sys.argv[1] == 'exec' and '--help' in sys.argv: print('--ephemeral --ignore-user-config --ignore-rules --skip-git-repo-check --sandbox --json --color --model --config')
 else:
  Path(__file__).with_suffix('.input').write_text(sys.stdin.read())
  print(json.dumps({'type':'item.completed','item':{'type':'agent_message','text':json.dumps({'answer':'42 from speech; personal Notes are not an agreement.','transcript_ids':['early'],'notes_used':True,'uncertain':False})}}))

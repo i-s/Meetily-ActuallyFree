@@ -142,8 +142,8 @@ from pathlib import Path
 root = Path(__file__).parent
 if sys.argv[1:] == ['--version']:
  print('codex-cli 0.167.2')
-elif sys.argv[1:] == ['exec', '--help']:
- print('--ephemeral --ignore-user-config --ignore-rules')
+elif sys.argv[1] == 'exec' and '--help' in sys.argv:
+ print('--ephemeral --ignore-user-config --ignore-rules --skip-git-repo-check --sandbox --json --color --model --config')
 elif sys.argv[1:] == ['login', 'status']:
  print('Logged in using ChatGPT', file=sys.stderr)
 else:
@@ -261,7 +261,7 @@ async fn codex_cli_timeout_and_cancel_kill_descendants_and_close_pipes() {
 #[cfg(unix)]
 #[tokio::test]
 async fn codex_cli_nonzero_exit_does_not_leak_diagnostics() {
-    let (dir, binary) = fixture("#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'codex-cli 0.167.2'; elif [ \"$2\" = --help ]; then echo '--ephemeral --ignore-user-config --ignore-rules'; elif [ \"$1\" = login ]; then echo 'Logged in using ChatGPT'; else echo 'SECRET_TRANSCRIPT sk-private' >&2; exit 1; fi\n");
+    let (dir, binary) = fixture("#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'codex-cli 0.167.2'; elif [ \"$1\" = exec ] && case \" $* \" in *\" --help \"*) true;; *) false;; esac; then echo '--ephemeral --ignore-user-config --ignore-rules --skip-git-repo-check --sandbox --json --color --model --config'; elif [ \"$1\" = login ]; then echo 'Logged in using ChatGPT'; else echo 'SECRET_TRANSCRIPT sk-private' >&2; exit 1; fi\n");
     let error = generate(
         binary.to_str(),
         &dir.path().join("auth"),
@@ -275,6 +275,10 @@ async fn codex_cli_nonzero_exit_does_not_leak_diagnostics() {
     assert!(error.contains("Codex CLI failed"));
     assert!(!error.contains("SECRET") && !error.contains("sk-private"));
 }
+
+#[cfg(unix)]
+#[path = "compatibility_tests.rs"]
+mod compatibility_tests;
 
 #[path = "real_cli_tests.rs"]
 mod real_cli_tests;
@@ -349,7 +353,7 @@ async fn codex_cli_blocks_both_global_agents_names_and_symlinked_auth_home_befor
 
 #[cfg(unix)]
 #[tokio::test]
-async fn codex_cli_rechecks_personalization_after_preflight_and_rejects_unqualified_version() {
+async fn codex_cli_rechecks_personalization_after_preflight_and_rejects_missing_capabilities() {
     let (dir, binary) = fixture(
         r#"#!/usr/bin/python3
 import sys,os

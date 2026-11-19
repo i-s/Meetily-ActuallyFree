@@ -126,11 +126,12 @@ fn command(binary: &Path, args: &[&str], cwd: &Path, auth_home: &Path) -> Comman
         .env_clear()
         .env("CI", "1")
         .env("NO_COLOR", "1");
-    // Keep only CLI-owned auth locations and OS essentials, not API routing,
-    // tool credentials, parent sessions, NODE_OPTIONS or preload hooks.
+    // Authentication is owned only by CODEX_HOME. Host discovery must not use
+    // the person's real home, even if a future CLI adds another discovery path.
+    cmd.env("HOME", cwd).env("USERPROFILE", cwd);
+    // Keep OS essentials, not API routing, tool credentials, parent sessions,
+    // NODE_OPTIONS or preload hooks.
     for name in [
-        "HOME",
-        "USERPROFILE",
         "SystemRoot",
         "WINDIR",
         "LANG",
@@ -321,12 +322,45 @@ pub async fn prepare_auth_home(home: &Path) -> Result<(), String> {
     }
     Ok(())
 }
-fn qualified_version(output: &Output) -> Result<(), String> {
-    if output.success && output.stdout.trim() == "codex-cli 0.167.2" {
-        Ok(())
-    } else {
-        Err("Live questions require Codex CLI 0.167.2, the tested text-only isolation version. This installed version is not qualified; no meeting text was sent.".into())
+/// Local-only parser preflight: never provide stdin or start a model turn here.
+/// Help is a capability hint, not evidence of isolation; exact installed CLIs
+/// are additionally qualified by credential-free emitted-request tests.
+async fn check_capabilities(
+    binary: &Path,
+    cwd: &Path,
+    auth_home: &Path,
+    model: &str,
+    token: Option<&CancellationToken>,
+) -> Result<(), String> {
+    let help = run(
+        checked_command(binary, &["exec", "--help"], cwd, auth_home).await?,
+        None,
+        PROBE_TIMEOUT,
+        token,
+    ).await?;
+    if !help.success {
+        return Err("Codex CLI could not describe its execution capabilities. No meeting text was sent.".into());
     }
+    for flag in ["--ephemeral", "--ignore-user-config", "--ignore-rules", "--skip-git-repo-check", "--sandbox", "--json", "--color", "--model", "--config"] {
+        if !help.stdout.split_ascii_whitespace().any(|word| word.trim_matches(',') == flag) {
+            return Err(format!("Update Codex CLI: required execution option {flag} is missing. No meeting text was sent."));
+        }
+    }
+    // Ask the parser to accept the complete production combination, including
+    // config overrides and any explicitly selected model, but exit via --help.
+    let mut args = generation_args(model);
+    args.pop();
+    args.push("--help");
+    let parsed = run(
+        checked_command(binary, &args, cwd, auth_home).await?,
+        None,
+        PROBE_TIMEOUT,
+        token,
+    ).await?;
+    if !parsed.success {
+        return Err("Codex CLI rejected Meetily's text-only isolation argument combination. No meeting text was sent.".into());
+    }
+    Ok(())
 }
 
 pub async fn probe(configured: Option<&str>, auth_home: &Path) -> CodexCliStatus {
@@ -357,11 +391,7 @@ pub async fn probe(configured: Option<&str>, auth_home: &Path) -> CodexCliStatus
         status.installed = true;
         status.version = Some(version.stdout.trim().to_string());
         status.readiness = "unsupported";
-        qualified_version(&version)?;
-        let help = run(checked_command(&binary, &["exec", "--help"], cwd.path(), auth_home).await?, None, PROBE_TIMEOUT, None).await?;
-        if !help.success || !["--ephemeral", "--ignore-user-config", "--ignore-rules"].iter().all(|flag| help.stdout.contains(flag)) {
-            return Err("Update Codex CLI: this provider requires exec --ephemeral, --ignore-user-config and --ignore-rules.".into());
-        }
+        check_capabilities(&binary, cwd.path(), auth_home, DEFAULT_MODEL, None).await?;
         status.readiness = "signed_out";
         let login = run(checked_command(&binary, &["login", "status"], cwd.path(), auth_home).await?, None, PROBE_TIMEOUT, None).await?;
         status.logged_in = chatgpt_login(&login);
@@ -497,11 +527,8 @@ pub async fn generate(
     let cwd =
         tempfile::tempdir().map_err(|e| format!("Cannot create Codex working directory: {e}"))?;
     let version = run(checked_command(&binary, &["--version"], cwd.path(), auth_home).await?, None, PROBE_TIMEOUT, token).await?;
-    qualified_version(&version)?;
-    let help = run(checked_command(&binary, &["exec", "--help"], cwd.path(), auth_home).await?, None, PROBE_TIMEOUT, token).await?;
-    if !help.success || !["--ephemeral", "--ignore-user-config", "--ignore-rules"].iter().all(|flag| help.stdout.contains(flag)) {
-        return Err("Codex CLI lacks the required isolation options. No meeting text was sent.".into());
-    }
+    if !version.success { return Err("Codex CLI could not report its version. No meeting text was sent.".into()); }
+    check_capabilities(&binary, cwd.path(), auth_home, model, token).await?;
     let login = run(
         checked_command(&binary, &["login", "status"], cwd.path(), auth_home).await?,
         None,

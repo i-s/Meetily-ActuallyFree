@@ -26,8 +26,8 @@ if sys.argv[1:] == ['login','status']:
  print({login:?})
 elif sys.argv[1:] == ['--version']:
  print('codex-cli 0.167.2')
-elif sys.argv[1:] == ['exec','--help']:
- print('--ephemeral --ignore-user-config --ignore-rules')
+elif sys.argv[1] == 'exec' and '--help' in sys.argv:
+ print('--ephemeral --ignore-user-config --ignore-rules --skip-git-repo-check --sandbox --json --color --model --config')
 else:
  prompt=sys.stdin.read()
  Path(__file__).with_suffix('.input').write_text(prompt)
