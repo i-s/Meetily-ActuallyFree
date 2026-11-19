@@ -24,7 +24,7 @@ import { ChevronDown, Layers, Minimize2, Mic, Pause, Play, Square } from 'lucide
 import { toast } from 'sonner';
 import { cn } from '@/lib/utils';
 import Analytics from '@/lib/analytics';
-import { useRecordingState } from '@/contexts/RecordingStateContext';
+import { useRecordingState, RecordingStatus } from '@/contexts/RecordingStateContext';
 import { useConfig } from '@/contexts/ConfigContext';
 import { usePlatform } from '@/hooks/usePlatform';
 import { usePendingGroup } from '@/hooks/usePendingGroup';
@@ -34,6 +34,8 @@ import type { SelectedDevices } from '@/components/DeviceSelection';
 import { RecordingVoiceLane } from '@/components/RecordingVoiceLane';
 import { AppAudioSource, useAppAudioSupported } from '@/components/recording/AppAudioSource';
 import { useAppAudio } from '@/hooks/useAppAudio';
+import { useRecordingSources } from '@/hooks/useRecordingSources';
+import { flushRecordingSources } from '@/lib/recording-sources';
 import { GroupPicker } from '@/components/groups/GroupBits';
 import { Hint } from '@/components/ui/tooltip';
 import { Spinner } from '@/components/ui/spinner';
@@ -113,14 +115,10 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
   const [openLane, setOpenLane] = useState<'mic' | 'output' | null>(null);
   const [micGain, setMicGain] = useState(1);
   const [systemGain, setSystemGain] = useState(1);
-  const [nextInPerson, setNextInPerson] = useState(false);
-  const inPerson = isRecording ? recordingState.inPerson : nextInPerson;
+  const recordingSources = useRecordingSources();
   const saveChain = useRef(Promise.resolve());
   const gainTimer = useRef<number | null>(null);
   const pendingGain = useRef<{ which: 'mic' | 'system'; value: number } | null>(null);
-  // Mutes chosen before recording apply the moment it starts.
-  const [idleMicMuted, setIdleMicMuted] = useState(false);
-  const [idleSystemMuted, setIdleSystemMuted] = useState(false);
 
   const [isProcessing, setIsProcessing] = useState(false);
   const [isStarting, setIsStarting] = useState(false);
@@ -145,7 +143,6 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
     void loadAudioDevices();
     void invoke<RecordingPreferences>('get_recording_preferences')
       .then((prefs) => {
-        setNextInPerson(prefs.in_person ?? false);
         setMicGain(prefs.mic_gain ?? 1);
         setSystemGain(prefs.system_gain ?? 1);
       })
@@ -253,26 +250,16 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
     if (isStarting) setOpenLane(null);
   }, [isStarting]);
 
-  const wasRecording = useRef(false);
-  useEffect(() => {
-    if (isRecording && !wasRecording.current) {
-      if (idleMicMuted) void invoke('set_microphone_muted', { muted: true }).catch(() => undefined);
-      if (idleSystemMuted) void invoke('set_system_audio_muted', { muted: true }).catch(() => undefined);
-    }
-    if (!isRecording && wasRecording.current) {
-      setIdleMicMuted(false);
-      setIdleSystemMuted(false);
-    }
-    wasRecording.current = isRecording;
-  }, [idleMicMuted, idleSystemMuted, isRecording]);
-
   const handleStartRecording = useCallback(async () => {
     if (isStarting) return;
     // Busy for the whole start sequence; loading the model can take a while.
     setIsStarting(true);
     await invoke('stop_audio_level_monitoring').catch(() => undefined);
     try {
+      await flushRecordingSources();
       await onRecordingStart();
+    } catch (error) {
+      toast.error('Could not start recording', { description: errorText(error) });
     } finally {
       setIsStarting(false);
     }
@@ -446,7 +433,8 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
     };
   }, [onRecordingStop, onTranscriptionError]);
 
-  const busy = isStarting || isProcessing;
+  const starting = isStarting || recordingState.status === RecordingStatus.STARTING;
+  const busy = starting || isProcessing;
   const elapsed = formatClock(recordingState.activeDuration ?? recordingState.recordingDuration ?? 0);
 
   return (
@@ -472,7 +460,7 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
               }}
               disabled={
                 busy ||
-                (!isRecording && isRecordingDisabled) ||
+                (!isRecording && (isRecordingDisabled || !recordingSources.sources || recordingSources.saving)) ||
                 (isRecording && (isStopping || isPausing || isResuming))
               }
               aria-label={isRecording ? 'Stop recording' : 'Start recording'}
@@ -569,19 +557,20 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
             savedValue={activeDevices?.micDevice ?? null}
             options={inputDevices}
             onSelect={chooseMic}
-            disabled={isStarting}
+            disabled={starting || (!isRecording && (!recordingSources.sources || recordingSources.saving))}
             gain={micGain}
             onGainLive={(value) => scheduleGain('mic', value, false)}
             onGainCommit={(value) => scheduleGain('mic', value, true)}
             live={isRecording}
-            muted={isRecording ? isMicrophoneMuted : idleMicMuted}
-            meterActive={isRecording && !isPaused && !isMicrophoneMuted}
+            captureIncluded={recordingState.microphoneCaptured}
+            muted={isRecording ? (!recordingState.microphoneCaptured || isMicrophoneMuted) : !recordingSources.sources?.microphone_enabled}
+            meterActive={isRecording && recordingState.microphoneCaptured && !isPaused && !isMicrophoneMuted}
             onMute={() => {
               if (isRecording) void handleMicrophoneMute();
-              else setIdleMicMuted((current) => !current);
+              else recordingSources.setEnabled('microphone', !recordingSources.sources?.microphone_enabled);
             }}
           />
-          {inPerson ? <span className="px-2 text-xs text-af-text-3">In-person · microphone only</span> : <RecordingVoiceLane
+          <RecordingVoiceLane
             kind="output"
             open={openLane === 'output'}
             onOpenChange={(next) => {
@@ -591,7 +580,7 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
             savedValue={isMacOS ? null : activeDevices?.systemDevice ?? null}
             options={isMacOS ? [] : outputDevices}
             onSelect={chooseSystem}
-            disabled={isStarting}
+            disabled={starting || (!isRecording && (!recordingSources.sources || recordingSources.saving))}
             gain={systemGain}
             onGainLive={(value) => scheduleGain('system', value, false)}
             onGainCommit={(value) => scheduleGain('system', value, true)}
@@ -599,13 +588,14 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
             source={appAudioSupported ? <AppAudioSource choice={appAudio} variant="compact" live={isRecording} /> : undefined}
             hideDevice={onlyChosenApps}
             live={isRecording}
-            muted={isRecording ? isSystemAudioMuted : idleSystemMuted}
-            meterActive={isRecording && !isPaused && !isSystemAudioMuted}
+            captureIncluded={recordingState.systemAudioCaptured}
+            muted={isRecording ? (!recordingState.systemAudioCaptured || isSystemAudioMuted) : !recordingSources.sources?.system_audio_enabled}
+            meterActive={isRecording && recordingState.systemAudioCaptured && !isPaused && !isSystemAudioMuted}
             onMute={() => {
               if (isRecording) void handleSystemAudioMute();
-              else setIdleSystemMuted((current) => !current);
+              else recordingSources.setEnabled('system', !recordingSources.sources?.system_audio_enabled);
             }}
-          />}
+          />
         </div>
       </div>
     </div>

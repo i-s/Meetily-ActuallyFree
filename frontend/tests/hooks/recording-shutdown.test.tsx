@@ -3,7 +3,7 @@ import { act, create } from 'react-test-renderer';
 import { expect, mock, spyOn, test } from 'bun:test';
 
 const handlers = new Map<string, (payload: any) => void>();
-let backend = { is_recording: true, is_paused: false, is_microphone_muted: false, is_system_audio_muted: false, is_active: true, recording_duration: 37 as number | null, active_duration: 35 as number | null };
+let backend = { microphone_captured: true, system_audio_captured: false, is_recording: true, is_paused: false, is_microphone_muted: false, is_system_audio_muted: false, is_active: true, recording_duration: 37 as number | null, active_duration: 35 as number | null };
 const subscribe = (name: string) => async (callback: (payload: any) => void) => {
   handlers.set(name, callback);
   return () => { handlers.delete(name); };
@@ -22,7 +22,7 @@ const { RecordingStateProvider, useRecordingState } = await import('../../src/co
 
 function Status() {
   const state = useRecordingState();
-  return <output>{JSON.stringify({ duration: state.activeDuration, message: state.statusMessage, stopping: state.isStopping, recording: state.isRecording, status: state.status, paused: state.isPaused })}</output>;
+  return <output>{JSON.stringify({ duration: state.activeDuration, message: state.statusMessage, stopping: state.isStopping, recording: state.isRecording, status: state.status, paused: state.isPaused, micCaptured: state.microphoneCaptured, systemCaptured: state.systemAudioCaptured, systemMuted: state.isSystemAudioMuted })}</output>;
 }
 
 test('shutdown stage stays visible and duration survives detached native manager until completion', async () => {
@@ -63,6 +63,24 @@ test('reload restores native recording status and continues polling pause change
     backend = { ...backend, is_paused: false, is_active: true, active_duration: 36 };
     await act(async () => { await poll!(); });
     expect(state()).toMatchObject({ paused: false, duration: 36 });
+  } finally {
+    if (view) act(() => view!.unmount());
+    timer.mockRestore(); clear.mockRestore();
+  }
+});
+
+
+test('started event and reload retain native excluded-source state instead of temporarily unmuting it', async () => {
+  backend = { ...backend, is_recording: true, is_paused: false, is_active: true, microphone_captured: true, system_audio_captured: false, is_system_audio_muted: true };
+  const timer = spyOn(globalThis, 'setInterval').mockImplementation((() => 1) as any);
+  const clear = spyOn(globalThis, 'clearInterval').mockImplementation(() => {});
+  let view: ReturnType<typeof create> | undefined;
+  try {
+    await act(async () => { view = create(<RecordingStateProvider><Status /></RecordingStateProvider>); });
+    const state = () => JSON.parse(view!.root.findByType('output').children.join(''));
+    expect(state()).toMatchObject({ micCaptured: true, systemCaptured: false, systemMuted: true });
+    await act(async () => { handlers.get('started')!({}); });
+    expect(state()).toMatchObject({ micCaptured: true, systemCaptured: false, systemMuted: true });
   } finally {
     if (view) act(() => view!.unmount());
     timer.mockRestore(); clear.mockRestore();

@@ -53,7 +53,14 @@ label sanitization; its historical pending hook boundary is superseded by the co
 Both source tracks/overlap stay intact; #6 acoustic identity remains
 pending and independent of lifecycle.
 
-Manual controls, explicit microphone-only in-person mode, fail-closed chosen-app
+Issue [#23 source selection](ISSUE23_RECORDING_SOURCES.md) supersedes the new-recording
+In-person switch with durable inclusion on the existing mic/output buttons. Native
+preference migration preserves old microphone-only capture; both Start commands
+filter source/device/app inputs before streams open. Live mute never adds an excluded
+source, and old room metadata/version identity restrictions remain separate. The
+note records source-scoped preview, synthetic coverage and pending physical gates.
+
+Manual controls, historical microphone-only in-person mode, fail-closed chosen-app
 capture, selected-process lifetime, FFmpeg checkpoint shutdown, storage failures,
 recovery/data retention and issue #9's unqualified physical acceptance gates are
 mapped in [ISSUE9_MANUAL_RECORDING.md](ISSUE9_MANUAL_RECORDING.md). Read it before

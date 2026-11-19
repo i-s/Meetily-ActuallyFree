@@ -34,16 +34,21 @@ static IS_MONITORING: AtomicBool = AtomicBool::new(false);
 type LevelMap = Arc<Mutex<std::collections::HashMap<String, AudioLevelData>>>;
 
 /// Start real level monitoring for the given device names.
-/// Empty list → default mic (input) + default output (system loopback on WASAPI).
+/// Empty list resolves defaults only within the explicitly requested source.
+/// Older onboarding callers without a type retain their dual-source preview.
 pub async fn start_monitoring<R: Runtime>(
     app_handle: AppHandle<R>,
     mut device_names: Vec<String>,
+    device_type: Option<String>,
 ) -> Result<()> {
+    if device_type.as_deref().is_some_and(|kind| kind != "input" && kind != "output") {
+        return Err(anyhow!("Unknown level-monitor source"));
+    }
     stop_monitoring().await?;
     tokio::time::sleep(Duration::from_millis(80)).await;
 
     if device_names.is_empty() {
-        device_names = default_monitor_devices();
+        device_names = default_monitor_devices(device_type.as_deref());
     }
     if device_names.is_empty() {
         return Err(anyhow!("No audio devices available to monitor"));
@@ -65,7 +70,7 @@ pub async fn start_monitoring<R: Runtime>(
             let mut _streams: Vec<cpal::Stream> = Vec::new();
 
             for name in &names {
-                match open_level_stream(name, levels.clone()) {
+                match open_level_stream(name, levels.clone(), device_type.as_deref()) {
                     Ok(stream) => {
                         if let Err(e) = stream.play() {
                             warn!("Failed to play level stream for '{}': {}", name, e);
@@ -143,7 +148,7 @@ pub fn is_monitoring() -> bool {
     IS_MONITORING.load(Ordering::SeqCst)
 }
 
-fn default_monitor_devices() -> Vec<String> {
+fn default_monitor_devices(device_type: Option<&str>) -> Vec<String> {
     let mut out = Vec::new();
 
     #[cfg(target_os = "windows")]
@@ -151,12 +156,12 @@ fn default_monitor_devices() -> Vec<String> {
     #[cfg(not(target_os = "windows"))]
     let host = cpal::default_host();
 
-    if let Some(d) = host.default_input_device() {
+    if let Some(d) = host.default_input_device().filter(|_| device_type != Some("output")) {
         if let Ok(n) = d.name() {
             out.push(n);
         }
     }
-    if let Some(d) = host.default_output_device() {
+    if let Some(d) = host.default_output_device().filter(|_| device_type != Some("input")) {
         if let Ok(n) = d.name() {
             if !out.contains(&n) {
                 out.push(n);
@@ -167,14 +172,14 @@ fn default_monitor_devices() -> Vec<String> {
 }
 
 /// Open a cpal input stream for levels. Tries mic input first, then WASAPI loopback on output.
-fn open_level_stream(device_name: &str, levels: LevelMap) -> Result<cpal::Stream> {
+fn open_level_stream(device_name: &str, levels: LevelMap, device_type: Option<&str>) -> Result<cpal::Stream> {
     #[cfg(target_os = "windows")]
     let host = cpal::host_from_id(cpal::HostId::Wasapi).unwrap_or_else(|_| cpal::default_host());
     #[cfg(not(target_os = "windows"))]
     let host = cpal::default_host();
 
     // 1) Input (microphone)
-    if let Ok(devices) = host.input_devices() {
+    if let Some(Ok(devices)) = (device_type != Some("output")).then(|| host.input_devices()) {
         for device in devices {
             if let Ok(name) = device.name() {
                 if name == device_name || name.contains(device_name) || device_name.contains(&name)
@@ -194,7 +199,7 @@ fn open_level_stream(device_name: &str, levels: LevelMap) -> Result<cpal::Stream
     }
 
     // 2) Output device via WASAPI loopback (system audio) — build_input_stream on output device
-    if let Ok(devices) = host.output_devices() {
+    if let Some(Ok(devices)) = (device_type != Some("input")).then(|| host.output_devices()) {
         for device in devices {
             if let Ok(name) = device.name() {
                 if name == device_name || name.contains(device_name) || device_name.contains(&name)

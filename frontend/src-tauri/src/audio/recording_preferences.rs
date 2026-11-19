@@ -84,9 +84,8 @@ pub struct PerAppTarget {
 pub struct RecordingPreferences {
     pub save_folder: PathBuf,
     pub auto_save: bool,
-    /// In-person meetings capture only the microphone, never a system tap.
-    #[serde(default)]
-    pub in_person: bool,
+    #[serde(flatten)]
+    pub sources: super::recording_sources::RecordingSources,
     pub file_format: String,
     #[serde(default)]
     pub preferred_mic_device: Option<String>,
@@ -128,7 +127,7 @@ impl Default for RecordingPreferences {
         Self {
             save_folder: get_default_recordings_folder(),
             auto_save: true,
-            in_person: false,
+            sources: super::recording_sources::RecordingSources::default(),
             file_format: "mp4".to_string(),
             preferred_mic_device: None,
             preferred_system_device: None,
@@ -354,6 +353,19 @@ pub async fn load_recording_preferences<R: Runtime>(
         prefs
     };
 
+    // Persist the source upgrade without replacing unrelated/unknown store keys.
+    // A failed durable write must not pretend the migration completed.
+    if let Some(previous) = store.get("preferences") {
+        let mut migrated = previous.clone();
+        if super::recording_sources::RecordingSources::migrate_preferences(&mut migrated)
+            .map_err(anyhow::Error::msg)? {
+            store.set("preferences", migrated);
+            if let Err(error) = store.save() {
+                store.set("preferences", previous);
+                return Err(anyhow::anyhow!("Could not migrate recording sources: {error}. Capture was not started."));
+            }
+        }
+    }
     let mut prefs = prefs;
     // Auto-migrate single legacy target to targets list if needed
     if prefs.per_app_targets.is_empty() {
@@ -379,7 +391,20 @@ pub async fn load_recording_preferences<R: Runtime>(
 }
 
 /// Save recording preferences to store
+static PREFERENCES_WRITE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Full settings/device/gain writes cannot restore a stale source snapshot.
+/// Source inclusion has one explicit patch command, independent of these edits.
 pub async fn save_recording_preferences<R: Runtime>(
+    app: &AppHandle<R>, preferences: &RecordingPreferences,
+) -> Result<()> {
+    let _write = PREFERENCES_WRITE.lock().await;
+    let mut preferences = preferences.clone();
+    preferences.sources = load_recording_preferences(app).await?.sources;
+    persist_recording_preferences(app, &preferences).await
+}
+
+async fn persist_recording_preferences<R: Runtime>(
     app: &AppHandle<R>,
     preferences: &RecordingPreferences,
 ) -> Result<()> {
@@ -402,7 +427,7 @@ pub async fn save_recording_preferences<R: Runtime>(
     }
 
     if cfg!(target_os = "macos") && preferences.per_app_recording_enabled
-        && !preferences.in_person && preferences.per_app_targets.len() > 1 {
+        && preferences.sources.system_audio_enabled && preferences.per_app_targets.len() > 1 {
         super::recording_mode::validate_app_count(true, preferences.per_app_targets.len())
             .map_err(anyhow::Error::msg)?;
     }
@@ -472,6 +497,29 @@ pub async fn set_recording_preferences<R: Runtime>(
     save_recording_preferences(&app, &preferences)
         .await
         .map_err(|e| format!("Failed to save recording preferences: {}", e))
+}
+
+/// Source-only patch, serialized with Start so an idle click cannot silently
+/// rewrite the frozen source selection of an already-starting/active take.
+#[tauri::command]
+pub async fn set_recording_source_enabled<R: Runtime>(
+    app: AppHandle<R>, source: String, enabled: bool,
+) -> Result<super::recording_sources::RecordingSources, String> {
+    use tauri::Emitter;
+    let _lifecycle = super::common::acquire_engine_lifecycle_lock().await;
+    if super::recording_commands::is_recording_active() || super::recording_commands::is_recording_stopping() {
+        return Err("Recording already started. Stop before changing captured sources.".into());
+    }
+    let _write = PREFERENCES_WRITE.lock().await;
+    let mut prefs = load_recording_preferences(&app).await.map_err(|e| e.to_string())?;
+    match source.as_str() {
+        "microphone" => prefs.sources.microphone_enabled = enabled,
+        "system" => prefs.sources.system_audio_enabled = enabled,
+        _ => return Err("Unknown recording source".into()),
+    }
+    persist_recording_preferences(&app, &prefs).await.map_err(|e| e.to_string())?;
+    let _ = app.emit("recording-sources-changed", prefs.sources);
+    Ok(prefs.sources)
 }
 
 #[tauri::command]

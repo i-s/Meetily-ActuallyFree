@@ -29,7 +29,8 @@ export interface PerAppTarget {
 export interface RecordingPreferences {
   save_folder: string;
   auto_save: boolean;
-  in_person?: boolean;
+  microphone_enabled?: boolean;
+  system_audio_enabled?: boolean;
   file_format: string;
   preferred_mic_device: string | null;
   preferred_system_device: string | null;
@@ -207,17 +208,6 @@ export function RecordingSettings({ onSave }: RecordingSettingsProps) {
 
   return (
     <div className="min-w-0 max-w-full space-y-5">
-      <div className="flex min-w-0 items-center justify-between gap-4 rounded-2xl border border-af-border bg-af-panel-2/40 p-5">
-        <div className="min-w-0 flex-1">
-          <h3 className="text-[15px] font-semibold text-af-text">In-person meeting</h3>
-          <p className="mt-0.5 text-[13px] leading-relaxed text-af-text-3">
-            Microphone only for the next recording. Computer audio and chosen apps are not captured.
-            Microphone labels indicate the source, not who spoke in the room.
-          </p>
-        </div>
-        <Switch aria-label="In-person meeting" checked={preferences.in_person ?? false} disabled={saving}
-          onCheckedChange={(in_person) => void savePreferences({ in_person })} className="shrink-0" />
-      </div>
       <div className="flex min-w-0 items-center justify-between gap-4 rounded-2xl border border-af-border bg-af-panel-2/40 p-5">
         <div className="min-w-0 flex-1">
           <h3 className="text-[15px] font-semibold text-af-text">Save audio</h3>

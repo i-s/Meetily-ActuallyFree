@@ -51,7 +51,7 @@ async function invokeNative(name: string, args: any = {}) {
   if (name === 'parakeet_init') return;
   if (name === 'get_database_directory') { databaseEntered?.(); await databaseGate; return data; }
   if (name === 'get_audio_devices') return [];
-  if (name === 'get_recording_preferences') return {};
+  if (name === 'get_recording_preferences') return { microphone_enabled: true, system_audio_enabled: true };
   if (name === 'stop_recording' && args.args?.manual_generation && failManualStopOnce) { failManualStopOnce = false; throw new Error('Synthetic manual Stop transport failure'); }
   if (name === 'stop_recording') await stopGate;
   const gate = name === 'start_recording_with_devices_and_meeting' ? replyGate : undefined;
@@ -72,7 +72,7 @@ mock.module('@/lib/labs', () => ({ loadLabsPreferences: () => ({ meetingAutomati
 mock.module('@/contexts/TranscriptContext', () => ({ useTranscripts: () => ({ clearTranscripts: noop, setMeetingTitle: noop }) }));
 mock.module('@/components/Sidebar/SidebarProvider', () => ({ useSidebar: () => ({ setIsMeetingActive: noop, meetings: [] }) }));
 mock.module('@/contexts/ConfigContext', () => ({ useConfig: () => ({ selectedDevices: { micDevice: null, systemDevice: null }, setSelectedDevices: noop }) }));
-mock.module('@/contexts/RecordingStateContext', () => ({ RecordingStatus: { IDLE: 'idle', STARTING: 'starting', ERROR: 'error' }, useRecordingState: () => ({ setStatus: noop, activeDuration: 3, inPerson: false }) }));
+mock.module('@/contexts/RecordingStateContext', () => ({ RecordingStatus: { IDLE: 'idle', STARTING: 'starting', ERROR: 'error' }, useRecordingState: () => ({ setStatus: noop, activeDuration: 3, microphoneCaptured: true, systemAudioCaptured: true }) }));
 mock.module('@/lib/groups', () => ({ readPendingGroup: () => null, writePendingGroup: noop }));
 mock.module('@/lib/live-session', () => ({ automaticTitle: () => 'Synthetic combined meeting', beginLiveSession: () => { lives++; } }));
 mock.module('@/lib/recordingNotification', () => ({ showRecordingNotification: async () => {} }));

@@ -13,7 +13,8 @@ export interface RecordingState {
   is_recording: boolean;
   is_stopping?: boolean;
   recording_lease?: RecordingLease | null;
-  in_person?: boolean;
+  microphone_captured?: boolean;
+  system_audio_captured?: boolean;
   is_paused: boolean;
   is_microphone_muted: boolean;
   is_system_audio_muted: boolean;

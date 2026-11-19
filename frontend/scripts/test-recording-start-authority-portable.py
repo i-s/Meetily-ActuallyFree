@@ -95,6 +95,7 @@ pub fn get_discord_automation_status()->Status{STATUS.lock().unwrap().clone().un
 struct Manager;
 impl Manager {
  fn is_paused(&self)->bool{false} fn get_state(&self)->&Self{self}
+ fn active_capture_sources(&self)->Option<(bool,bool)>{Some((true,true))}
  fn is_microphone_muted(&self)->bool{false} fn is_system_audio_muted(&self)->bool{false}
  fn is_active(&self)->bool{true} fn get_recording_duration(&self)->Option<f64>{Some(1.)}
  fn get_active_recording_duration(&self)->Option<f64>{Some(1.)}

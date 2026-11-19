@@ -22,7 +22,7 @@ mock.module('@tauri-apps/api/core', () => ({ invoke: async (name: string, args: 
   calls.push({ name, args });
   if (name === 'get_recording_state') return { is_recording: !!current, is_stopping: false, recording_lease: current };
   if (name === 'get_audio_devices') return [];
-  if (name === 'get_recording_preferences') return {};
+  if (name === 'get_recording_preferences') return { microphone_enabled: true, system_audio_enabled: true };
   if (name === 'get_database_directory') { await dataGate; return '/synthetic'; }
   if (name === 'stop_recording') {
     if (failStopOnce) { failStopOnce = false; throw new Error('Synthetic Stop transport failure'); }
@@ -33,7 +33,7 @@ mock.module('@tauri-apps/api/core', () => ({ invoke: async (name: string, args: 
 } }));
 mock.module('@tauri-apps/api/event', () => ({ listen: async () => noop }));
 mock.module('@/lib/labs', () => ({ loadLabsPreferences: () => ({ meetingAutomation: enabled }) }));
-mock.module('@/contexts/RecordingStateContext', () => ({ useRecordingState: () => ({ activeDuration: 3, inPerson: false }) }));
+mock.module('@/contexts/RecordingStateContext', () => ({ RecordingStatus: { STARTING: 'starting' }, useRecordingState: () => ({ activeDuration: 3, microphoneCaptured: true, systemAudioCaptured: true }) }));
 mock.module('@/contexts/ConfigContext', () => ({ useConfig: () => ({ selectedDevices: { micDevice: null, systemDevice: null }, setSelectedDevices: noop }) }));
 mock.module('@/hooks/usePlatform', () => ({ usePlatform: () => 'macos' }));
 mock.module('@/hooks/usePendingGroup', () => ({ usePendingGroup: () => [null, noop] }));

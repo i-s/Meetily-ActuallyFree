@@ -325,13 +325,14 @@ async fn save_transcript(file_path: String, content: String) -> Result<(), Strin
 async fn start_audio_level_monitoring<R: Runtime>(
     app: AppHandle<R>,
     device_names: Vec<String>,
+    device_type: Option<String>,
 ) -> Result<(), String> {
     log_info!(
         "Starting audio level monitoring for devices: {:?}",
         device_names
     );
 
-    audio::simple_level_monitor::start_monitoring(app, device_names)
+    audio::simple_level_monitor::start_monitoring(app, device_names, device_type)
         .await
         .map_err(|e| format!("Failed to start audio level monitoring: {}", e))
 }
@@ -952,6 +953,7 @@ pub fn run() {
             openrouter::get_openrouter_models,
             audio::recording_preferences::get_recording_preferences,
             audio::recording_preferences::set_recording_preferences,
+            audio::recording_preferences::set_recording_source_enabled,
             audio::recording_preferences::get_default_recordings_folder_path,
             audio::recording_preferences::open_recordings_folder,
             audio::recording_preferences::discard_recording_folder,
