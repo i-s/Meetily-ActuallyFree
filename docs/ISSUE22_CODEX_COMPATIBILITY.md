@@ -1,9 +1,11 @@
 # Issue #22 — capability-based installed Codex CLI compatibility
 
-Live issue body and empty comments read 2026-11-19. Technical stage only,
-local branch `meetily/ux-22`, verified parent
+Live issue body and empty comments read 2026-11-19. Local implementation,
+branch `meetily/ux-22`, verified base
 `c05a32f64d703a29083186110b72a01f6eca1449` (restored SQLx migration history).
-No other issue/PR, migration, UI source, account or owner Mac was changed.
+Technical stage was committed as `08b16a1beec3c4d34f10b0c9a30f06c5ac4c0fa7`;
+the owner subsequently chose compact UI variant A in this thread. No other
+issue/PR, migration, account or owner Mac was changed.
 
 ## Data flow and compatibility boundary
 
@@ -127,30 +129,69 @@ Temporary evidence: `/tmp/meetily22-final-native.log`,
 `/tmp/meetily22-final-real167.log`, `/tmp/meetily22-final-real170.log`.
 These are local diagnostic artifacts, not committed fixtures or a public release.
 
-## UI preparation and remaining manual milestone
+## Owner-selected status A and remaining manual milestone
 
-No visible UI source changed. In particular, the old Settings copy still says
-0.167.2; changing that copy and presentation is intentionally deferred with the
-rest of UI until owner choice, not claimed complete.
+After the coordinator explicitly transferred the one-question UX slot from #23,
+two interactive alternatives were supplied in existing Settings → Live questions
+context, with the same compatible-but-signed-out 0.170.0 scenario. The prototype
+retained the existing path field and `Save and check` / `Check path` actions;
+variant A collapses its three checks, variant B keeps them visible. The inline
+HTML tool rejected its exposed html/path argument combination; the immediate
+standalone fallback was `/tmp/meetily22-status-options-v2.html`. The owner then
+explicitly answered **“Вариант A.”** No visible product UI was changed before
+that answer. No waiting/UX-relay callback was sent to the coordinator.
 
-Two functional local throwaway alternatives are prepared but NOT demonstrated
-or put to an owner question while #23 owns the slot:
+`frontend/src/components/CodexCliSettings.tsx` now implements A:
 
-- A: one concise status/next action, expandable path/version and sign-in details.
-- B: three separate installation / compatibility / isolated-login rows, the same
-  diagnostics and actions. Both use the same five synthetic status scenarios,
-  expandable details, path edit/check simulation and login instructions.
+- One concise heading and next-step/reason distinguish missing, unsupported,
+  blocked isolation, check error, compatible signed-out, and ready states.
+  Native incompatibility/blocked reasons remain visible, not replaced with a
+  version-range guess. An inconsistent ready result fails closed in presentation.
+- Native HTML disclosures keep **What was checked** (installation/compatibility/
+  isolated login) and **CLI path, version and isolation details** collapsed by
+  default, keyboard-accessible via summary. Labels communicate meaning without
+  relying on color. The old hard-coded 0.167.2 requirement is removed.
+- **Separate ChatGPT sign-in** is offered only for a compatible signed-out CLI
+  with a known executable and private auth home. Its properly POSIX-quoted
+  command is display-only; no button, shell execution, login request, API provider,
+  model selection or new native command was added. Incompatible/blocked/error/
+  ready states do not display a sign-in command.
+- Existing path/save/check controls and native IPC arguments remain. Editing
+  invalidates prior readiness; generation guards suppress stale results after
+  editing/unmount. A queued path event also releases the busy UI so an obsolete
+  result cannot leave its controls disabled. Native subprocess ownership and
+  limits remain independent of the UI.
+- A permanent footnote distinguishes local readiness from network/quota and
+  reiterates that recording, local ASR and Notes remain independent. No model
+  input is sent by the Settings component.
 
-Prototype: `/tmp/meetily22-status-options.html`. No external scripts, network,
-CLI invocation or credentials. After explicit slot transfer (or owner's direct
-opening here), show both using `html_preview` then `html_render`, ask the concrete
-choice here, and wait for the actual answer. No coordinator callback requesting
-relay of that question.
+### Frontend verification
 
-Pending: UI choice and implementation/tests; actual Mac/Dock executable discovery,
-private-auth-home permissions and scratch-HOME behavior; owner-controlled separate
-ChatGPT login and real-subscription smoke only after coordination. Local fixtures
-do not establish account access, quota, semantic quality, remote latency,
+- Red/green mounted production-component tests: **11 passed, 0 failed**. They
+  exercise all readiness categories, initially collapsed disclosure markup,
+  existing actions only, no unsafe login instruction, quoted spaces/apostrophes,
+  check without save, trimmed path/automatic discovery save, native check failure,
+  pending control disabling, late result invalidation and unmount during path
+  loading. Every mocked IPC invocation is restricted to the three existing
+  local path/status/save commands; no model/service operation is permitted.
+- Full isolated frontend suite: **73/73 test files passed**, with each Bun file
+  in a fresh process. Expected synthetic storage/autosave failure diagnostics in
+  other groups are printed while their assertions pass; they are not hidden
+  product failures. This is mock/fixture coverage, not real desktop transport.
+- Standalone TypeScript `tsc -p frontend/tsconfig.json --noEmit --incremental false`
+  passed, separate from any Next build. Available cached dependencies were reused
+  by a local ignored node_modules symlink after matching pnpm lockfiles; no
+  package installation or changes to another worktree were made.
+- The native **33 passed / 5 ignored** default suite and **5/5 per exact real
+  binary** loopback controls described above were re-run for final qualification.
+  Evidence: `/tmp/meetily22-ui-green.log`, `/tmp/meetily22-ui-all.log`,
+  `/tmp/meetily22-ui-types.log`, and the native/real logs listed above.
+
+**Manual milestone remains:** verify this selected presentation on the owner's
+Mac, Dock executable discovery, private-auth-home permissions and scratch-HOME
+behavior; owner-controlled separate ChatGPT login and real-subscription smoke
+only after coordination. Rendered-component tests do not establish actual Mac
+focus/layout/interaction, account access, quota, semantic quality, remote latency,
 recording/ASR responsiveness on hardware, desktop IPC or a packaged installation.
 No frontend production export, native desktop build, DMG, Actions, push, PR,
 release, account changes or owner-Mac actions occurred. No #24 work started.

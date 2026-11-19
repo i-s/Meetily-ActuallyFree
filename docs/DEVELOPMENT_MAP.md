@@ -276,7 +276,9 @@ process ownership, stable interfaces and remaining real-subscription/physical Ma
 gates. The [#22 compatibility follow-up](ISSUE22_CODEX_COMPATIBILITY.md) replaces
 one-version equality with shared local parser/capability checks, scratch HOME,
 real 0.167.2/0.170.0 request/tool/leak controls and a loopback-only Linux test
-runner; visible Settings presentation remains deferred to the owner choice.
+runner. Owner-selected status A keeps existing Settings controls, one concise
+readiness heading and collapsed checks/path/version/sign-in details; the note
+separates its mounted UI coverage from unqualified Mac/account gates.
 The live path has no summary-provider/API/key fallback and reads no other
 meetings, contacts or audio. Saved-library/group AI is a separate legacy path.
 
