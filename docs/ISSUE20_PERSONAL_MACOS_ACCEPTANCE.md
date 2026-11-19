@@ -9,6 +9,12 @@ operation, upload of meeting material, or installation is authorized by this not
 
 ## 1. Authority, source and present evidence
 
+Installed-startup follow-up: the confirmed SQLx missing-history failure is repaired
+by restoring authentic fork migration bytes, not bypassing validation. The
+[exact lineage/checksum audit and generated-DB tests](ISSUE20_MIGRATION_LINEAGE.md)
+record the source repair and added native workflow gate. Owner relaunch on a
+corrected final artifact remains unobserved here.
+
 Live issue/body/comments and linked AC read 2026-11-19:
 [#20](https://github.com/i-s/Meetily-ActuallyFree/issues/20),
 [#5](https://github.com/i-s/Meetily-ActuallyFree/issues/5),

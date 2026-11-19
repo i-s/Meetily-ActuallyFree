@@ -9,3 +9,7 @@ frontend/src-tauri/migrations/20260914010000_add_summary_max_tokens.sql text eol
 frontend/src-tauri/migrations/20260926010000_add_groups.sql text eol=lf
 frontend/src-tauri/migrations/20260928000000_unified_workspace.sql text eol=lf
 frontend/src-tauri/migrations/20260928010000_reset_placeholder_titles.sql text eol=lf
+frontend/src-tauri/migrations/20260930000000_add_codex_cli_path.sql text eol=lf
+frontend/src-tauri/migrations/20261026020000_persistent_meeting_chat.sql text eol=lf
+frontend/src-tauri/migrations/20261026030000_summary_input_snapshot.sql text eol=lf
+frontend/tests/fixtures/migration-lineage/*.sql text eol=lf

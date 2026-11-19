@@ -403,7 +403,15 @@ source/export checks live in `scripts/verify_macos_candidate.py`, covered by
 `tests/test_macos_candidate.py`. The workflow checks actual frontend output,
 aligned source/app versions and byte-identical bundled models. The owner record
 maps all live AC to evidence, keeps Zoom/Discord observation-only and every physical
-gate explicitly NOT RUN, and separates source/workflow/artifact identities.
+gates explicitly NOT RUN, and separates source/workflow/artifact identities.
+
+The installed-startup SQLx `VersionMissing(20260930000000)` repair restores three
+authentic fork migrations without weakening validation. Read the
+[exact lineage/checksum audit and generated persistent-DB regressions](ISSUE20_MIGRATION_LINEAGE.md)
+before changing migration history. `database/migration_lineage_tests.rs` runs under
+the production manager, via the focused portable runner and the macOS native gate;
+fresh, legacy, later-candidate, checksum-mismatch and unknown-version paths are
+separate from owner data/installed acceptance.
 
 macOS publication supports an explicitly labeled CI-qualified preview via
 `publish-macos.yml` (`preview=true`). It records no physical-test attestation,
