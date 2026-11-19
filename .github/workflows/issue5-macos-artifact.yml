@@ -18,7 +18,7 @@ concurrency:
 env:
   # Candidate source metadata; update SOURCE_SHA after the authorized remote import
   # and keep ORIGINAL_LOCAL_SHA equal to the local approved commit below.
-  SOURCE_SHA: 4eee1282792b3d6213870ee8383c20dc6d9f6bf7
+  SOURCE_SHA: e37be614bcf286c0c401fb5edf64efa93282be03
   SOURCE_TREE: 9aeca6832be9b4d267dcb137b1ddfc5b3a7e1034
   ORIGINAL_LOCAL_SHA: e37be614bcf286c0c401fb5edf64efa93282be03
   ACCEPTED_BASE_SHA: 50f6e973a637f8da9239df058d7df6d0bece2730
