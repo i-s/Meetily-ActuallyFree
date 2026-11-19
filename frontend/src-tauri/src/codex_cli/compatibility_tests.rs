@@ -64,10 +64,41 @@ async fn compatibility_signed_out_is_not_incompatible_and_never_sends_meeting() 
         for login in ["Not logged in", "Logged in using an API key"] {
             let (dir, binary) = capable(version, HELP, false, login);
             let home = dir.path().join("auth");
-            assert_eq!(probe(binary.to_str(), &home).await.readiness, "signed_out");
+            let status = probe(binary.to_str(), &home).await;
+            assert_eq!(status.readiness, "signed_out");
+            assert!(status.error.is_none(), "recognized authentication state: {status:?}");
             assert!(generate(binary.to_str(), &home, "default", "private", "PRIVATE_MEETING", None).await.is_err());
             assert!(!dir.path().join("meeting-stdin").exists());
         }
+    }
+}
+
+#[tokio::test]
+async fn login_probe_failures_do_not_request_sign_in() {
+    for (after_parser, login_body, expected_state, expected_reason) in [
+        ("Path(os.environ['CODEX_HOME'], 'AGENTS.override.md').touch()", "pass", "blocked", "AGENTS"),
+        ("Path(__file__).unlink()", "pass", "error", "Cannot start Codex CLI"),
+        ("pass", "print('PRIVATE_DETAIL', file=sys.stderr); sys.exit(2)", "error", "login status"),
+        ("pass", "print('unknown authentication mode')", "error", "login status"),
+        ("pass", "import time; time.sleep(12)", "error", "did not respond"),
+    ] {
+        let (dir, binary) = fixture(&format!(r#"#!/usr/bin/python3 -I
+import os, sys
+from pathlib import Path
+args = sys.argv[1:]
+if args == ['--version']: print('codex-cli 0.170.0')
+elif args == ['exec', '--help']: print({HELP:?})
+elif '--help' in args: {after_parser}
+elif args == ['login', 'status']: {login_body}
+else: Path(__file__).with_suffix('.sent').touch()
+"#));
+        let status = probe(binary.to_str(), &dir.path().join("auth")).await;
+        assert_eq!(status.readiness, expected_state, "{status:?}");
+        assert!(status.installed && !status.logged_in);
+        let reason = status.error.unwrap();
+        assert!(reason.contains(expected_reason), "{reason}");
+        assert!(!reason.contains("PRIVATE_DETAIL"));
+        assert!(!binary.with_extension("sent").exists());
     }
 }
 

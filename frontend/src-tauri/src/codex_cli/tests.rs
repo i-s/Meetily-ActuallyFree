@@ -103,23 +103,23 @@ fn codex_cli_response_requires_completion_and_uses_last_agent_message() {
 
 #[test]
 fn codex_cli_auth_never_accepts_api_key_or_failed_status() {
-    for text in ["Logged in using an API key - sk-test", "Not logged in", ""] {
-        assert!(!chatgpt_login(&Output {
+    for text in ["Logged in using an API key - sk-test", "Not logged in"] {
+        assert_eq!(chatgpt_login(&Output {
             success: true,
             stdout: String::new(),
             stderr: text.into()
-        }));
+        }), Ok(false));
     }
-    assert!(chatgpt_login(&Output {
+    assert_eq!(chatgpt_login(&Output {
         success: true,
         stdout: String::new(),
         stderr: "Logged in using ChatGPT\n".into()
-    }));
-    assert!(!chatgpt_login(&Output {
+    }), Ok(true));
+    assert!(chatgpt_login(&Output {
         success: false,
         stdout: "Logged in using ChatGPT".into(),
         stderr: String::new()
-    }));
+    }).is_err());
 }
 
 #[cfg(unix)]

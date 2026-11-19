@@ -25,8 +25,12 @@ Before login status and before meeting stdin:
 3. Have the CLI parser accept the complete production argument vector, replacing
    stdin marker `-` with `--help`. This catches rejected argument combinations;
    it is not just a substring check. No stdin or model turn is supplied.
-4. Check isolated ChatGPT login. Missing/API-key login remains `signed_out`, not
-   `unsupported`. No meeting stdin reaches either incompatible or signed-out CLI.
+4. Check isolated ChatGPT login. Only an explicit signed-out or API-key login
+   response produces `signed_out` (with no probe error). A rejected private
+   home before the login command produces `blocked`. A spawn failure, timeout,
+   or unrecognized login response produces `error`. Raw CLI diagnostics can
+   contain account data and are excluded from the displayed reason. Generation
+   uses the same login parser before writing meeting text.
 
 `readiness` and the command interfaces are unchanged: `missing`, `unsupported`,
 `blocked`, `error`, `signed_out`, `ready`. `ready` is local parser/login readiness,
@@ -151,6 +155,11 @@ that answer. No waiting/UX-relay callback was sent to the coordinator.
   isolated login) and **CLI path, version and isolation details** collapsed by
   default, keyboard-accessible via summary. Labels communicate meaning without
   relying on color. The old hard-coded 0.167.2 requirement is removed.
+- The R1 regression exercises a private-home check that fails after the CLI
+  has already passed compatibility, and a binary that disappears, times out,
+  or returns an unrecognized login status. A mounted Settings regression also
+  verifies that a probe error wins over an inconsistent signed-out label and
+  suppresses the login command.
 - **Separate ChatGPT sign-in** is offered only for a compatible signed-out CLI
   with a known executable and private auth home. Its properly POSIX-quoted
   command is display-only; no button, shell execution, login request, API provider,
@@ -186,6 +195,11 @@ that answer. No waiting/UX-relay callback was sent to the coordinator.
   binary** loopback controls described above were re-run for final qualification.
   Evidence: `/tmp/meetily22-ui-green.log`, `/tmp/meetily22-ui-all.log`,
   `/tmp/meetily22-ui-types.log`, and the native/real logs listed above.
+
+After the R1 correction the portable suite passed 34 tests. The 5 optional
+loopback tests also passed separately on each of the two listed Linux binaries.
+Mounted Settings passed 12 tests, all 73 isolated frontend files passed, and
+standalone TypeScript checking passed.
 
 **Manual milestone remains:** verify this selected presentation on the owner's
 Mac, Dock executable discovery, private-auth-home permissions and scratch-HOME

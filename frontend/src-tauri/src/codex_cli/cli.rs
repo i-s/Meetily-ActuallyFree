@@ -259,13 +259,21 @@ async fn run(
     result
 }
 
-fn chatgpt_login(output: &Output) -> bool {
-    output.success
-        && output
-            .stdout
-            .lines()
-            .chain(output.stderr.lines())
-            .any(|line| line.trim().eq_ignore_ascii_case("Logged in using ChatGPT"))
+fn chatgpt_login(output: &Output) -> Result<bool, &'static str> {
+    for line in output.stdout.lines().chain(output.stderr.lines()).map(str::trim) {
+        if output.success && line.eq_ignore_ascii_case("Logged in using ChatGPT") {
+            return Ok(true);
+        }
+        // The CLI reports an empty home with a nonzero exit. API-key status
+        // can include a redacted key after the login method; never display it.
+        let method = line.split_once(" - ").map_or(line, |(method, _)| method);
+        if line.eq_ignore_ascii_case("Not logged in")
+            || (output.success && method.eq_ignore_ascii_case("Logged in using an API key"))
+        {
+            return Ok(false);
+        }
+    }
+    Err("Could not determine the isolated ChatGPT login status. No meeting text was sent.")
 }
 
 /// Auth remains owned by the installed CLI in a separate persistent home.
@@ -392,11 +400,12 @@ pub async fn probe(configured: Option<&str>, auth_home: &Path) -> CodexCliStatus
         status.version = Some(version.stdout.trim().to_string());
         status.readiness = "unsupported";
         check_capabilities(&binary, cwd.path(), auth_home, DEFAULT_MODEL, None).await?;
-        status.readiness = "signed_out";
-        let login = run(checked_command(&binary, &["login", "status"], cwd.path(), auth_home).await?, None, PROBE_TIMEOUT, None).await?;
-        status.logged_in = chatgpt_login(&login);
-        if !status.logged_in { return Err("Use the isolated ChatGPT sign-in command in Settings > Live questions, then re-check. API-key login is not used by this provider.".into()); }
-        status.readiness = "ready";
+        status.readiness = "blocked";
+        let login_command = checked_command(&binary, &["login", "status"], cwd.path(), auth_home).await?;
+        status.readiness = "error";
+        let login = run(login_command, None, PROBE_TIMEOUT, None).await?;
+        status.logged_in = chatgpt_login(&login)?;
+        status.readiness = if status.logged_in { "ready" } else { "signed_out" };
         Ok::<(), String>(())
     }.await;
     status.error = result.err();
@@ -536,7 +545,7 @@ pub async fn generate(
         token,
     )
     .await?;
-    if !chatgpt_login(&login) {
+    if !chatgpt_login(&login)? {
         return Err("Codex CLI needs a separate ChatGPT sign-in in its isolated live auth home. Use the exact command in Settings > Live questions.".into());
     }
     let args = generation_args(model);

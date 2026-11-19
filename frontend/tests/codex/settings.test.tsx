@@ -27,7 +27,7 @@ beforeEach(() => {
   statusRequest = null;
   pathRequest = null;
   status = { installed: true, path: savedPath, version: 'codex-cli 0.170.0', logged_in: false,
-    readiness: 'signed_out', auth_home: authHome, error: 'Separate isolated ChatGPT sign-in required' };
+    readiness: 'signed_out', auth_home: authHome, error: null };
 });
 afterEach(async () => {
   if (root) await act(async () => { root!.unmount(); });
@@ -95,6 +95,15 @@ test('inconsistent ready result is not presented as permission to send a meeting
   const view = await mount();
   expect(text(view.root.findByType('h4'))).toBe('CLI check failed');
   expect(text(disclosure('What was checked'))).not.toContain('Confirmed');
+});
+
+test('a failed native probe takes precedence over a signed-out label', async () => {
+  status.error = 'Cannot verify isolated Codex auth home';
+  const view = await mount();
+  expect(text(view.root.findByType('h4'))).toBe('CLI check failed');
+  expect(text(view.root)).toContain(status.error);
+  expect(text(disclosure('What was checked'))).toContain('Isolated ChatGPT loginNot checked');
+  expect(view.root.findAllByProps({ 'aria-label': 'Isolated Codex sign-in command' })).toHaveLength(0);
 });
 
 test('Check path does not save while Save and check persists the trimmed path, including automatic discovery', async () => {

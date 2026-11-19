@@ -14,14 +14,15 @@ const STATUS_COPY: Record<string, { title: string; description: string }> = {
   ready: { title: 'Ready for questions', description: 'Local checks passed. Requests use your ChatGPT subscription; network availability and quota are not confirmed.' },
 };
 function statusPresentation(status: CodexStatus) {
-  const reportedReady = status.installed && status.logged_in && !status.error;
-  const readiness = status.readiness === 'ready' && !reportedReady ? 'error' : status.readiness;
+  const hasLoginResult = status.readiness === 'ready' || status.readiness === 'signed_out';
+  const validLoginResult = status.installed && !status.error && status.logged_in === (status.readiness === 'ready');
+  const readiness = hasLoginResult && !validLoginResult ? 'error' : status.readiness;
   const copy = STATUS_COPY[readiness] ?? STATUS_COPY.error;
   const compatible = readiness === 'ready' || readiness === 'signed_out';
   return {
     readiness,
     title: copy.title,
-    description: compatible ? copy.description : status.error || copy.description,
+    description: status.error || copy.description,
     canSignIn: readiness === 'signed_out' && status.installed && !!status.path && !!status.auth_home,
     checks: [
       ['CLI installation', status.installed ? 'Found' : readiness === 'missing' ? 'Not found' : 'Not checked'],
