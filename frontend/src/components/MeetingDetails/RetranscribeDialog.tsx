@@ -26,6 +26,7 @@ import { useRouter } from 'next/navigation';
 import { LANGUAGES } from '@/constants/languages';
 import { useTranscriptionModels, ModelOption } from '@/hooks/useTranscriptionModels';
 import Analytics from '@/lib/analytics';
+import { useSavedAudioRevision } from '@/hooks/useSavedAudioRevision';
 import { announceChange } from '@/lib/workspace-api';
 
 interface RetranscribeDialogProps {
@@ -83,6 +84,16 @@ export function RetranscribeDialog({
   const [savedMeetingVocabulary, setSavedMeetingVocabulary] = useState('');
   const [isClearingMeetingVocabulary, setIsClearingMeetingVocabulary] = useState(false);
   const [listenersReady, setListenersReady] = useState(false);
+  const [audioAvailable, setAudioAvailable] = useState(false);
+  const savedAudioRevision = useSavedAudioRevision(meetingId);
+  useEffect(() => {
+    let active = true;
+    setAudioAvailable(false);
+    if (open) void invoke<{ audio_available: boolean }>('list_transcript_versions', { meetingId })
+      .then(state => { if (active) setAudioAvailable(state.audio_available); })
+      .catch(cause => { if (active) setError(`Cannot check saved audio: ${String(cause)}`); });
+    return () => { active = false; };
+  }, [open, meetingId, savedAudioRevision]);
 
   // Use centralized model fetching hook
   const {
@@ -201,7 +212,7 @@ export function RetranscribeDialog({
 
             setIsProcessing(false);
             toast.success(
-              `Retranscription complete! ${event.payload.segments_count} segments created.`
+              `Refined version saved separately (${event.payload.segments_count} segments). Review it in Transcript versions; current text is unchanged.`
             );
             announceChange('people');
             onCompleteRef.current?.();
@@ -294,10 +305,10 @@ export function RetranscribeDialog({
   const handleCancel = async () => {
     if (isProcessing) {
       try {
-        await invoke('cancel_retranscription_command');
+        await invoke('cancel_retranscription_command', { meetingId });
         setIsProcessing(false);
         setProgress(null);
-        toast.info('Retranscription cancelled');
+        toast.info('Cancellation requested. Native inference may still be finishing; check Transcript versions for its saved status.');
       } catch (err) {
         console.error('Failed to cancel retranscription:', err);
       }
@@ -372,11 +383,12 @@ export function RetranscribeDialog({
               ? progress?.message || 'Processing audio...'
               : error
                 ? 'An error occurred during retranscription'
-                : 'Re-process the audio with a different model, language, or vocabulary hints'}
+                : 'Local ASR and speaker refinement create a separate version. Current text and speaker corrections stay selected; choose a result in Transcript versions after review.'}
           </DialogDescription>
         </DialogHeader>
 
         <div className="space-y-4 py-4">
+          {!audioAvailable && !isProcessing && <p role="status" className="text-sm text-af-text-2">Saved audio is unavailable or still being checked. Reprocessing is disabled. Existing transcript versions remain readable.</p>}
           {!isProcessing && !error && (
             !isParakeetModel ? (
               <div className="space-y-3">
@@ -579,7 +591,7 @@ export function RetranscribeDialog({
               <Button
                 onClick={handleStartRetranscription}
                 className="bg-af-accent hover:bg-af-accent-hover"
-                disabled={!meetingFolderPath || !listenersReady || isClearingMeetingVocabulary || loadingModels || !selectedModelDetails}
+                disabled={!audioAvailable || !meetingFolderPath || !listenersReady || isClearingMeetingVocabulary || loadingModels || !selectedModelDetails}
               >
                 <RefreshCw className="h-4 w-4 mr-2" />
                 Start Retranscription

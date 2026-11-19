@@ -13,9 +13,8 @@ import {
   getClaudeCliStatus,
 } from '@/lib/claude-cli';
 import {
-  detectAndCacheSummaryLanguage,
+  detectTranscriptSummaryLanguage,
   readMeetingSummaryLanguage,
-  readCachedDetectedSummaryLanguage,
 } from '@/lib/summary-language-preferences';
 
 /**
@@ -38,7 +37,7 @@ async function claudeCliPreflight(): Promise<{ message: string; installed: boole
   }
 }
 
-async function resolveSummaryLanguage(
+export async function resolveSummaryLanguage(
   meetingId: string,
   transcriptTexts: string[]
 ): Promise<string | null> {
@@ -52,15 +51,10 @@ async function resolveSummaryLanguage(
     });
   }
 
+  // Detection is cheap and local. Do not consume or mutate the legacy
+  // meeting-only cache: it cannot prove which version/revision produced it.
   try {
-    const cachedDetected = await readCachedDetectedSummaryLanguage(meetingId);
-    if (cachedDetected) return cachedDetected;
-  } catch (err) {
-    console.warn('Failed to load cached detected summary language:', err);
-  }
-
-  try {
-    const detection = await detectAndCacheSummaryLanguage(meetingId, transcriptTexts);
+    const detection = await detectTranscriptSummaryLanguage(transcriptTexts);
     if (detection.reason === 'tie') {
       toast.warning('Bilingual transcript detected', {
         description: 'Pick a summary language manually if Auto chooses the wrong fallback.',

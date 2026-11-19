@@ -12,8 +12,8 @@ use super::capture::{AudioCaptureBackend, get_current_backend};
 
 #[cfg(target_os = "macos")]
 use super::capture::CoreAudioCapture;
-#[cfg(target_os = "macos")]
-use super::recording_state::AudioError;
+#[cfg(any(target_os = "macos", test))]
+pub(super) mod core_audio_processing;
 
 /// Stream backend implementation
 pub enum StreamBackend {
@@ -204,77 +204,28 @@ impl AudioStream {
         // The stream needs to be polled continuously to produce samples
         let device_name = device.name.clone();
         info!("🔊 Stream: Spawning tokio task to poll Core Audio stream...");
-        let task = tokio::spawn({
-            let capture = capture.clone();
-            let mut stream = core_stream;
-
-            async move {
-                use futures_util::StreamExt;
-
-                let mut buffer = Vec::new();
-                let mut frame_count = 0;
-                let frames_per_chunk = 1024; // Process in chunks of 1024 samples
-                let mut terminal_error_reported = false;
-
-                info!("✅ Stream: Core Audio processing task started for {}", device_name);
-
-                let mut _sample_count = 0u64;
-                loop {
-                    let sample = match tokio::time::timeout(
-                        tokio::time::Duration::from_secs(5),
-                        stream.next(),
-                    )
-                    .await
-                    {
-                        Ok(Some(sample)) => sample,
-                        Ok(None) => break,
-                        Err(_) => {
-                            error!(
-                                "Core Audio stopped delivering callbacks for {}",
-                                device_name
-                            );
-                            state_for_stream.report_error(AudioError::ChannelClosed);
-                            terminal_error_reported = true;
-                            break;
-                        }
-                    };
-                    let current_sample_rate = stream.sample_rate();
-                    if current_sample_rate != sample_rate {
-                        error!(
-                            "Core Audio sample rate changed during recording: {} -> {} Hz",
-                            sample_rate, current_sample_rate
-                        );
-                        state_for_stream.report_error(AudioError::SampleRateUnsupported);
-                        terminal_error_reported = true;
-                        break;
-                    }
-                    _sample_count += 1;
-                    // if _sample_count % 48000 == 0 {
-                    //     info!("📊 Stream: Received {} samples from Core Audio stream", _sample_count);
-                    // }
-
-                    buffer.push(sample);
-                    frame_count += 1;
-
-                    // Process when we have enough samples
-                    if frame_count >= frames_per_chunk {
-                        capture.process_audio_data(&buffer);
-                        buffer.clear();
-                        frame_count = 0;
-                    }
+        let monitor_state = state_for_stream.clone();
+        let processing = core_audio_processing::process_core_audio_stream(
+            core_stream,
+            |stream| stream.sample_rate(),
+            move |samples| capture.process_audio_data(samples),
+            state_for_stream,
+            device_name,
+            sample_rate,
+        );
+        let task = tokio::spawn(async move {
+            if let Some(pid) = target_pid {
+                tokio::select! {
+                    _ = processing => {},
+                    _ = core_audio_processing::watch_selected_process(pid, monitor_state, |pid| {
+                        let mut system = sysinfo::System::new();
+                        let pid = sysinfo::Pid::from_u32(pid);
+                        system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
+                        system.process(pid).is_some()
+                    }) => {},
                 }
-
-                // Process any remaining samples
-                if !buffer.is_empty() {
-                    capture.process_audio_data(&buffer);
-                }
-
-                if !terminal_error_reported && state_for_stream.is_recording() {
-                    error!("Core Audio stream ended unexpectedly for {}", device_name);
-                    state_for_stream.report_error(AudioError::ChannelClosed);
-                }
-
-                info!("⚠️ Stream: Core Audio processing task ended for {}", device_name);
+            } else {
+                processing.await;
             }
         });
 
@@ -297,28 +248,10 @@ impl AudioStream {
     ) -> Result<Self> {
         info!("🎯 Creating per-app audio stream for {} target(s)", targets.len());
 
-        #[cfg(target_os = "macos")]
-        if targets.len() > 1 {
-            anyhow::bail!("macOS currently supports one selected app at a time. Select one app or use all computer audio.");
-        }
-
-        let mut running_targets = Vec::new();
-        for target in &targets {
-            if let Some(pid) = crate::audio::capture::per_app::find_pid_for_app(&target.executable) {
-                info!("🎯 Found active PID {} for target app '{}' ({})", pid, target.name, target.executable);
-                running_targets.push((target.name.clone(), pid));
-            } else {
-                warn!("⚠️ Target app '{}' ({}) is not currently running", target.name, target.executable);
-            }
-        }
-
-        if running_targets.is_empty() {
-            let target_summary: Vec<String> = targets.iter().map(|t| format!("{} ({})", t.name, t.executable)).collect();
-            return Err(anyhow::anyhow!(
-                "None of the target applications are currently running: {}. Please launch at least one application before recording.",
-                target_summary.join(", ")
-            ));
-        }
+        let selected: Vec<_> = targets.iter().map(|target| (target.name.clone(), target.executable.clone())).collect();
+        let running_targets = super::recording_mode::resolve_app_targets(
+            cfg!(target_os = "macos"), &selected, crate::audio::capture::per_app::find_pid_for_app,
+        ).map_err(anyhow::Error::msg)?;
 
         let display_names: Vec<String> = running_targets.iter().map(|(name, _)| name.clone()).collect();
         let device = Arc::new(AudioDevice {
@@ -352,13 +285,15 @@ impl AudioStream {
 
         #[cfg(target_os = "macos")]
         {
-            let first_pid = running_targets[0].1;
+            let [(_, selected_pid)] = running_targets.as_slice() else {
+                anyhow::bail!("macOS requires exactly one resolved audio application");
+            };
             Self::create_core_audio_stream_with_process(
                 device,
                 state,
                 _device_type,
                 recording_sender,
-                Some(first_pid),
+                Some(*selected_pid),
             ).await
         }
 
@@ -469,13 +404,11 @@ impl AudioStream {
             }
             #[cfg(target_os = "macos")]
             StreamBackend::CoreAudio { task } => {
-                // Abort the processing task and wait briefly for cleanup
+                // Aborting wakes a Pending task so its owned native stream is
+                // dropped by Tokio without waiting for another audio callback.
                 if let Some(task_handle) = task {
                     info!("Aborting Core Audio task...");
                     task_handle.abort();
-                    // Give the runtime a moment to clean up the aborted task
-                    // This helps ensure Arc references in the closure are dropped
-                    std::thread::sleep(std::time::Duration::from_millis(50));
                     info!("Core Audio task aborted");
                 }
             }
@@ -528,6 +461,13 @@ impl AudioStreamManager {
         let backend = get_current_backend();
         info!("🎙️ Starting audio streams with backend: {:?}, per-app: {:?}", backend, per_app_targets.is_some());
 
+        if let Some(targets) = &per_app_targets {
+            let selected: Vec<_> = targets.iter().map(|target| (target.name.clone(), target.executable.clone())).collect();
+            // Fail the full selection before opening even the microphone. The
+            // actual app-stream open resolves again to catch an exit in between.
+            super::recording_mode::resolve_app_targets(cfg!(target_os = "macos"), &selected,
+                crate::audio::capture::per_app::find_pid_for_app).map_err(anyhow::Error::msg)?;
+        }
         // Start microphone stream
         if let Some(mic_device) = microphone_device {
             info!("🎤 Creating microphone stream: {} (always uses CPAL)", mic_device.name);
@@ -580,7 +520,8 @@ impl AudioStreamManager {
                 }
                 Err(e) => {
                     warn!("⚠️ Failed to create system audio stream: {}", e);
-                    // Don't fail if only system audio fails
+                    self.state.finish_capture_setup();
+                    return Err(anyhow::anyhow!("System audio capture failed: {}", e));
                 }
             }
         } else {

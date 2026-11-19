@@ -40,13 +40,15 @@ export class StorageService {
     meetingTitle: string,
     transcripts: Transcript[],
     folderPath: string | null,
-    recordingStartedAt?: string | null
+    recordingStartedAt?: string | null,
+    recoveryId?: string
   ): Promise<SaveMeetingResponse> {
     return invoke<SaveMeetingResponse>('api_save_transcript', {
       meetingTitle,
       transcripts,
       folderPath,
       recordingStartedAt: recordingStartedAt ?? null,
+      ...(recoveryId ? { recoveryId } : {}),
     });
   }
 

@@ -10,7 +10,7 @@ release availability and qualification are separate facts documented below.
 | --- | --- | --- |
 | Transcription | Parakeet, Whisper, or configured provider | Produces words and transcript timing. |
 | Diarization | Selected Pyannote/WeSpeaker or Nemotron engine | Assigns meeting-local speaker labels to audio/transcript turns. |
-| Capture provenance | Independent microphone/system tracks | Establishes the local `You` label; it is not inferred from speaker channel 0. |
+| Capture provenance | Independent microphone/system tracks | Preserves source, not acoustic identity; identifiable/unqualified Zoom and room mic stays `Microphone`. Never infer `You` from speaker channel 0. |
 
 Nemotron is diarization, not voice isolation. Its overlapping activity predictions
 do not produce separate audio tracks for each remote voice. Names, voiceprints,
@@ -18,10 +18,69 @@ and a model's anonymous speaker channels are also different concepts.
 
 ## 2. Recording data flow
 
+The [combined #10/#11 integration](ISSUE10_11_INTEGRATION.md) owns the current
+shared recorder path: one explicit intent/reservation/recovery protocol, native
+source-specific opt-in/qualification, epoch-ticket admission, guarded Stop and
+keep-recording. Read it alongside both preserved source/journal notes. It records
+actual cross-language coverage separately from serializer/standalone/physical gates.
+#14 remains separate. The combined note's R1 section covers source-specific native
+Stop revocation/confirmed-exit authority and durable routed Stop through Controls'
+initial state sync, including queued native-lock and remount regressions. Its R2
+section supersedes startup reconstruction/first-wins routing with provisional native
+admission continuity, non-restarting live Settings and distinct generation-bound
+manual Stop intents; it records the actual Settings command-path fixture limits.
+Its acknowledgement-failure correction bounds completed claims and pauses routed
+queue dispatch on failed durable writes without blocking the direct manual button.
+
+Zoom's source-specific AX candidate, composable lifecycle snapshots, session-bound
+start/Stop ownership, manual override and provisional timing are documented in
+[ISSUE10_ZOOM_AUTOMATION.md](ISSUE10_ZOOM_AUTOMATION.md). Read it before changing
+meeting automation or adding Discord's adapter. Prior physical AX **UNKNOWN** is
+unresolved. Real AX classes are observation-only and cannot authorize capture,
+including with old enabled preferences; timestamped read-only qualification is
+available in Settings. Shared token reservations and native recording generations/
+owners guard Stop atomically and restore ownership on WebView reload. The follow-up
+[native start authority v1](RECORDING_START_AUTHORITY.md) fences delayed start IPC
+with a process epoch/sequence and serialized terminal barriers; #11 owns browser
+expiry/phase protocol, now wired through the combined hook and terminal recovery. Scoped native
+provenance (identified Zoom contexts, ambiguous global Zoom inventory, and room)
+sets persisted `microphone_identity_unverified`; unrelated capture keeps its prior
+behavior. Flagged offline calls bypass BOTH mic-to-You and legacy voiceprint/user-
+cluster inference; shared source-label predicates keep Microphone refinable rather
+than a person. The [R2 follow-up](ISSUE10_R2_FOLLOWUP.md) adds explicit recorder
+launch intent, original-folder metadata validation and no-overlap/composite user
+label sanitization; its historical pending hook boundary is superseded by the combined note.
+Both source tracks/overlap stay intact; #6 acoustic identity remains
+pending and independent of lifecycle.
+
+Issue [#23 source selection](ISSUE23_RECORDING_SOURCES.md) supersedes the new-recording
+In-person switch with durable inclusion on the existing mic/output buttons. Native
+preference migration preserves old microphone-only capture; both Start commands
+filter source/device/app inputs before streams open. Live mute never adds an excluded
+source, and old room metadata/version identity restrictions remain separate. The
+note records source-scoped preview, synthetic coverage and pending physical gates.
+Its R1 section covers serialized read-triggered repair/rollback, short source/Start
+admission independent of inference, awaited chosen-app endpoint-preview teardown,
+typed reconnect, recoverable loading and frozen-source minibar controls.
+
+Manual controls, historical microphone-only in-person mode, fail-closed chosen-app
+capture, selected-process lifetime, FFmpeg checkpoint shutdown, storage failures,
+recovery/data retention and issue #9's unqualified physical acceptance gates are
+mapped in [ISSUE9_MANUAL_RECORDING.md](ISSUE9_MANUAL_RECORDING.md). Read it before
+changing capture selection, Stop ordering or checkpoint cleanup. In-person mic
+labels describe the room source, never a user identity; its persisted metadata
+also disables the offline mic-to-You source-track shortcut. Shared-room identity
+is outside MVP; Zoom-through-speakers remote-only/double-talk remains the gate.
+The note also owns per-track durable commit proofs, idempotent audio-only library
+recovery, and the explicit macOS one-selected-app limit (including stale prefs).
+
 Speech-start pre-roll, live system speech sensitivity, and real-call replay
 qualification are documented in [LIVE_SPEECH_RETENTION.md](LIVE_SPEECH_RETENTION.md).
 Sample continuity across jittered capture callbacks and issue #40 qualification
 are documented in [AUDIO_CALLBACK_CONTINUITY.md](AUDIO_CALLBACK_CONTINUITY.md).
+Core Audio silence/EOF handling, the restored fork fix, device-free regressions,
+and the pending issue #5 build repin are documented in
+[MACOS_IDLE_AUDIO.md](MACOS_IDLE_AUDIO.md).
 
 ```text
 recording_commands.rs: start command
@@ -35,7 +94,7 @@ recording_commands.rs: start command
               -> VAD speech turns -> transcription queue
         -> persist mic/system source tracks and mixed playback audio
      -> transcription/worker.rs: transcribe each source's speech turn
-        -> microphone: You
+        -> microphone: Microphone on scoped unverified Zoom/room; otherwise legacy You
         -> Pyannote selected: online embedding/centroid speaker matching
         -> Nemotron selected: query streaming timeline by turn start + duration
         -> transcript-update event
@@ -73,7 +132,9 @@ Paths below are relative to `frontend/src-tauri/src/` unless marked frontend.
 - Preserve silence and timeline gaps. Concatenating VAD speech turns without
   their gaps is not a continuous recording and corrupts streaming timing.
 - Mic and system audio must not be mixed before source attribution. Microphone
-  audio retains `You`; remote model channels remain `Speaker N`.
+  source is not identity: scoped unverified Zoom/room speech remains `Microphone`;
+  unrelated paths retain the legacy `You` convention (not an acoustic proof).
+  Remote model channels remain `Speaker N`.
 - Speaker channels are meeting-local. The live model/cache is recreated for each
   recording. Changing settings during a call affects the next live session.
 - One transcript turn currently gets one greatest-overlap label. Do not split
@@ -99,7 +160,100 @@ VAD boundaries, ASR time, and queue load also contribute. Timeline lookup waits
 at most 1.5 s; history is limited to ten minutes. Missing/failed results retain
 source labels rather than guessing a speaker or switching engines.
 
+## Audio retention and explicit cleanup
+
+[ISSUE19_AUDIO_CLEANUP.md](ISSUE19_AUDIO_CLEANUP.md) owns the normal library's
+storage observation, unchecked audio selection, expiring one-shot native consent,
+exact final-track unlink scope, partial outcomes and retained text/queue data.
+Read it before changing audio removal. Cleanup shares offline-operation and
+recording lifecycle admission, then rechecks job/version ownership under a SQLite
+write reservation. Recovery/direct diarization/voice enrollment retain offline
+admission through their awaited file readers. `audio-cleanup-finished` invalidates
+open playback, library and retranscription availability, not saved text. Generated
+fixture tests do not qualify physical Mac storage/IPC/playback or deletion latency.
+[R1 qualification](ISSUE19_R1.md) separates lifecycle-owned Stop finalization
+cleanup from offline-admitted IPC cleanup, avoiding the refinement lock inversion.
+It also owns identity-based, scoped playback revalidation (unchanged focus retains
+position/rate/playing) and native-task ownership of manual meeting diarization.
+[Bridge integration](ISSUE19_BRIDGE_INTEGRATION.md) records the exact accepted
+parents, combined cleanup/queue/canonical/export checks and unchanged Notes
+readiness fix, which keeps canonical summary tuples current across navigation.
+
 ## 3. Post-call processing and model selection
+
+Accepted #15 + #10/#11/#12/#14 + #16/#17 local convergence, shared entrypoint
+resolutions, lightweight adapter boundaries/results and open heavy/physical gates
+are recorded in [ISSUE15_COORDINATED_CONVERGENCE.md](ISSUE15_COORDINATED_CONVERGENCE.md).
+
+Issue #15's native automatic save/recovery queue, recording-first resource admission,
+checkpoint reuse, subscription-only saved-meeting Codex operation, immutable revision-
+bound summaries, visible stages/defer/retry/history, synthetic qualification and
+remaining physical/signed-in gates are documented in
+[ISSUE15_POST_CALL_QUEUE.md](ISSUE15_POST_CALL_QUEUE.md). Read it before changing
+Stop/save/recovery enqueue, recording startup priority, offline cancellation or
+summary publication. SQLite owns jobs/results; WebViews only observe/control.
+Automatic refinement never selects a candidate; summaries use the committed selected
+transcript and separate personal Notes. #10 policy and #16 approved-vocabulary
+integration seams/tests are explicit in that note; unfinished branches are not imported.
+
+Issue #14's local ASR + diarization candidate workflow, immutable live/refined/
+corrections snapshots, revision-checked selection and text corrections, restart/
+cancellation ownership, source-neutral in-person policy, #9 recovery invariants,
+#15/#16 interfaces and deferred same-audio RU/EN/Mac qualification are documented
+in [ISSUE14_TRANSCRIPT_VERSIONS.md](ISSUE14_TRANSCRIPT_VERSIONS.md). Read it before
+changing retranscription commit or post-call sequencing. Native refinement now
+saves a separate version; it never deletes selected transcript rows on success.
+Meeting details owns the normal version review/select/correction UI. Automatic
+post-recording summary handoff now belongs to the native #15 queue and approved
+#13 subscriber Codex CLI, never a legacy configured text provider.
+The feature note also names the #10 seam: opaque recording metadata and per-row
+capture source maps survive candidate/correction/restore; generated labels are
+not manual identity. The accepted #10/#11 + #12/#14 identity gate now covers
+ordinary and candidate shared-inner paths before decode; original/stored authority
+combines conservatively and survives older-version selection. Read
+[ISSUE10_14_IDENTITY_INTEGRATION.md](ISSUE10_14_IDENTITY_INTEGRATION.md) for policy
+precedence, neutral source routing, atomic commit and synthetic/physical limits.
+R1 adds editor-safe in-place refresh, snapshot contact mappings, version-aware
+retained task anchors, consumed per-meeting handoff/retry, fresh local language
+detection and manifest-required dual-source checks. #15 owns queue/preemption;
+#16 owns term corrections.
+R2 preserves deleted/conflicted contact-mapping evidence during restore: only
+absent evidence permits ordinary normalized contact reconstruction. See the
+feature note for exact/normalized controls, meeting isolation and rollback tests.
+
+Issue #16's independent transcript correction → explicit **Запомнить** flow,
+revision-CAS personal vocabulary editing, legacy approval provenance, unchanged
+local Whisper consumers, separate bounded Codex spelling snapshots and #15's
+shared summary seam are documented in
+[ISSUE16_CONFIRMED_VOCABULARY.md](ISSUE16_CONFIRMED_VOCABULARY.md). Read it before
+changing vocabulary writers or provider context. `get_global` includes legacy
+local-ASR hints; Codex must use the proof-bearing `approved_global` snapshot.
+Ordinary corrections and declined confirmation never learn terms. Parakeet has
+no hints; Whisper uses a 224-token prefix, not the whole storage character limit.
+Synthetic persistence/dispatch tests do not qualify real ASR/model accuracy.
+
+Issue #17's requested local RU/EN spelling suggestions, bounded read-only selected
+projection, same-transaction source/version/revision approval guard, transient
+rejection and ordinary meeting controls are documented in
+[ISSUE17_VOCABULARY_SUGGESTIONS.md](ISSUE17_VOCABULARY_SUGGESTIONS.md). Read it before
+changing suggestion generation or accepting inferred terms. No AI/provider or
+queue is used; scan/decline/close never write. Only explicit acceptance enters
+#16's existing vocabulary transaction. Generic #14 snapshots, Notes and approval
+migrations remain unchanged; physical usability/real-transcript usefulness are
+separate pending gates.
+
+Issue #12's live/library Notes editor, session-keyed autosave, transactional
+save/recovery association, independent data ownership, revisioned read interfaces
+for #13/#15/#18, portable coverage and deferred physical Mac gates are documented
+in [ISSUE12_NOTES.md](ISSUE12_NOTES.md). Read it before changing Notes or copying
+live data during Stop. A Notes draft is not speech, a title is not a session key,
+and a JS completion callback is not the owner of its native association.
+
+Combined #12/#14 editor preparation, stable `meeting:<id>` Notes ownership,
+independent revisions and real-component/SQLite qualification are documented in
+[ISSUE12_14_INTEGRATION.md](ISSUE12_14_INTEGRATION.md). Selection and correction
+drain Notes conversion/store readback and summary saving before native mutation;
+transcript projection refresh never replaces Notes or consents to recovery writes.
 
 Summary-generated title ownership, placeholder rejection and completion refresh
 are documented in [SUMMARY_GENERATED_TITLES.md](SUMMARY_GENERATED_TITLES.md).
@@ -116,6 +270,27 @@ state for dialogs, including native activation events and stale-response guards.
 
 Live ASR and post-call ASR defaults are independent. Optional Whisper activation
 saves the **post-call** default; it must not replace the live Parakeet selection.
+
+### Live subscription questions (issue #13)
+
+`recording/LiveCodexChat.tsx` replaces only the recording panel's generic-provider
+Ask AI caller. `codex_cli/{commands,context,service,cli,jobs}.rs` owns native
+current-session/committed-Notes validation, typed verified citations, cancellation
+and the isolated installed subscription CLI. The five-minute action anchors to
+`recording_commands::current_text_clock()` (active seconds excluding pauses), not
+ASR arrival time or a display timer. Notes remain separate revisioned user data.
+Read [ISSUE13_CODEX_LIVE.md](ISSUE13_CODEX_LIVE.md) before reusing this provider for
+#15/#16: it documents the dedicated private CODEX_HOME/one-time separate login,
+real CLI 0.167.2 global-AGENTS leak reproduction and isolation controls, bounded
+process ownership, stable interfaces and remaining real-subscription/physical Mac
+gates. The [#22 compatibility follow-up](ISSUE22_CODEX_COMPATIBILITY.md) replaces
+one-version equality with shared local parser/capability checks, scratch HOME,
+real 0.167.2/0.170.0 request/tool/leak controls and a loopback-only Linux test
+runner. Owner-selected status A keeps existing Settings controls, one concise
+readiness heading and collapsed checks/path/version/sign-in details; the note
+separates its mounted UI coverage from unqualified Mac/account gates.
+The live path has no summary-provider/API/key fallback and reads no other
+meetings, contacts or audio. Saved-library/group AI is a separate legacy path.
 
 ## 4. Optional download ownership and UI synchronization
 
@@ -173,7 +348,86 @@ verifier requires `notes` to be a string. This was caught during v0.2.18 draft
 preparation; the manifest/checksums were regenerated and reverified without
 changing the signed executable payloads.
 
-## 6. Tests, qualification, and historical notes
+## 6. Issue #6 audio evidence preparation
+
+Issue #6's portable, read-only source-track observations, transcript evidence schema,
+synthetic tests, and the physical Mac acceptance protocol are documented in
+[ISSUE6_AUDIO_PROBE.md](ISSUE6_AUDIO_PROBE.md). The probe must not be treated as an
+AEC, ASR, or hardware result: it preserves source provenance and flags evidence for
+manual review. The example fixture is explicitly `physical_acceptance: not_run`.
+The final batched Mac run depends on issue #5 and the one final DMG; no DMG build or
+physical operation is part of this preparation.
+
+## Issue #8 duration and subscription CLI qualification
+
+[ISSUE8_QUALIFICATION.md](ISSUE8_QUALIFICATION.md) owns the four-run Mac protocol,
+model/corpus provenance, speech/display clock limits, power/resource/audio-integrity
+checks and configuration decision. `scripts/issue8_qualification.py` collects
+resource samples, runs only a fixed synthetic-text subscription Codex CLI prompt,
+summarizes text-free ASR diagnostic records and checks manual journals for missing
+evidence/failed targets. `audio/transcription/timing.rs` plus `worker.rs` emit
+opt-in dispatcher queue/service/outcome records (`MEETILY_ISSUE8_TIMING=1`).
+This is qualification instrumentation, not an in-app Codex provider or a physical
+Mac pass. Existing ASR/capture semantics and queue policy are unchanged. Portable
+coverage is `tests/test_issue8_qualification.py`; native build and physical/model
+qualification remain separately required.
+
+## 7. Tests, qualification, and historical notes
+
+Issue #7's read-only Core Audio process-metadata probe, local truth journal,
+portable experimental I/O replay, prior fork detector limitations, and deferred
+Zoom/Discord physical matrix are documented in
+[ISSUE7_CALL_SIGNALS.md](ISSUE7_CALL_SIGNALS.md). This is qualification tooling,
+not an automatic recording adapter. The subsequent #10 candidate is separately
+mapped above and does not overturn #7's pending physical gate. Mute/preview and process I/O must not be
+promoted to call lifecycle without evidence; no target Mac measurements or
+verified mechanism are claimed.
+
+Issue #11's isolated read-only Discord macOS AX candidate, native state event,
+normal-recorder integration, manual-stop/session ownership and test coverage are
+mapped in [ISSUE11_DISCORD_AUTOMATION.md](ISSUE11_DISCORD_AUTOMATION.md).
+**Automatic Discord capture remains qualification-gated off**: guild voice, DM
+and group DM are individually unqualified, and leave with the client open has no
+validated signal. Process/mic activity and missing UI never authorize capture or
+prove leave. This adapter does not alter the concurrent Zoom event path.
+Its observation-only native journal, finite manual-truth markers, privacy-safe
+export and exact guild/DM/GDM comparison/promotion protocol are documented in
+[ISSUE11_DISCORD_OBSERVATION.md](ISSUE11_DISCORD_OBSERVATION.md). Reader availability,
+observation enablement, client absence, candidate Active and qualified call support
+are distinct; no diagnostic setting can unlock unqualified recording.
+R1's stale-observation gap reset, busy-call tombstones, common token reservation
+and required #10 native generation/guarded-Stop integration are recorded in
+[ISSUE11_REVIEW_FIXES.md](ISSUE11_REVIEW_FIXES.md). A standalone missing lease or
+missing guarded dispatcher cannot silently become an unguarded Discord Stop.
+R2's expirable preparation versus persisted native-start uncertainty, exact #10
+v1 expectedStart/settling-barrier transport, explicit automated launch intent,
+consumed-session capacity/recovery and race/serialization fixtures are mapped in
+[ISSUE11_START_RECOVERY.md](ISSUE11_START_RECOVERY.md). An expired JS token or idle
+snapshot cannot clear a dispatched start; missing native authority fails closed.
+
+Issue #5 artifact-only Actions build (pinned source/tree vs workflow SHA),
+sidecar ordering, locked dependencies, model provenance, same-account backup/
+rollback proposal and physical mic/system/restart qualification
+are documented in [ISSUE5_MACOS_BUILD.md](ISSUE5_MACOS_BUILD.md). The portable
+`tests/test_macos_build.py` checks script orchestration only; neither target Mac
+has been qualified by those tests.
+
+Issue #20's [single personal candidate and batched two-Mac record](ISSUE20_PERSONAL_MACOS_ACCEPTANCE.md)
+supersedes historical #5 artifact pins for the final #5–19 handoff, without
+publishing or claiming physical acceptance. It reuses PR21's artifact-only workflow;
+source/export checks live in `scripts/verify_macos_candidate.py`, covered by
+`tests/test_macos_candidate.py`. The workflow checks actual frontend output,
+aligned source/app versions and byte-identical bundled models. The owner record
+maps all live AC to evidence, keeps Zoom/Discord observation-only and every physical
+gates explicitly NOT RUN, and separates source/workflow/artifact identities.
+
+The installed-startup SQLx `VersionMissing(20260930000000)` repair restores three
+authentic fork migrations without weakening validation. Read the
+[exact lineage/checksum audit and generated persistent-DB regressions](ISSUE20_MIGRATION_LINEAGE.md)
+before changing migration history. `database/migration_lineage_tests.rs` runs under
+the production manager, via the focused portable runner and the macOS native gate;
+fresh, legacy, later-candidate, checksum-mismatch and unknown-version paths are
+separate from owner data/installed acceptance.
 
 macOS publication supports an explicitly labeled CI-qualified preview via
 `publish-macos.yml` (`preview=true`). It records no physical-test attestation,
@@ -191,7 +445,20 @@ Live system-meter warnings are documented in
 See [PR39_INTEGRATION.md](PR39_INTEGRATION.md) for capture-readiness, setup
 gating, quiet-speech and meeting-scoped speaker-edit recovery corrections.
 
-### Home meeting library
+### Current meeting library, search and export
+
+Issue #18's ordinary `/meetings` library, saved-material states, RU/EN text/Notes
+search, navigation generations, late-page transcript focus and shared source-labelled
+Markdown export are owned by [ISSUE18_LIBRARY.md](ISSUE18_LIBRARY.md). Read it before
+changing global/library search or either meeting export entrypoint. It documents
+the transactional selected-transcript/summary/Notes snapshot, safe picker destination,
+legacy rich Notes handling, portable/mounted tests, read-only #14 compatibility and
+remaining Mac qualification. Search results never expand live Q&A context.
+
+### Historical home meeting library
+
+The following records the earlier `/home` implementation, not this accepted
+checkout's current `/meetings` route and workspace schema.
 
 `components/Sidebar/index.tsx` renders the text-only **Meetily · Actually Free**
 wordmark, with the original blue/soft-blue colors on one line. It opens About;
@@ -302,3 +569,7 @@ Development labels 0.2.18–0.2.20 in historical notes were consolidated into th
 0.2.17 candidate after checking GitHub's published 0.2.16. Re-check the actual
 release state before future version work; do not treat this historical statement
 as a permanently current release number.
+
+Canonical post-call artifact → normal summary/task/library/export integration is
+owned by [ISSUE18_CANONICAL_BRIDGE.md](ISSUE18_CANONICAL_BRIDGE.md). Read its
+publication ownership/provenance rules before changing that bridge.

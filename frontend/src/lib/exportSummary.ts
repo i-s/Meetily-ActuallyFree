@@ -13,7 +13,8 @@ import { save } from '@tauri-apps/plugin-dialog';
 import { writeFile } from '@tauri-apps/plugin-fs';
 
 function sanitizeFilename(name: string): string {
-  return (name || 'summary').replace(/[^\w\-]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 80) || 'summary';
+  const safe = (name || 'meeting').normalize('NFC').replace(/[<>:"/\\|?*\u0000-\u001f\u007f]/g, '_').replace(/^[.\s]+|[.\s]+$/g, '').slice(0, 80) || 'meeting';
+  return /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(safe) ? `_${safe}` : safe;
 }
 
 /** Split a markdown line into bold/plain runs based on **bold** markers. */
@@ -166,7 +167,9 @@ export async function exportSummaryAs(
   format: ExportFormat,
   markdown: string,
   baseName: string,
+  isCurrent: () => boolean = () => true,
 ): Promise<boolean> {
+  if (!isCurrent()) return false;
   const details = FORMAT_DETAILS[format];
   // The native picker owns the destination and grants that selected path to
   // the fs plugin; the webview only creates bytes and never starts a download.
@@ -174,10 +177,10 @@ export async function exportSummaryAs(
     defaultPath: `${sanitizeFilename(baseName)}.${details.extension}`,
     filters: [{ name: details.label, extensions: [details.extension] }],
   });
-  if (!destination) return false;
-  const outputPath = destination.toLowerCase().endsWith(`.${details.extension}`)
-    ? destination
-    : `${destination}.${details.extension}`;
+  if (!destination || !isCurrent()) return false;
+  // Do not append an extension after the picker: that would write a different,
+  // unconfirmed path, possibly bypassing its overwrite prompt and fs grant.
+  const outputPath = destination;
 
   const encoder = new TextEncoder();
   let bytes: Uint8Array;
@@ -187,6 +190,7 @@ export async function exportSummaryAs(
   else if (format === 'json') bytes = encoder.encode(createJson(markdown, baseName));
   else bytes = encoder.encode(markdown);
 
+  if (!isCurrent()) return false;
   await writeFile(outputPath, bytes);
   return true;
 }

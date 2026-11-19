@@ -1,5 +1,6 @@
 // src/audio/mod.rs
 pub mod audio_processing;
+pub(crate) mod playback_identity;
 pub mod decoder;
 pub mod encode;
 pub mod ffmpeg;
@@ -17,12 +18,19 @@ pub mod ffmpeg_mixer;  // NEW: FFmpeg-style adaptive audio mixer
 
 // New simplified audio system
 pub mod recording_state;
+pub mod recording_mode;
+pub mod recording_sources;
+pub mod recording_source_admission;
+pub mod recording_ownership;
+pub mod recording_start_authority;
+pub mod recording_start_sources;
 pub mod pipeline;
 pub mod stream;
 pub mod recording_manager;
 pub mod recording_commands;
 pub mod recording_preferences;
 pub mod recording_saver;
+pub mod track_commit;
 pub mod incremental_saver;  // NEW: Incremental audio saving with checkpoints
 pub mod level_monitor;
 pub mod simple_level_monitor;

@@ -3,7 +3,7 @@ use tokio::sync::mpsc;
 use anyhow::Result;
 use log::{debug, error, info, warn};
 
-use super::devices::{AudioDevice, list_audio_devices};
+use super::devices::{AudioDevice, DeviceType, list_audio_devices};
 
 #[cfg(target_os = "macos")]
 use super::devices::get_safe_recording_devices_macos;
@@ -29,6 +29,8 @@ pub struct RecordingManager {
     recording_saver: RecordingSaver,
     device_monitor: Option<AudioDeviceMonitor>,
     device_event_receiver: Option<mpsc::UnboundedReceiver<DeviceEvent>>,
+    sources: super::recording_sources::RecordingSources,
+    automatic_zoom: bool,
     per_app_enabled: bool,
     per_app_targets: Vec<crate::audio::recording_preferences::PerAppTarget>,
 }
@@ -51,12 +53,33 @@ impl RecordingManager {
             recording_saver: RecordingSaver::new(),
             device_monitor: Some(device_monitor),
             device_event_receiver: Some(device_event_receiver),
+            sources: super::recording_sources::RecordingSources::default(),
+            automatic_zoom: false,
             per_app_enabled: false,
             per_app_targets: Vec::new(),
         }
     }
 
-    // Remove app handle storage for now - will be passed directly when saving
+    pub fn set_sources(&mut self, sources: super::recording_sources::RecordingSources) {
+        self.sources = sources;
+    }
+
+    pub fn set_automatic_zoom(&mut self, automatic: bool) { self.automatic_zoom = automatic; }
+
+    /// Called before live model initialization and again before opening capture.
+    /// Native app inventory informs provenance only, never call lifecycle.
+    pub fn prepare_source_provenance(&self) {
+        #[cfg(target_os = "macos")]
+        let zoom_present = crate::meeting_detection::zoom::client_present();
+        #[cfg(not(target_os = "macos"))]
+        let zoom_present = Some(false);
+        let executables: Vec<&str> = self.per_app_targets.iter().map(|t| t.executable.as_str()).collect();
+        let unverified = super::recording_mode::zoom_identity_unverified(cfg!(target_os = "macos"),
+            !self.sources.system_audio_enabled, self.per_app_enabled, &executables, zoom_present, self.automatic_zoom);
+        // Mic-only is capture provenance, not a new room mode. Preserve neutral
+        // microphone identity without imposing archival in-person semantics.
+        super::recording_mode::start_session(false, unverified);
+    }
 
     /// Start recording with specified devices
     ///
@@ -72,12 +95,20 @@ impl RecordingManager {
         level_sender: Option<mpsc::UnboundedSender<super::pipeline::AudioLevels>>,
     ) -> Result<mpsc::UnboundedReceiver<AudioChunk>> {
         info!("Starting recording manager (auto_save: {})", auto_save);
+        let (microphone_device, system_device) = self.sources.devices(microphone_device, system_device);
+        self.sources.validate_available(microphone_device.is_some(), system_device.is_some(),
+            self.per_app_enabled, self.per_app_targets.len()).map_err(anyhow::Error::msg)?;
+        self.prepare_source_provenance();
+        self.per_app_enabled = self.sources.captures_apps(self.per_app_enabled);
+        self.recording_saver.set_recording_state(self.state.clone());
 
         // Set up transcription channel
         let (transcription_sender, transcription_receiver) = mpsc::unbounded_channel::<AudioChunk>();
 
         // Start recording state first
         self.state.start_recording()?;
+        self.state.set_microphone_muted(!self.sources.microphone_enabled);
+        self.state.set_system_audio_muted(!self.sources.system_audio_enabled);
 
         // Get device information for adaptive mixing
         // The pipeline uses device kind (Bluetooth vs Wired) to apply adaptive buffering:
@@ -140,7 +171,12 @@ impl RecordingManager {
         } else {
             None
         };
-        self.stream_manager.start_streams_with_per_app(microphone_device.clone(), system_device.clone(), per_app_opt, None).await?;
+        if let Err(error) = self.stream_manager.start_streams_with_per_app(microphone_device.clone(), system_device.clone(), per_app_opt, None).await {
+            self.state.stop_recording();
+            let _ = self.stream_manager.stop_streams();
+            let _ = self.pipeline_manager.force_flush_and_stop().await;
+            return Err(error);
+        }
 
         // Start device monitoring to detect disconnects (skip system device monitoring if per-app)
         if let Some(ref mut monitor) = self.device_monitor {
@@ -297,9 +333,9 @@ impl RecordingManager {
             errors.push(format!("Failed to flush the audio pipeline: {}", e));
         }
 
-        // CRITICAL: Full cleanup to release all Arc references and resources
-        // This ensures microphone is released even if Drop is delayed
-        self.state.cleanup();
+        // stop_recording already releases capture devices and input. Retain the
+        // frozen duration, pause total, statistics and errors through final save;
+        // RecordingManager::drop performs the full reset afterwards.
 
         if !errors.is_empty() {
             return Err(anyhow::anyhow!(errors.join("; ")));
@@ -541,14 +577,26 @@ impl RecordingManager {
     /// Attempt to reconnect a disconnected device
     /// Returns true if reconnection successful
     pub async fn attempt_device_reconnect(&mut self, device_name: &str, device_type: DeviceMonitorType) -> Result<bool> {
+        let included = match device_type {
+            DeviceMonitorType::Microphone => self.sources.microphone_enabled,
+            DeviceMonitorType::SystemAudio => self.sources.system_audio_enabled,
+        };
+        if !included { return Err(anyhow::anyhow!("Source was excluded at Start. Stop and enable it before the next recording.")); }
+        if self.per_app_enabled { return Err(anyhow::anyhow!("Stop before changing devices for chosen-app capture.")); }
+
         info!("🔄 Attempting to reconnect device: {} ({:?})", device_name, device_type);
 
         // List current devices
         let available_devices = list_audio_devices().await?;
 
-        // Find the device by name
+        // A duplex endpoint commonly shares its name with the opposite direction.
+        // Never reinterpret an output as microphone (or vice versa) at reopen.
+        let hardware_type = match device_type {
+            DeviceMonitorType::Microphone => DeviceType::Input,
+            DeviceMonitorType::SystemAudio => DeviceType::Output,
+        };
         let device = available_devices.iter()
-            .find(|d| d.name == device_name)
+            .find(|d| d.name == device_name && d.device_type == hardware_type)
             .cloned();
 
         if let Some(device) = device {

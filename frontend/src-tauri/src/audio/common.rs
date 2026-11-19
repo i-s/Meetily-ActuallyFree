@@ -33,6 +33,11 @@ pub fn mark_llm_unloaded() {
     LLM_LAST_UNLOAD_SECS.store(now_secs(), Ordering::Relaxed);
 }
 
+pub(crate) fn try_engine_lifecycle_lock() -> Result<OwnedMutexGuard<()>, String> {
+    ENGINE_LIFECYCLE_LOCK.clone().try_lock_owned()
+        .map_err(|_| "Capture or audio processing is busy; review cleanup again when it finishes".into())
+}
+
 pub(crate) async fn acquire_engine_lifecycle_lock() -> OwnedMutexGuard<()> {
     ENGINE_LIFECYCLE_LOCK.clone().lock_owned().await
 }

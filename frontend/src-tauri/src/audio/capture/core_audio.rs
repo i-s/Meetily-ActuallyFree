@@ -4,13 +4,13 @@
 use std::pin::Pin;
 #[cfg(target_os = "macos")]
 use std::time::{Duration, Instant};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll, Waker};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
+use std::task::{Context, Poll};
 use anyhow::Result;
 use futures_util::Stream;
 use ringbuf::{
-    traits::{Consumer, Producer, Split},
+    traits::{Consumer, Split},
     HeapCons, HeapProd, HeapRb,
 };
 use log::{error, info, warn};
@@ -18,11 +18,7 @@ use log::{error, info, warn};
 #[cfg(target_os = "macos")]
 use cidre::{arc, av, cat, cf, core_audio as ca, os};
 
-/// Waker state for async polling
-struct WakerState {
-    waker: Option<Waker>,
-    has_data: bool,
-}
+use super::core_audio_buffer::CoreAudioBufferState;
 
 /// Core Audio speaker input using aggregate device + tap
 #[cfg(target_os = "macos")]
@@ -38,7 +34,7 @@ pub struct CoreAudioStream {
     _device: ca::hardware::StartedDevice<ca::AggregateDevice>,
     _ctx: Box<AudioContext>,
     _tap: ca::TapGuard,
-    waker_state: Arc<Mutex<WakerState>>,
+    buffer_state: Arc<CoreAudioBufferState>,
     current_sample_rate: Arc<AtomicU32>,
 }
 
@@ -47,10 +43,8 @@ pub struct CoreAudioStream {
 struct AudioContext {
     format: arc::R<av::AudioFormat>,
     producer: HeapProd<f32>,
-    waker_state: Arc<Mutex<WakerState>>,
+    buffer_state: Arc<CoreAudioBufferState>,
     current_sample_rate: Arc<AtomicU32>,
-    consecutive_drops: Arc<AtomicU32>,
-    should_terminate: Arc<AtomicBool>,
 }
 
 #[cfg(target_os = "macos")]
@@ -94,7 +88,14 @@ impl CoreAudioCapture {
 
         let tap_desc = if let Some(pid) = target_pid {
             info!("🎙️ CoreAudio: Creating process tap for target PID {}...", pid);
-            let num = cidre::ns::Number::with_i32(pid as i32);
+            // TapDesc expects a HAL AudioObjectID, never a Unix PID. Resolve
+            // explicitly and fail closed if the chosen process has disappeared.
+            let process = ca::hardware::Process::with_pid(pid as i32)
+                .map_err(|e| anyhow::anyhow!("Selected app system audio unavailable (PID {}): {:?}", pid, e))?;
+            if process.0.0 == 0 {
+                anyhow::bail!("Selected app system audio unavailable (PID {}): no HAL process object", pid);
+            }
+            let num = cidre::ns::Number::with_u32(process.0.0);
             let arr = cidre::ns::Array::from_slice(&[&*num]);
             ca::TapDesc::with_mono_mixdown_of_processes(&arr)
         } else {
@@ -103,15 +104,7 @@ impl CoreAudioCapture {
         };
 
         let tap = tap_desc.create_process_tap()
-            .or_else(|err| {
-                if target_pid.is_some() {
-                    warn!("⚠️ CoreAudio: Per-process tap failed ({:?}), falling back to global tap...", err);
-                    let fallback_desc = ca::TapDesc::with_mono_global_tap_excluding_processes(&cidre::ns::Array::new());
-                    fallback_desc.create_process_tap()
-                } else {
-                    Err(err)
-                }
-            })
+            // A failed selected-app tap must never broaden capture to other apps.
             .map_err(|e| {
                 error!("❌ CoreAudio: Failed to create process tap: {:?}", e);
                 anyhow::anyhow!("Failed to create process tap: {:?}", e)
@@ -284,10 +277,7 @@ impl CoreAudioCapture {
         let rb = HeapRb::<f32>::new(buffer_size);
         let (producer, consumer) = rb.split();
 
-        let waker_state = Arc::new(Mutex::new(WakerState {
-            waker: None,
-            has_data: false,
-        }));
+        let buffer_state = Arc::new(CoreAudioBufferState::default());
 
         let current_sample_rate = Arc::new(AtomicU32::new(asbd.sample_rate as u32));
         info!("✅ CoreAudio: Initial sample rate: {} Hz", asbd.sample_rate);
@@ -295,10 +285,8 @@ impl CoreAudioCapture {
         let mut ctx = Box::new(AudioContext {
             format,
             producer,
-            waker_state: waker_state.clone(),
+            buffer_state: buffer_state.clone(),
             current_sample_rate: current_sample_rate.clone(),
-            consecutive_drops: Arc::new(AtomicU32::new(0)),
-            should_terminate: Arc::new(AtomicBool::new(false)),
         });
 
         info!("🎙️ CoreAudio: Starting audio device...");
@@ -311,7 +299,7 @@ impl CoreAudioCapture {
             _device: device,
             _ctx: ctx,
             _tap: self.tap,
-            waker_state,
+            buffer_state,
             current_sample_rate,
         })
     }
@@ -353,37 +341,8 @@ impl CoreAudioCapture {
 /// Process audio data from the IO proc callback
 #[cfg(target_os = "macos")]
 fn process_audio_data(ctx: &mut AudioContext, data: &[f32]) {
-    // Push raw samples directly to ring buffer
-    // Let the pipeline handle all gain adjustments (post-mix 3x gain + mic normalization)
-    let buffer_size = data.len();
-    let pushed = ctx.producer.push_slice(data);
-
-    if pushed < buffer_size {
-        let consecutive = ctx.consecutive_drops.fetch_add(1, Ordering::AcqRel) + 1;
-
-        if consecutive > 10 {
-            ctx.should_terminate.store(true, Ordering::Release);
-            return;
-        }
-    } else {
-        ctx.consecutive_drops.store(0, Ordering::Release);
-    }
-
-    if pushed > 0 {
-        let should_wake = {
-            let mut waker_state = ctx.waker_state.lock().unwrap();
-            if !waker_state.has_data {
-                waker_state.has_data = true;
-                waker_state.waker.take()
-            } else {
-                None
-            }
-        };
-
-        if let Some(waker) = should_wake {
-            waker.wake();
-        }
-    }
+    // Gain adjustments remain downstream; this only transfers bounded raw samples.
+    ctx.buffer_state.push_samples(&mut ctx.producer, data);
 }
 
 #[cfg(target_os = "macos")]
@@ -402,28 +361,12 @@ impl Stream for CoreAudioStream {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Self::Item>> {
-        // Try to pop a sample from the ring buffer
-        if let Some(sample) = self.consumer.try_pop() {
-            return Poll::Ready(Some(sample));
-        }
-
-        // Check if we should terminate
-        if self._ctx.should_terminate.load(Ordering::Acquire) {
+        let this = &mut *self;
+        let result = this.buffer_state.poll_sample(&mut this.consumer, cx);
+        if matches!(result, Poll::Ready(None)) {
             warn!("Stream terminating due to buffer pressure");
-            return match self.consumer.try_pop() {
-                Some(sample) => Poll::Ready(Some(sample)),
-                None => Poll::Ready(None),
-            };
         }
-
-        // No data available, register waker and return pending
-        {
-            let mut state = self.waker_state.lock().unwrap();
-            state.has_data = false;
-            state.waker = Some(cx.waker().clone());
-        }
-
-        Poll::Pending
+        result
     }
 }
 
@@ -431,7 +374,7 @@ impl Stream for CoreAudioStream {
 impl Drop for CoreAudioStream {
     fn drop(&mut self) {
         info!("CoreAudioStream dropped, signaling termination");
-        self._ctx.should_terminate.store(true, Ordering::Release);
+        self.buffer_state.terminate();
     }
 }
 

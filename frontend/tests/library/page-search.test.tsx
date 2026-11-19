@@ -1,0 +1,81 @@
+import React from 'react';
+import { act, create, type ReactTestRenderer } from 'react-test-renderer';
+import { expect, mock, test } from 'bun:test';
+mock.module('@tauri-apps/api/event', () => ({ listen: async () => () => {} }));
+const listeners = new Map<string, Set<(...args: any[]) => void>>();
+Object.assign(globalThis, { window: { location: { search: '', pathname: '/meetings' }, history: { replaceState() {} }, addEventListener: (name: string, fn: any) => { if (!listeners.has(name)) listeners.set(name, new Set()); listeners.get(name)!.add(fn); }, removeEventListener: (name: string, fn: any) => listeners.get(name)?.delete(fn) } });
+let route = '';
+const source = [{ id: 'notes', title: 'Old meeting', created_at: '2026-11-18T10:00:00Z' }, { id: 'empty', title: 'Empty meeting', created_at: '2026-11-17T10:00:00Z' }];
+const sidebar: any = { meetings: source, setCurrentMeeting() {}, currentMeeting: null, refetchMeetings: async () => {}, meetingsError: null };
+mock.module('next/navigation', () => ({ useRouter: () => ({ push: (href: string) => { route = href; } }) }));
+mock.module('@/components/Sidebar/SidebarProvider', () => ({ useSidebar: () => sidebar }));
+mock.module('@/contexts/WorkspaceContext', () => ({ useWorkspace: () => ({ groups: [], groupById: () => null, people: [] }) }));
+mock.module('@/contexts/ImportDialogContext', () => ({ useImportDialog: () => ({ openImportDialog() {} }) }));
+let held: ((value: any) => void) | null = null;
+let fail = false;
+mock.module('@tauri-apps/api/event', () => ({ listen: async () => () => {} }));
+mock.module('@tauri-apps/api/core', () => ({ invoke: async (command: string, args: any) => {
+  if (command === 'api_library_materials') return source.map((meeting, i) => ({ id: meeting.id, hasNotes: i === 0, transcriptCount: 0, hasSummary: false, summaryStatus: null, audioAvailable: false }));
+  if (command === 'api_search_library') {
+    if (args.query === 'slow') return new Promise(resolve => { held = resolve; });
+    if (fail) throw new Error('search unavailable');
+    return [{ kind: 'notes', id: 'notes-notes', meetingId: 'notes', title: 'Old meeting', snippet: 'Моя МыСлЬ не речь', timestamp: '2026-11-18' }];
+  }
+  throw new Error(command);
+} }));
+mock.module('@/lib/workspace-api', () => ({ onWorkspaceChange: () => () => {}, announceChange() {} }));
+mock.module('@/lib/meeting-actions', () => ({ deleteMeetings() {}, moveMeetingsToGroup() {}, renameMeeting() {} }));
+const Wrap = ({ children }: any) => <div>{children}</div>;
+mock.module('@/components/ui/button', () => ({ Button: ({ children, ...props }: any) => <button {...props}>{children}</button> }));
+mock.module('@/components/ui/input', () => ({ Input: (props: any) => <input {...props} /> }));
+mock.module('@/components/ui/checkbox', () => ({ Checkbox: () => <input type="checkbox" /> }));
+mock.module('@/components/ui/combobox', () => ({ Combobox: () => <div /> }));
+mock.module('@/components/ui/confirm-dialog', () => ({ ConfirmDialog: () => null }));
+mock.module('@/components/ui/avatar', () => ({ Avatar: () => <div /> }));
+mock.module('@/components/ui/surface', () => ({ EmptyState: ({ title }: any) => <p>{title}</p>, PageHeader: ({ title }: any) => <h1>{title}</h1> }));
+mock.module('@/components/ui/select', () => ({ Select: Wrap, SelectContent: Wrap, SelectItem: Wrap, SelectTrigger: Wrap, SelectValue: Wrap }));
+mock.module('@/components/ui/dropdown-menu', () => Object.fromEntries(['DropdownMenu', 'DropdownMenuContent', 'DropdownMenuItem', 'DropdownMenuSeparator', 'DropdownMenuSub', 'DropdownMenuSubContent', 'DropdownMenuSubTrigger', 'DropdownMenuTrigger'].map(key => [key, Wrap])));
+mock.module('@/components/groups/GroupBits', () => ({ createGroupFromPicker() {}, GroupChip: Wrap, GroupDot: Wrap, groupOptions: () => [] }));
+mock.module('@/components/groups/GroupEditor', () => ({ openGroupEditor() {} }));
+mock.module('@/components/meetings/ExportMeetingsDialog', () => ({ ExportMeetingsDialog: () => null }));
+const { default: MeetingsPage } = await import('../../src/app/meetings/page');
+const pause = () => new Promise(resolve => setTimeout(resolve, 250));
+const query = (root: ReactTestRenderer, value: string) => root.root.findByProps({ 'aria-label': 'Filter meetings' }).props.onChange({ target: { value } });
+
+test('normal library page retains empty/Notes-only meetings, displays materials and opens matching Notes', async () => {
+  let root!: ReactTestRenderer;
+  await act(async () => { root = create(<MeetingsPage />); });
+  expect(root.root.findAllByType('li').length).toBe(2);
+  const before = JSON.stringify(root.toJSON());
+  expect(before).toContain('Audio unavailable'); expect(before).toContain('No summary'); expect(before).toContain('Your Notes');
+  await act(async () => query(root, 'мысль'));
+  await act(async () => { await pause(); });
+  expect(root.root.findAllByType('li').length).toBe(1);
+  expect(JSON.stringify(root.toJSON())).toContain('Моя МыСлЬ не речь');
+  await act(async () => root.root.findByType('li').props.onClick({}));
+  expect(route).toBe('/meeting-details?id=notes&section=notes');
+  await act(async () => root.unmount());
+});
+
+test('changing library query immediately removes stale hits, late responses cannot replace current results', async () => {
+  let root!: ReactTestRenderer;
+  await act(async () => { root = create(<MeetingsPage />); });
+  await act(async () => query(root,'slow'));
+  await act(async () => { await pause(); });
+  await act(async () => query(root,'current'));
+  expect(JSON.stringify(root.toJSON())).not.toContain('Моя МыСлЬ не речь');
+  await act(async () => { await pause(); });
+  await act(async () => { held!([{ kind:'transcript',id:'bad',meetingId:'empty',snippet:'STALE RESULT' }]); });
+  expect(JSON.stringify(root.toJSON())).not.toContain('STALE RESULT');
+  expect(root.root.findAllByType('li').length).toBe(1);
+  fail = true;
+  await act(async () => query(root,'failure'));
+  await act(async () => { await pause(); });
+  expect(JSON.stringify(root.toJSON())).toContain('search unavailable');
+  expect(JSON.stringify(root.toJSON())).not.toContain('Моя МыСлЬ не речь');
+  fail = false;
+  await act(async () => root.root.findAllByType('button').find(node => node.children.includes('Retry library'))!.props.onClick());
+  await act(async () => { await pause(); });
+  expect(JSON.stringify(root.toJSON())).toContain('Моя МыСлЬ не речь');
+  await act(async () => root.unmount());
+});

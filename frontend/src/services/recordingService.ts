@@ -7,9 +7,14 @@
 
 import { invoke } from '@tauri-apps/api/core';
 import { listen, UnlistenFn } from '@tauri-apps/api/event';
+import { isStartCapability, isStartRequest, isStartResolution, type StartCapability, type StartRequest, type StartResolution, type RecordingLease } from '@/lib/recording-start-authority';
 
 export interface RecordingState {
   is_recording: boolean;
+  is_stopping?: boolean;
+  recording_lease?: RecordingLease | null;
+  microphone_captured?: boolean;
+  system_audio_captured?: boolean;
   is_paused: boolean;
   is_microphone_muted: boolean;
   is_system_audio_muted: boolean;
@@ -78,13 +83,44 @@ export class RecordingService {
   async startRecordingWithDevices(
     micDeviceName: string | null,
     systemDeviceName: string | null,
-    meetingName: string
-  ): Promise<void> {
+    meetingName: string,
+    lifecycleSession?: string,
+    expectedStart?: StartRequest
+  ): Promise<RecordingLease | void> {
+    // Manual starts send neither field. Never silently omit a malformed or
+    // unsupported automatic guard and invoke the manual command instead.
+    if (lifecycleSession !== undefined || expectedStart !== undefined) {
+      if (!lifecycleSession || !isStartRequest(expectedStart) || expectedStart.session_id !== lifecycleSession) {
+        throw new Error('Automated recording requires native start authority v1 and its exact lifecycle session');
+      }
+    }
     return invoke('start_recording_with_devices_and_meeting', {
       micDeviceName,
       systemDeviceName,
-      meetingName
+      meetingName,
+      ...(expectedStart ? { lifecycleSession, expectedStart } : {}),
     });
+  }
+
+  async getRecordingStartCapability(): Promise<StartCapability> {
+    const value = await invoke<unknown>('get_recording_start_capability');
+    if (!isStartCapability(value)) throw new Error('Native recording start authority v1 is unavailable');
+    return value;
+  }
+
+  async resolveAutomatedRecordingStart(expected: StartRequest): Promise<StartResolution> {
+    return this.settleAutomatedRecordingStart('resolve_automated_recording_start', expected);
+  }
+
+  async cancelAutomatedRecordingStart(expected: StartRequest): Promise<StartResolution> {
+    return this.settleAutomatedRecordingStart('cancel_automated_recording_start', expected);
+  }
+
+  private async settleAutomatedRecordingStart(command: string, expected: StartRequest): Promise<StartResolution> {
+    if (!isStartRequest(expected)) throw new Error('Invalid native recording start request');
+    const value = await invoke<unknown>(command, { expected });
+    if (!isStartResolution(value, expected)) throw new Error('Native recording start remains unresolved');
+    return value;
   }
 
   /**

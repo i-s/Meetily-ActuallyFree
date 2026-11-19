@@ -37,12 +37,17 @@ pub mod analytics;
 pub mod api;
 pub mod app_update;
 pub mod audio;
+mod audio_cleanup;
+mod audio_cleanup_commands;
 pub mod claude_cli;
+pub mod codex_cli;
+pub mod post_call;
 pub mod config;
 pub mod console_utils;
 pub mod crash_report;
 pub mod database;
 pub mod diarization;
+pub mod speaker_labels;
 mod optional_models;
 pub mod notifications;
 pub mod ollama;
@@ -58,6 +63,7 @@ pub mod groq;
 pub mod openrouter;
 pub mod live_assistant;
 pub mod meeting_detection;
+mod discord_automation;
 pub mod minibar;
 pub mod parakeet_engine;
 pub mod paths;
@@ -103,6 +109,10 @@ fn set_check_updates_on_launch(enabled: bool) -> Result<(), String> {
 #[derive(Debug, Deserialize)]
 struct RecordingArgs {
     save_path: String,
+    #[serde(default)]
+    expected: Option<audio::recording_ownership::RecordingLease>,
+    #[serde(default)]
+    manual_generation: Option<String>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -188,6 +198,8 @@ async fn stop_recording<R: Runtime>(app: AppHandle<R>, args: RecordingArgs) -> R
         app.clone(),
         audio::recording_commands::RecordingArgs {
             save_path: args.save_path.clone(),
+            expected: args.expected.clone(),
+            manual_generation: args.manual_generation.clone(),
         },
     )
     .await
@@ -313,13 +325,14 @@ async fn save_transcript(file_path: String, content: String) -> Result<(), Strin
 async fn start_audio_level_monitoring<R: Runtime>(
     app: AppHandle<R>,
     device_names: Vec<String>,
+    device_type: Option<String>,
 ) -> Result<(), String> {
     log_info!(
         "Starting audio level monitoring for devices: {:?}",
         device_names
     );
 
-    audio::simple_level_monitor::start_monitoring(app, device_names)
+    audio::simple_level_monitor::start_monitoring(app, device_names, device_type)
         .await
         .map_err(|e| format!("Failed to start audio level monitoring: {}", e))
 }
@@ -361,7 +374,7 @@ async fn start_recording_with_devices<R: Runtime>(
     mic_device_name: Option<String>,
     system_device_name: Option<String>,
 ) -> Result<(), String> {
-    start_recording_with_devices_and_meeting(app, mic_device_name, system_device_name, None).await
+    start_recording_with_devices_and_meeting(app, mic_device_name, system_device_name, None, None, None).await.map(|_| ())
 }
 
 #[tauri::command]
@@ -370,7 +383,9 @@ async fn start_recording_with_devices_and_meeting<R: Runtime>(
     mic_device_name: Option<String>,
     system_device_name: Option<String>,
     meeting_name: Option<String>,
-) -> Result<(), String> {
+    lifecycle_session: Option<String>,
+    expected_start: Option<audio::recording_start_authority::StartRequest>,
+) -> Result<audio::recording_ownership::RecordingLease, String> {
     log_info!("ðŸš€ CALLED start_recording_with_devices_and_meeting - Mic: {:?}, System: {:?}, Meeting: {:?}",
              mic_device_name, system_device_name, meeting_name);
 
@@ -378,34 +393,40 @@ async fn start_recording_with_devices_and_meeting<R: Runtime>(
     let meeting_name_for_notification = meeting_name.clone();
 
     // Call the recording module functions that support meeting names
-    let recording_result = match (mic_device_name.clone(), system_device_name.clone()) {
-        (None, None) => {
-            log_info!(
-                "No devices specified, starting with defaults and meeting: {:?}",
-                meeting_name
-            );
-            audio::recording_commands::start_recording_with_meeting_name(app.clone(), meeting_name)
+    let recording_result = if lifecycle_session.is_some() || expected_start.is_some() {
+        audio::recording_commands::start_recording_with_lifecycle(
+            app.clone(), mic_device_name.clone(), system_device_name.clone(), meeting_name.clone(), lifecycle_session, expected_start,
+        ).await
+    } else {
+        match (mic_device_name.clone(), system_device_name.clone()) {
+            (None, None) => {
+                log_info!(
+                    "No devices specified, starting with defaults and meeting: {:?}",
+                    meeting_name
+                );
+                audio::recording_commands::start_recording_with_meeting_name(app.clone(), meeting_name)
+                    .await
+            }
+            _ => {
+                log_info!(
+                    "Starting with specified devices: mic={:?}, system={:?}, meeting={:?}",
+                    mic_device_name,
+                    system_device_name,
+                    meeting_name
+                );
+                audio::recording_commands::start_recording_with_devices_and_meeting(
+                    app.clone(),
+                    mic_device_name,
+                    system_device_name,
+                    meeting_name,
+                )
                 .await
-        }
-        _ => {
-            log_info!(
-                "Starting with specified devices: mic={:?}, system={:?}, meeting={:?}",
-                mic_device_name,
-                system_device_name,
-                meeting_name
-            );
-            audio::recording_commands::start_recording_with_devices_and_meeting(
-                app.clone(),
-                mic_device_name,
-                system_device_name,
-                meeting_name,
-            )
-            .await
+            }
         }
     };
 
     match recording_result {
-        Ok(_) => {
+        Ok(lease) => {
             log_info!("Recording started successfully via tauri command");
 
             // Show recording started notification through NotificationManager
@@ -424,7 +445,7 @@ async fn start_recording_with_devices_and_meeting<R: Runtime>(
                 );
             }
 
-            Ok(())
+            Ok(lease)
         }
         Err(e) => {
             log_error!("Failed to start recording via tauri command: {}", e);
@@ -533,6 +554,7 @@ pub fn run() {
             // Meeting detection: load persisted settings and start the monitor
             // if the user enabled it (default off).
             crate::meeting_detection::initialize(&_app.handle());
+            crate::discord_automation::initialize(&_app.handle());
 
             // Free Whisper/Parakeet VRAM a couple minutes after last STT use.
             audio::common::start_stt_idle_unloader();
@@ -738,6 +760,9 @@ pub fn run() {
             onnx_runtime::check_transcription_runtime,
             start_recording_with_devices,
             start_recording_with_devices_and_meeting,
+            audio::recording_start_authority::get_recording_start_capability,
+            audio::recording_commands::resolve_automated_recording_start,
+            audio::recording_commands::cancel_automated_recording_start,
             start_audio_level_monitoring,
             stop_audio_level_monitoring,
             is_audio_level_monitoring,
@@ -762,6 +787,7 @@ pub fn run() {
             audio::incremental_saver::recover_audio_from_checkpoints,
             audio::incremental_saver::cleanup_checkpoints,
             audio::incremental_saver::has_audio_checkpoints,
+            audio::incremental_saver::has_recoverable_audio,
             console_utils::show_console,
             console_utils::hide_console,
             console_utils::toggle_console,
@@ -778,6 +804,12 @@ pub fn run() {
             anthropic::anthropic::get_anthropic_models,
             groq::groq::get_groq_models,
             api::api_get_meetings,
+            audio_cleanup_commands::api_audio_storage,
+            audio_cleanup_commands::api_prepare_audio_cleanup,
+            audio_cleanup_commands::api_confirm_audio_cleanup,
+            database::library_commands::api_library_materials,
+            database::library_commands::api_search_library,
+            database::library_commands::api_export_meeting_snapshot,
             api::api_search_transcripts,
             database::repositories::person::api_global_search,
             database::repositories::person::api_get_person_profile,
@@ -800,11 +832,30 @@ pub fn run() {
             database::repositories::action_item::api_update_action_item,
             database::repositories::action_item::api_delete_action_item,
             database::repositories::action_item::api_sync_ai_action_items,
+            database::repositories::action_sync::api_action_sync_context,
+            database::repositories::action_sync::api_commit_action_sync,
             database::repositories::action_item::api_list_unsynced_action_meetings,
+            database::repositories::notes_document::api_notes_recording_target,
+            database::repositories::notes_document::api_read_notes_document,
+            database::repositories::notes_document::api_write_notes_document,
             database::repositories::meeting_notes::api_get_meeting_notes,
             database::repositories::meeting_notes::api_save_meeting_notes,
             api::api_get_meeting_audio,
+            audio::recording_ownership::set_meeting_automation_enabled,
+            audio::recording_ownership::release_automated_recording,
+            meeting_detection::zoom_observation::start_zoom_observation,
+            meeting_detection::zoom_observation::mark_zoom_observation,
+            meeting_detection::zoom_observation::stop_zoom_observation,
+            meeting_detection::zoom_observation::export_zoom_observation,
+            meeting_detection::zoom_observation::clear_zoom_observation,
+            meeting_detection::lifecycle::get_meeting_lifecycle_snapshot,
             meeting_detection::get_meeting_detection_settings,
+            discord_automation::get_discord_automation_status,
+            discord_automation::start_discord_observation,
+            discord_automation::mark_discord_observation,
+            discord_automation::stop_discord_observation,
+            discord_automation::get_discord_observation,
+            discord_automation::clear_discord_observation,
             meeting_detection::set_meeting_detection_settings,
             meeting_detection::start_meeting_detection,
             meeting_detection::stop_meeting_detection,
@@ -841,6 +892,9 @@ pub fn run() {
             api::api_get_transcript_api_key,
             api::api_get_whisper_vocabulary,
             api::api_save_global_whisper_vocabulary,
+            api::api_confirm_vocabulary_term,
+            api::api_get_vocabulary_suggestion_context,
+            api::api_confirm_vocabulary_suggestion,
             api::api_save_meeting_whisper_vocabulary,
             api::api_delete_meeting,
             api::api_get_meeting,
@@ -873,6 +927,16 @@ pub fn run() {
             summary::template_commands::api_save_custom_template,
             summary::template_commands::api_delete_custom_template,
             summary::template_commands::api_is_custom_template,
+            post_call::post_call_list,
+            post_call::post_call_control,
+            post_call::post_call_results,
+            post_call::post_call_canonical_summary,
+            codex_cli::commands::codex_cli_get_path,
+            codex_cli::commands::codex_cli_save_path,
+            codex_cli::commands::codex_cli_get_status,
+            codex_cli::commands::codex_live_cutoff,
+            codex_cli::commands::codex_live_ask,
+            codex_cli::commands::codex_live_cancel,
             live_assistant::ask_live_assistant,
             live_assistant::ask_person,
             live_assistant::api_ask_meeting,
@@ -889,6 +953,7 @@ pub fn run() {
             openrouter::get_openrouter_models,
             audio::recording_preferences::get_recording_preferences,
             audio::recording_preferences::set_recording_preferences,
+            audio::recording_preferences::set_recording_source_enabled,
             audio::recording_preferences::get_default_recordings_folder_path,
             audio::recording_preferences::open_recordings_folder,
             audio::recording_preferences::discard_recording_folder,
@@ -949,6 +1014,11 @@ pub fn run() {
             #[cfg(target_os = "macos")]
             utils::open_system_settings,
             // Retranscription commands
+            database::transcript_version_commands::get_selected_transcript,
+            database::transcript_version_commands::correct_transcript_text,
+            database::transcript_version_commands::list_transcript_versions,
+            database::transcript_version_commands::get_transcript_version,
+            database::transcript_version_commands::select_transcript_version,
             audio::retranscription::start_retranscription_command,
             audio::retranscription::cancel_retranscription_command,
             audio::retranscription::is_retranscription_in_progress_command,

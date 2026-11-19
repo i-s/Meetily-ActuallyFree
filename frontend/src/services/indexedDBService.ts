@@ -13,6 +13,7 @@ export interface MeetingMetadata {
   transcriptCount: number;    // Number of transcript segments
   savedToSQLite: boolean;     // Flag: saved to backend DB
   folderPath?: string;        // Path to recording folder
+  audioAvailable?: boolean;  // Ephemeral native validation result, never replaces folderPath
 }
 
 export interface StoredTranscript {
@@ -193,6 +194,7 @@ class IndexedDBService {
       });
     } catch (error) {
       console.warn('Failed to mark meeting as saved:', error);
+      throw error;
     }
   }
 
@@ -293,7 +295,7 @@ class IndexedDBService {
       });
     } catch (error) {
       console.error('Failed to get transcripts from IndexedDB:', error);
-      return [];
+      throw error;
     }
   }
 

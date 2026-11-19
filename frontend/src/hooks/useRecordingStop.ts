@@ -13,8 +13,8 @@ import {
   applyPinnedSummaryLanguageToMeeting,
   detectAndCacheSummaryLanguage,
 } from '@/lib/summary-language-preferences';
-import { endLiveSession, finalLiveTitle, readLiveNotes, writeLiveTitle } from '@/lib/live-session';
-import { announceChange, saveMeetingNotes } from '@/lib/workspace-api';
+import { endLiveSession, finalLiveTitle } from '@/lib/live-session';
+import { announceChange } from '@/lib/workspace-api';
 import { endAutomatedRecording } from '@/lib/meeting-automation';
 
 type SummaryStatus = 'idle' | 'processing' | 'summarizing' | 'regenerating' | 'completed' | 'error';
@@ -83,57 +83,18 @@ export function useRecordingStop(
       return;
     }
     stopInProgressRef.current = true;
-    endAutomatedRecording();
+    // Native start settlement owns automation release. A delayed save callback
+    // for A must not revoke whichever owner/pending B exists when it runs.
 
-    // Accidental taps: under 10s → discard, no meeting note.
-    const MIN_MEETING_SECS = 10;
-    let elapsedSecs = recordingState.recordingDuration ?? 0;
-    let recordingStartedAtMs = 0;
+    // Manual Stop saves the take, even when short or ASR has produced no text.
+    // Discarding user audio requires an explicit user action, not a duration guess.
     let recordingStartFallbackAtMs = 0;
     try {
-      recordingStartedAtMs = Number(sessionStorage.getItem('recording_started_at') || '0');
       recordingStartFallbackAtMs = Number(sessionStorage.getItem('recording_start_fallback_at') || '0');
-      if (recordingStartedAtMs > 0) {
-        elapsedSecs = Math.max(elapsedSecs, (Date.now() - recordingStartedAtMs) / 1000);
-      }
       sessionStorage.removeItem('recording_started_at');
       sessionStorage.removeItem('recording_start_fallback_at');
     } catch {
       /* ignore */
-    }
-
-    if (elapsedSecs > 0 && elapsedSecs < MIN_MEETING_SECS) {
-      console.log(`Recording too short (${elapsedSecs.toFixed(1)}s) — discarding`);
-      setStatus(RecordingStatus.IDLE);
-      setIsRecording(false);
-      setIsRecordingDisabled(false);
-      setIsMeetingActive(false);
-      clearTranscripts();
-      endLiveSession();
-      try {
-        // stop_recording may still be publishing folder_path — brief wait.
-        let folderPath = sessionStorage.getItem('last_recording_folder_path');
-        if (!folderPath) {
-          await new Promise((r) => setTimeout(r, 400));
-          folderPath = sessionStorage.getItem('last_recording_folder_path');
-        }
-        sessionStorage.removeItem('last_recording_folder_path');
-        sessionStorage.removeItem('last_recording_meeting_name');
-        if (folderPath) {
-          await invoke('discard_recording_folder', { folderPath }).catch((e) =>
-            console.warn('Failed to discard short recording folder:', e),
-          );
-        }
-      } catch {
-        /* ignore cleanup errors */
-      }
-      toast.message('Recording cancelled', {
-        description: `That take was under ${MIN_MEETING_SECS} seconds, so nothing was saved.`,
-        duration: 5000,
-      });
-      Analytics.trackButtonClick('recording_discarded_too_short', 'home_page');
-      stopInProgressRef.current = false;
-      return;
     }
 
     // Set status to STOPPING immediately
@@ -240,7 +201,12 @@ export function useRecordingStop(
       // Save to SQLite
       // NOTE: enabled to save COMPLETE transcripts after frontend receives all updates
       // This ensures user sees all transcripts streaming in before database save
-      if (isCallApi && transcriptionComplete == true) {
+      if (isCallApi) {
+        if (!transcriptionComplete) {
+          toast.warning('Transcription did not finish in time', {
+            description: 'Saving the available text and recorded audio. Recovery data is retained for review.',
+          });
+        }
 
         setStatus(RecordingStatus.SAVING, 'Saving meeting to database...');
 
@@ -290,23 +256,9 @@ export function useRecordingStop(
             } catch (error) {
               console.warn('Could not file this meeting into its group', error);
             }
-            // Notes typed during the call become the meeting's notes. If that
-            // fails they stay in the draft rather than being dropped.
-            const liveNotes = readLiveNotes();
-            let notesSaved = true;
-            if (liveNotes?.markdown.trim()) {
-              try {
-                await saveMeetingNotes(meetingId, liveNotes.markdown, liveNotes.json);
-              } catch (error) {
-                notesSaved = false;
-                console.warn('Could not save the notes taken during the call', error);
-                toast.warning('Your call notes were not saved to the meeting', {
-                  description: 'Copy them from the Notes tab on the recorder before starting another recording.',
-                });
-              }
-            }
-            if (notesSaved) endLiveSession();
-            else writeLiveTitle(null);
+            // Native save/recovery attaches Notes by recording folder in the
+            // meeting transaction. Never copy an unscoped browser draft here.
+            endLiveSession();
           }
           if (!meetingId) {
             console.error('No meeting_id in response:', responseData);

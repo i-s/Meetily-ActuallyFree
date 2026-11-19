@@ -13,25 +13,40 @@ export function useAutosave<T>(save: (value: T) => Promise<void>, delay = 800) {
   const [state, setState] = useState<SaveState>('idle');
   const pending = useRef<{ value: T } | null>(null);
   const timer = useRef<number | null>(null);
+  const inFlight = useRef<Promise<boolean> | null>(null);
   const saveRef = useRef(save);
   saveRef.current = save;
 
-  const flush = useCallback(async () => {
+  const flush = useCallback(async (): Promise<boolean> => {
     if (timer.current !== null) {
       window.clearTimeout(timer.current);
       timer.current = null;
     }
-    const next = pending.current;
-    if (!next) return;
-    pending.current = null;
-    setState('saving');
-    try {
-      await saveRef.current(next.value);
-      setState(pending.current ? 'pending' : 'saved');
-    } catch (error) {
-      console.error('Autosave failed', error);
-      setState('error');
-    }
+    // A transcript switch must await a write already in flight, not just the
+    // debounce buffer. Drain newer edits serially so old replies cannot win.
+    if (inFlight.current) return inFlight.current;
+    const write = async () => {
+      while (pending.current) {
+        const next = pending.current;
+        const writer = saveRef.current;
+        pending.current = null;
+        setState('saving');
+        try {
+          await writer(next.value);
+        } catch (error) {
+          if (!pending.current) pending.current = next;
+          console.error('Autosave failed', error);
+          setState('error');
+          return false;
+        }
+      }
+      setState('saved');
+      return true;
+    };
+    const work = write();
+    inFlight.current = work;
+    try { return await work; }
+    finally { inFlight.current = null; }
   }, []);
 
   const schedule = useCallback(

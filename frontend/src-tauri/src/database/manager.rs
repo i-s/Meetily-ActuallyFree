@@ -373,6 +373,10 @@ impl DatabaseManager {
 }
 
 #[cfg(test)]
+#[path = "migration_lineage_tests.rs"]
+mod migration_lineage_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

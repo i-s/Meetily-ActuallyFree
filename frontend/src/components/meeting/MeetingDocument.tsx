@@ -38,17 +38,18 @@ import { ActionItemsList } from '@/components/actions/ActionItemsList';
 import { ChatThread } from '@/components/chat/ChatThread';
 import { LanguagePickerPopover } from '@/components/LanguagePickerPopover';
 import { ModelSettingsModal, type ModelConfig } from '@/components/ModelSettingsModal';
+import { MeetingNotesEditor } from '@/components/meeting/MeetingNotesEditor';
 import { useAutosave, saveStateLabel, type SaveState } from '@/hooks/useAutosave';
 import {
   askMeeting,
-  getMeetingNotes,
   listActionItems,
   onWorkspaceChange,
-  saveMeetingNotes,
   type ActionItem,
 } from '@/lib/workspace-api';
 import { syncMeetingActionItems, type TranscriptLine } from '@/lib/action-item-sync';
 import { extractActionItems } from '@/lib/action-items';
+import { onPostCallCanonicalChange } from '@/lib/post-call-canonical';
+import { getNotesSnapshot, subscribeNotes } from '@/lib/notes-store';
 import { completeSummaryMarkdown } from '@/lib/summary-markdown';
 import { labelForCode } from '@/lib/summary-languages';
 import { readMeetingSummaryLanguage, saveMeetingSummaryLanguage } from '@/lib/summary-language-preferences';
@@ -57,6 +58,9 @@ type SummaryStatus = 'idle' | 'processing' | 'summarizing' | 'regenerating' | 'c
 
 export interface MeetingDocumentProps {
   meetingId: string;
+  focusNotes?: boolean;
+  transcriptChanging?: boolean;
+  registerTranscriptPreparation?: (prepare: () => Promise<void>) => (() => void);
   aiSummary: any;
   summaryUserEdited: boolean;
   onSummaryChange: (summary: any, source: 'user' | 'system') => void;
@@ -103,6 +107,7 @@ function SaveIndicator({ state }: { state: SaveState }) {
 
 export function MeetingDocument(props: MeetingDocumentProps) {
   const [tab, setTab] = useState<'notes' | 'ask'>('notes');
+  useEffect(() => { if (props.focusNotes) setTab('notes'); }, [props.meetingId, props.focusNotes]);
   return (
     <Tabs value={tab} onValueChange={(value) => setTab(value as 'notes' | 'ask')} className="flex h-full min-h-0 flex-col">
       <div className="flex h-12 shrink-0 items-center justify-between gap-3 border-b border-af-border px-4">
@@ -138,6 +143,9 @@ export function MeetingDocument(props: MeetingDocumentProps) {
 
 function NotesTab({
   meetingId,
+  focusNotes,
+  transcriptChanging,
+  registerTranscriptPreparation,
   aiSummary,
   summaryUserEdited,
   onSummaryChange,
@@ -160,36 +168,28 @@ function NotesTab({
   regenerateRequest,
   onRegenerateRequestHandled,
 }: MeetingDocumentProps) {
-  // ---- Notes ---------------------------------------------------------------
-  const [notes, setNotes] = useState<{ loaded: boolean; json: unknown[] | null; markdown: string | null }>({
-    loaded: false,
-    json: null,
-    markdown: null,
-  });
+  const notesSection = useRef<HTMLElement>(null);
   useEffect(() => {
-    let cancelled = false;
-    setNotes({ loaded: false, json: null, markdown: null });
-    void getMeetingNotes(meetingId)
-      .then((stored) => !cancelled && setNotes({ loaded: true, json: stored?.json ?? null, markdown: stored?.markdown ?? null }))
-      .catch(() => !cancelled && setNotes({ loaded: true, json: null, markdown: null }));
-    return () => {
-      cancelled = true;
-    };
-  }, [meetingId]);
-  const notesSaver = useAutosave<NotesContent>((content) =>
-    saveMeetingNotes(meetingId, content.markdown.trim() ? content.markdown : null, content.markdown.trim() ? content.json : null),
-  );
-
+    if (!focusNotes) return;
+    const section = notesSection.current;
+    section?.scrollIntoView({ block: 'start' });
+    section?.focus({ preventScroll: true });
+  }, [meetingId, focusNotes]);
   // ---- Action items --------------------------------------------------------
   const [items, setItems] = useState<ActionItem[]>([]);
+  const activeMeeting = useRef(meetingId);
+  activeMeeting.current = meetingId;
+  const itemRequest = useRef(0);
   const [itemsLoaded, setItemsLoaded] = useState(false);
   const loadItems = useCallback(async () => {
+    const request = ++itemRequest.current;
     try {
-      setItems(await listActionItems({ meetingId }));
+      const loaded = await listActionItems({ meetingId });
+      if (activeMeeting.current === meetingId && itemRequest.current === request) setItems(loaded);
     } catch (error) {
       console.error('Failed to load action items', error);
     } finally {
-      setItemsLoaded(true);
+      if (activeMeeting.current === meetingId && itemRequest.current === request) setItemsLoaded(true);
     }
   }, [meetingId]);
   useEffect(() => {
@@ -216,36 +216,102 @@ function NotesTab({
     setRevision((value) => value + 1);
   }, [markdown]);
 
-  // Move a fresh summary's action section into the action list.
-  const syncing = useRef(false);
-  const transcriptRef = useRef(transcript);
-  transcriptRef.current = transcript;
+  // A native extraction can outlive this summary, projection or WebView.
+  // Keep its promise for the local version barrier; native CAS is authoritative
+  // for other windows/jobs, while this epoch protects newer unsaved rich drafts.
+  const syncing = useRef({ meetingId, work: Promise.resolve() });
+  if (syncing.current.meetingId !== meetingId) syncing.current = { meetingId, work: Promise.resolve() };
+  const summaryDraftEpoch = useRef(0);
+  const actionView = useRef({ meetingId, aiSummary, transcriptChanging, summaryUserEdited });
+  actionView.current = { meetingId, aiSummary, transcriptChanging, summaryUserEdited };
+  const onSummaryChangeRef = useRef(onSummaryChange);
+  onSummaryChangeRef.current = onSummaryChange;
   useEffect(() => {
-    if (!aiSummary || syncing.current || !markdown.trim()) return;
-    // Only summaries that arrive from generation or storage are sorted; a
-    // section the user is typing into stays where they put it.
+    if (!aiSummary || transcriptChanging || !markdown.trim()) return;
     if (lastEditorMarkdown.current !== null && lastEditorMarkdown.current === markdown) return;
     if (!extractActionItems(markdown).hadActionSection) return;
-    syncing.current = true;
-    void syncMeetingActionItems(meetingId, aiSummary, transcriptRef.current)
+    let cancelled = false;
+    const draftEpoch = summaryDraftEpoch.current;
+    const work = syncMeetingActionItems(meetingId, aiSummary)
       .then((outcome) => {
-        if (outcome.items) setItems(outcome.items);
-        if (outcome.summary) onSummaryChange(outcome.summary, 'system');
+        const current = actionView.current;
+        if (cancelled || summaryDraftEpoch.current !== draftEpoch || current.meetingId !== meetingId || current.aiSummary !== aiSummary || current.transcriptChanging) return;
+        // A task can be edited while the committed extraction reply is in
+        // transit. Reload instead of installing its older task/anchor snapshot.
+        if (outcome.items) void loadItems();
+        if (outcome.summary) onSummaryChangeRef.current(outcome.summary, 'system');
       })
-      .catch((error) => console.error('Action item sync failed', error))
-      .finally(() => {
-        syncing.current = false;
-      });
-  }, [aiSummary, markdown, meetingId, onSummaryChange]);
+      .catch((error) => console.error('Action item sync failed', error));
+    syncing.current = { meetingId, work: Promise.all([syncing.current.work, work]).then(() => {}) };
+    return () => { cancelled = true; };
+  }, [aiSummary, markdown, meetingId, transcriptChanging, loadItems]);
+
+  const canonicalRefresh = useRef(0);
+  useEffect(() => {
+    let disposed = false;
+    const target = `meeting:${meetingId}`;
+    let notesRevision = getNotesSnapshot(target).committedRevision;
+    const refresh = async () => {
+      const request = ++canonicalRefresh.current;
+      const expectedNotesRevision = getNotesSnapshot(target).committedRevision;
+      const epoch = summaryDraftEpoch.current;
+      const view = actionView.current;
+      // A local user draft owns this editor, including while conversion waits.
+      if (epoch !== 0 || view.transcriptChanging || view.summaryUserEdited || view.aiSummary?.user_edited) return;
+      try {
+        const summary = await invoke<any>('post_call_canonical_summary', { meetingId });
+        const current = actionView.current;
+        if (disposed || request !== canonicalRefresh.current || epoch !== summaryDraftEpoch.current || expectedNotesRevision !== getNotesSnapshot(target).committedRevision || current.meetingId !== meetingId || current.aiSummary !== view.aiSummary || current.transcriptChanging || current.summaryUserEdited) return;
+        if (summary && JSON.stringify(summary) !== JSON.stringify(current.aiSummary)) {
+          onSummaryChangeRef.current(summary, 'system');
+          void loadItems();
+        } else if (!summary && current.aiSummary?.post_call) {
+          onSummaryChangeRef.current(null, 'system');
+          void loadItems();
+        }
+      } catch (error) { console.error('Canonical post-call summary refresh failed', error); }
+    };
+    summaryDraftEpoch.current = 0;
+    void refresh();
+    const stop = onPostCallCanonicalChange(() => void refresh());
+    const stopNotes = subscribeNotes(target, () => {
+      const committed = getNotesSnapshot(target).committedRevision;
+      if (committed === undefined || committed === notesRevision) return;
+      notesRevision = committed;
+      // The native canonical view checks this exact committed Notes revision.
+      // Draft/conversion/error notifications do not invalidate saved output.
+      void refresh();
+    });
+    return () => { disposed = true; ++canonicalRefresh.current; stop(); stopNotes(); };
+  }, [meetingId, loadItems]);
 
   const summarySaver = useAutosave<NotesContent>(async (content) => {
     await invoke('api_save_meeting_summary', {
       meetingId,
-      summary: { markdown: content.markdown, summary_json: content.json },
+      summary: { markdown: content.markdown, summary_json: content.json, ...(aiSummary?.post_call ? { post_call: aiSummary.post_call, user_edited: true } : {}) },
       userEdit: true,
     });
     setUserEdited(true);
   });
+
+  const notesConversion = useRef<() => Promise<void>>(async () => {});
+  const summaryConversion = useRef<() => Promise<void>>(async () => {});
+  const registerNotesFlush = useCallback((flush: () => Promise<void>) => {
+    notesConversion.current = flush;
+    return () => { notesConversion.current = async () => {}; };
+  }, []);
+  const registerSummaryFlush = useCallback((flush: () => Promise<void>) => {
+    summaryConversion.current = flush;
+    return () => { summaryConversion.current = async () => {}; };
+  }, []);
+  useEffect(() => registerTranscriptPreparation?.(async () => {
+    await Promise.all([notesConversion.current(), summaryConversion.current()]);
+    const saved = await summarySaver.flush();
+    if (!saved) throw new Error('Save pending notes and summary edits before changing transcript versions. Retry after storage recovers.');
+    // Drain this window's extraction before native archives the summary/tasks.
+    // Other windows remain safe through the native ownership transaction.
+    await syncing.current.work;
+  }), [registerTranscriptPreparation, summarySaver.flush]);
 
   const generating = summaryStatus === 'processing' || summaryStatus === 'summarizing' || summaryStatus === 'regenerating';
   const hasSummary = !!aiSummary && !!markdown.trim();
@@ -308,21 +374,9 @@ function NotesTab({
     <div className="min-h-0 flex-1 overflow-y-auto">
       <div className="mx-auto max-w-3xl space-y-8 px-10 pb-16 pt-6">
         {/* Notes */}
-        <section>
-          <SectionTitle icon={NotebookPen} aside={<SaveIndicator state={notesSaver.state} />}>
-            Your notes
-          </SectionTitle>
-          {notes.loaded ? (
-            <NotesEditor
-              key={`notes-${meetingId}`}
-              initialBlocks={notes.json}
-              initialMarkdown={notes.markdown}
-              placeholder="Write your own notes. They stay yours: summaries never overwrite them."
-              onChange={notesSaver.schedule}
-            />
-          ) : (
-            <Skeleton className="h-16 w-full" />
-          )}
+        <section ref={notesSection} id="user-notes" tabIndex={-1}>
+          <SectionTitle icon={NotebookPen}>Your notes — not recognized speech</SectionTitle>
+          <MeetingNotesEditor key={meetingId} target={`meeting:${meetingId}`} editable={!transcriptChanging} registerFlush={registerNotesFlush} />
         </section>
 
         {/* Action items */}
@@ -479,12 +533,15 @@ function NotesTab({
           ) : hasSummary ? (
             <NotesEditor
               key={`summary-${meetingId}-${revision}`}
+              editable={!transcriptChanging}
+              registerFlush={registerSummaryFlush}
+              onEdit={() => { summaryDraftEpoch.current += 1; }}
               initialBlocks={blocks}
               initialMarkdown={blocks ? null : markdown}
               placeholder="The summary is empty."
               onChange={(content) => {
                 lastEditorMarkdown.current = completeSummaryMarkdown({ markdown: content.markdown });
-                onSummaryChange({ markdown: content.markdown, summary_json: content.json }, 'user');
+                onSummaryChange({ markdown: content.markdown, summary_json: content.json, ...(aiSummary?.post_call ? { post_call: aiSummary.post_call, user_edited: true } : {}) }, 'user');
                 summarySaver.schedule(content);
               }}
             />

@@ -127,7 +127,7 @@ export interface TranscriptSegmentData {
   speaker?: string;
 }
 
-export type GlobalSearchResultKind = 'person' | 'meeting' | 'transcript' | 'summary';
+export type GlobalSearchResultKind = 'person' | 'meeting' | 'transcript' | 'summary' | 'notes' | 'group' | 'action';
 
 export interface GlobalSearchResult {
   kind: GlobalSearchResultKind;

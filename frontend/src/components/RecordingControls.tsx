@@ -24,7 +24,7 @@ import { ChevronDown, Layers, Minimize2, Mic, Pause, Play, Square } from 'lucide
 import { toast } from 'sonner';
 import { cn } from '@/lib/utils';
 import Analytics from '@/lib/analytics';
-import { useRecordingState } from '@/contexts/RecordingStateContext';
+import { useRecordingState, RecordingStatus } from '@/contexts/RecordingStateContext';
 import { useConfig } from '@/contexts/ConfigContext';
 import { usePlatform } from '@/hooks/usePlatform';
 import { usePendingGroup } from '@/hooks/usePendingGroup';
@@ -34,10 +34,14 @@ import type { SelectedDevices } from '@/components/DeviceSelection';
 import { RecordingVoiceLane } from '@/components/RecordingVoiceLane';
 import { AppAudioSource, useAppAudioSupported } from '@/components/recording/AppAudioSource';
 import { useAppAudio } from '@/hooks/useAppAudio';
+import { useRecordingSources } from '@/hooks/useRecordingSources';
+import { flushRecordingSources } from '@/lib/recording-sources';
 import { GroupPicker } from '@/components/groups/GroupBits';
 import { Hint } from '@/components/ui/tooltip';
 import { Spinner } from '@/components/ui/spinner';
-import { STOP_RECORDING_EVENT, STOP_REQUEST_KEY } from '@/lib/recording-launch';
+import { STOP_RECORDING_EVENT, takeRecordingStopRequest, readRecordingStopRequest, queueRecordingStopRequest, completeRecordingStopRequest, requestRecordingStop } from '@/lib/recording-launch';
+import { stopRecordingRequest, type RecordingLease } from '@/lib/native-recording';
+import { loadLabsPreferences } from '@/lib/labs';
 import { formatClock } from '@/lib/dates';
 
 interface RecordingControlsProps {
@@ -111,12 +115,10 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
   const [openLane, setOpenLane] = useState<'mic' | 'output' | null>(null);
   const [micGain, setMicGain] = useState(1);
   const [systemGain, setSystemGain] = useState(1);
+  const recordingSources = useRecordingSources();
   const saveChain = useRef(Promise.resolve());
   const gainTimer = useRef<number | null>(null);
   const pendingGain = useRef<{ which: 'mic' | 'system'; value: number } | null>(null);
-  // Mutes chosen before recording apply the moment it starts.
-  const [idleMicMuted, setIdleMicMuted] = useState(false);
-  const [idleSystemMuted, setIdleSystemMuted] = useState(false);
 
   const [isProcessing, setIsProcessing] = useState(false);
   const [isStarting, setIsStarting] = useState(false);
@@ -248,82 +250,97 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
     if (isStarting) setOpenLane(null);
   }, [isStarting]);
 
-  const wasRecording = useRef(false);
-  useEffect(() => {
-    if (isRecording && !wasRecording.current) {
-      if (idleMicMuted) void invoke('set_microphone_muted', { muted: true }).catch(() => undefined);
-      if (idleSystemMuted) void invoke('set_system_audio_muted', { muted: true }).catch(() => undefined);
-    }
-    if (!isRecording && wasRecording.current) {
-      setIdleMicMuted(false);
-      setIdleSystemMuted(false);
-    }
-    wasRecording.current = isRecording;
-  }, [idleMicMuted, idleSystemMuted, isRecording]);
-
   const handleStartRecording = useCallback(async () => {
     if (isStarting) return;
     // Busy for the whole start sequence; loading the model can take a while.
     setIsStarting(true);
     await invoke('stop_audio_level_monitoring').catch(() => undefined);
     try {
+      await flushRecordingSources();
       await onRecordingStart();
+    } catch (error) {
+      toast.error('Could not start recording', { description: errorText(error) });
     } finally {
       setIsStarting(false);
     }
   }, [onRecordingStart, isStarting]);
 
-  const stopRecordingAction = useCallback(async () => {
+  const stopRecordingAction = useCallback(async (expected?: RecordingLease, manualGeneration?: string) => {
     try {
-      setIsProcessing(true);
+      if (expected && !loadLabsPreferences().meetingAutomation) return false;
+      if (!expected && !manualGeneration) setIsProcessing(true);
       // Recordings save under the install-local data root (same directory as the database).
       const dataDir = await invoke<string>('get_database_directory');
       const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-      const didStop = await invoke<boolean>('stop_recording', {
-        args: { save_path: `${dataDir}/recording-${timestamp}.wav` },
-      });
-      setIsProcessing(false);
-      if (!didStop) return;
+      if (expected && !loadLabsPreferences().meetingAutomation) return false;
+      const didStop = await stopRecordingRequest(`${dataDir}/recording-${timestamp}.wav`, expected, manualGeneration);
+      if (!expected && !manualGeneration) setIsProcessing(false);
+      if (!didStop) return false;
+      if (manualGeneration) onStopInitiated?.();
       Analytics.trackTranscriptionSuccess();
       // Rust emits one completion event; RecordingPostProcessingProvider saves
       // the meeting and navigates for every stop origin.
+      return true;
     } catch (error) {
       console.error('Failed to stop recording:', error);
-      if (errorText(error).includes('No recording in progress')) return;
-      setIsProcessing(false);
-      onRecordingStop(false);
+      if (errorText(error).includes('No recording in progress')) return false;
+      if (!expected && !manualGeneration) {
+        setIsProcessing(false);
+        onRecordingStop(false);
+      }
+      return false;
     } finally {
-      setIsStopping(false);
+      if (!expected && !manualGeneration) setIsStopping(false);
     }
-  }, [onRecordingStop]);
+  }, [onRecordingStop, onStopInitiated]);
 
   const handleStopRecording = useCallback(async () => {
     if (!isRecording || isStarting || isStopping) return;
     onStopInitiated?.();
     setIsStopping(true);
-    await stopRecordingAction();
+    return stopRecordingAction();
   }, [isRecording, isStarting, isStopping, stopRecordingAction, onStopInitiated]);
 
-  // Stop pressed elsewhere in the app (recording pill, command bar, meeting
-  // automation) routes here and leaves a request, so the normal stop and save
-  // flow runs from this card.
-  useEffect(() => {
-    let requested = false;
+  const stopDispatcher = useRef(false);
+  const stopReady = useRef(false);
+  stopReady.current = isRecording && !isStarting && !isStopping;
+  const stopMounted = useRef(true);
+  useEffect(() => { stopMounted.current = true; return () => { stopMounted.current = false; }; }, []);
+  const dispatchPendingStop = useCallback(async () => {
+    if (stopDispatcher.current || !stopReady.current || !stopMounted.current) return;
+    stopDispatcher.current = true;
     try {
-      requested = sessionStorage.getItem(STOP_REQUEST_KEY) === '1';
-      if (requested) sessionStorage.removeItem(STOP_REQUEST_KEY);
-    } catch {
-      requested = false;
-    }
-    if (requested && isRecording) void handleStopRecording();
-  }, [isRecording, handleStopRecording]);
+      while (stopReady.current && stopMounted.current) {
+        const request = takeRecordingStopRequest();
+        if (!request) break;
+        try {
+          if (request.kind === 'automated') await stopRecordingAction(request.expected);
+          else if (request.state === 'ready') await stopRecordingAction(undefined, request.generation);
+        } finally { completeRecordingStopRequest(request); }
+      }
+    } finally { stopDispatcher.current = false; }
+  }, [stopRecordingAction]);
 
-  // The same request while this page is open (command bar, meeting automation).
   useEffect(() => {
-    const onStop = () => void handleStopRecording();
+    const onStop = (event: Event) => {
+      const detail = (event as CustomEvent).detail;
+      // Legacy typed manual events are fresh actions, not stored/replayed
+      // unbound intent. Their generation is frozen now, even before UI sync.
+      if (detail?.kind === 'manual' && detail.id === undefined) {
+        requestRecordingStop(() => {}); return;
+      }
+      if (detail?.kind !== 'queued') {
+        const request = readRecordingStopRequest(detail);
+        if (!request) return;
+        queueRecordingStopRequest(request);
+      }
+      void dispatchPendingStop();
+    };
     window.addEventListener(STOP_RECORDING_EVENT, onStop);
     return () => window.removeEventListener(STOP_RECORDING_EVENT, onStop);
-  }, [handleStopRecording]);
+  }, [dispatchPendingStop]);
+
+  useEffect(() => { void dispatchPendingStop(); }, [isRecording, isStarting, isStopping, dispatchPendingStop]);
 
   const handlePauseRecording = useCallback(async () => {
     if (!isRecording || isPaused || isPausing) return;
@@ -416,7 +433,8 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
     };
   }, [onRecordingStop, onTranscriptionError]);
 
-  const busy = isStarting || isProcessing;
+  const starting = isStarting || recordingState.status === RecordingStatus.STARTING;
+  const busy = starting || isProcessing;
   const elapsed = formatClock(recordingState.activeDuration ?? recordingState.recordingDuration ?? 0);
 
   return (
@@ -442,7 +460,7 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
               }}
               disabled={
                 busy ||
-                (!isRecording && isRecordingDisabled) ||
+                (!isRecording && (isRecordingDisabled || !recordingSources.sources || recordingSources.saving)) ||
                 (isRecording && (isStopping || isPausing || isResuming))
               }
               aria-label={isRecording ? 'Stop recording' : 'Start recording'}
@@ -529,6 +547,12 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
         <div className="h-8 w-px shrink-0 self-center bg-af-border" />
 
         <div className={cn('flex items-center gap-2', isRecording ? 'min-w-0 flex-1' : 'shrink-0')}>
+          {!isRecording && recordingSources.error && (
+            <span role="alert" className="max-w-52 text-xs text-af-warning">
+              Could not load recording sources.{' '}
+              <button type="button" aria-label="Retry loading recording sources" className="underline" onClick={() => void recordingSources.retry()}>Retry</button>
+            </span>
+          )}
           <RecordingVoiceLane
             kind="mic"
             open={openLane === 'mic'}
@@ -539,16 +563,17 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
             savedValue={activeDevices?.micDevice ?? null}
             options={inputDevices}
             onSelect={chooseMic}
-            disabled={isStarting}
+            disabled={starting || (!isRecording && (!recordingSources.sources || recordingSources.saving))}
             gain={micGain}
             onGainLive={(value) => scheduleGain('mic', value, false)}
             onGainCommit={(value) => scheduleGain('mic', value, true)}
             live={isRecording}
-            muted={isRecording ? isMicrophoneMuted : idleMicMuted}
-            meterActive={isRecording && !isPaused && !isMicrophoneMuted}
+            captureIncluded={recordingState.microphoneCaptured}
+            muted={isRecording ? (!recordingState.microphoneCaptured || isMicrophoneMuted) : !recordingSources.sources?.microphone_enabled}
+            meterActive={isRecording && recordingState.microphoneCaptured && !isPaused && !isMicrophoneMuted}
             onMute={() => {
               if (isRecording) void handleMicrophoneMute();
-              else setIdleMicMuted((current) => !current);
+              else recordingSources.setEnabled('microphone', !recordingSources.sources?.microphone_enabled);
             }}
           />
           <RecordingVoiceLane
@@ -561,19 +586,21 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
             savedValue={isMacOS ? null : activeDevices?.systemDevice ?? null}
             options={isMacOS ? [] : outputDevices}
             onSelect={chooseSystem}
-            disabled={isStarting}
+            disabled={starting || (!isRecording && (!recordingSources.sources || recordingSources.saving))}
             gain={systemGain}
             onGainLive={(value) => scheduleGain('system', value, false)}
             onGainCommit={(value) => scheduleGain('system', value, true)}
             macDefaultOutput={isMacOS}
             source={appAudioSupported ? <AppAudioSource choice={appAudio} variant="compact" live={isRecording} /> : undefined}
             hideDevice={onlyChosenApps}
+            previewScope={{ loaded: appAudio.loaded, onlyApps: appAudio.onlyApps, targets: appAudio.targets.map(target => target.executable) }}
             live={isRecording}
-            muted={isRecording ? isSystemAudioMuted : idleSystemMuted}
-            meterActive={isRecording && !isPaused && !isSystemAudioMuted}
+            captureIncluded={recordingState.systemAudioCaptured}
+            muted={isRecording ? (!recordingState.systemAudioCaptured || isSystemAudioMuted) : !recordingSources.sources?.system_audio_enabled}
+            meterActive={isRecording && recordingState.systemAudioCaptured && !isPaused && !isSystemAudioMuted}
             onMute={() => {
               if (isRecording) void handleSystemAudioMute();
-              else setIdleSystemMuted((current) => !current);
+              else recordingSources.setEnabled('system', !recordingSources.sources?.system_audio_enabled);
             }}
           />
         </div>

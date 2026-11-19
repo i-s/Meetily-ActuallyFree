@@ -3,10 +3,19 @@ use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use sqlx::{Connection, Error as SqlxError, SqlitePool};
 use tracing::{error, info};
 use uuid::Uuid;
+use sha2::{Digest, Sha256};
 
 pub struct TranscriptsRepository;
 
 impl TranscriptsRepository {
+    pub async fn save_recovered_transcript(
+        pool: &SqlitePool, meeting_title: &str, transcripts: &[TranscriptSegment],
+        folder_path: Option<String>, recording_started_at: Option<DateTime<Utc>>, recovery_id: &str,
+    ) -> Result<String, SqlxError> {
+        if recovery_id.trim().is_empty() { return Err(SqlxError::Protocol("Missing recovery identity".into())); }
+        Self::save_with_recovery(pool, meeting_title, transcripts, folder_path, recording_started_at, Some(recovery_id)).await
+    }
+
     /// Saves a new meeting and its associated transcript segments.
     /// This function uses a transaction to ensure that either both the meeting
     /// and all its transcripts are saved, or none of them are.
@@ -17,7 +26,17 @@ impl TranscriptsRepository {
         folder_path: Option<String>,
         recording_started_at: Option<DateTime<Utc>>,
     ) -> Result<String, SqlxError> {
-        let meeting_id = format!("meeting-{}", Uuid::new_v4());
+        Self::save_with_recovery(pool, meeting_title, transcripts, folder_path, recording_started_at, None).await
+    }
+
+    async fn save_with_recovery(
+        pool: &SqlitePool, meeting_title: &str, transcripts: &[TranscriptSegment],
+        folder_path: Option<String>, recording_started_at: Option<DateTime<Utc>>, recovery_id: Option<&str>,
+    ) -> Result<String, SqlxError> {
+        let meeting_id = match recovery_id {
+            Some(key) => format!("meeting-recovered-{:x}", Sha256::digest(key.as_bytes())),
+            None => format!("meeting-{}", Uuid::new_v4()),
+        };
 
         let mut conn = pool.acquire().await?;
         let mut transaction = conn.begin().await?;
@@ -30,7 +49,9 @@ impl TranscriptsRepository {
         let result = sqlx::query(
             "INSERT INTO meetings
              (id, title, created_at, updated_at, folder_path, title_is_manual)
-             VALUES (?, ?, ?, ?, ?, ?)",
+             SELECT ?, ?, ?, ?, ?, ?
+             WHERE (? = 0 OR ? IS NULL OR NOT EXISTS (SELECT 1 FROM meetings WHERE folder_path = ?))
+             ON CONFLICT(id) DO NOTHING",
         )
         .bind(&meeting_id)
         .bind(meeting_title)
@@ -38,13 +59,42 @@ impl TranscriptsRepository {
         .bind(now)
         .bind(&folder_path)
         .bind(title_is_manual)
+        // Native recording folders are unique per session. Deduplicate normal
+        // save retries as well as recovery (e.g. commit succeeded, IPC reply was
+        // lost), so Notes cannot be stranded on an earlier duplicate meeting.
+        .bind(folder_path.is_some())
+        .bind(&folder_path)
+        .bind(&folder_path)
         .execute(&mut *transaction)
         .await;
 
-        if let Err(e) = result {
-            error!("Failed to create meeting '{}': {}", meeting_title, e);
-            transaction.rollback().await?;
-            return Err(e);
+        let inserted = match result {
+            Ok(result) => result.rows_affected() > 0,
+            Err(error) => {
+                transaction.rollback().await?;
+                return Err(error);
+            }
+        };
+        if !inserted {
+            // The conditional INSERT takes SQLite's write lock before looking
+            // for a folder match. Concurrent retries cannot both create rows.
+            // Never rewrite a previously committed meeting or speaker edits.
+            let by_id: Option<(String, Option<String>)> = sqlx::query_as("SELECT id, folder_path FROM meetings WHERE id = ?")
+                .bind(&meeting_id).fetch_optional(&mut *transaction).await?;
+            let existing_id = if let Some((id, existing_folder)) = by_id {
+                if existing_folder != folder_path {
+                    return Err(SqlxError::Protocol("Recovery identity belongs to another recording folder".into()));
+                }
+                Some(id)
+            } else if let Some(folder) = &folder_path {
+                sqlx::query_scalar::<_, String>("SELECT id FROM meetings WHERE folder_path = ? ORDER BY created_at, id LIMIT 1")
+                    .bind(folder).fetch_optional(&mut *transaction).await?
+            } else { None };
+            let existing_id = existing_id.ok_or_else(|| SqlxError::Protocol("Session save did not create or find a meeting".into()))?;
+            super::notes_document::attach(&mut transaction, folder_path.as_deref(), &existing_id).await?;
+            crate::post_call::store::enqueue(&mut transaction, &existing_id).await?;
+            transaction.commit().await?;
+            return Ok(existing_id);
         }
 
         info!("Successfully created meeting with id: {}", meeting_id);
@@ -97,7 +147,12 @@ impl TranscriptsRepository {
         )
         .await?;
 
-        // Commit the transaction
+        crate::database::transcript_versions::ensure(&mut transaction, &meeting_id).await.map_err(SqlxError::Protocol)?;
+        super::notes_document::attach(&mut transaction, folder_path.as_deref(), &meeting_id).await?;
+
+        crate::post_call::store::enqueue(&mut transaction, &meeting_id).await?;
+
+        // Queue, live snapshot and Notes association share the same commit.
         transaction.commit().await?;
 
         Ok(meeting_id)
@@ -315,6 +370,10 @@ mod tests {
             audio_start_time: Some(0.0), audio_end_time: Some(2.0), duration: Some(2.0),
             speaker: Some(speaker.into()),
         };
+        sqlx::raw_sql(include_str!("../../../migrations/20261118001400_transcript_versions.sql")).execute(&pool).await.unwrap();
+        sqlx::raw_sql(include_str!("../../../migrations/20261118001401_transcript_version_references.sql")).execute(&pool).await.unwrap();
+        sqlx::raw_sql(include_str!("../../../migrations/20261118001500_post_call_queue.sql")).execute(&pool).await.unwrap();
+        sqlx::raw_sql(include_str!("../../../migrations/20261118001501_post_call_vocabulary.sql")).execute(&pool).await.unwrap();
         let meeting = TranscriptsRepository::save_transcript(&pool, "Test", &[make_turn("Alice"), make_turn("Speaker 2")], None, None)
             .await.unwrap();
         let linked: Vec<String> = sqlx::query_scalar("SELECT speaker_label FROM person_speakers WHERE meeting_id = ?")
@@ -349,4 +408,88 @@ mod tests {
         assert!(!is_default_meeting_title("Meeting with Ada"));
         assert!(!is_default_meeting_title("Quarterly Review"));
     }
+}
+
+
+#[cfg(test)]
+mod issue9_recovery_tests {
+    use super::*;
+    async fn pool() -> SqlitePool {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new().max_connections(1).connect(":memory:").await.unwrap();
+        sqlx::raw_sql("CREATE TABLE meetings (id TEXT PRIMARY KEY, title TEXT, created_at TEXT, updated_at TEXT, folder_path TEXT, title_is_manual INTEGER); CREATE TABLE transcripts (id TEXT PRIMARY KEY, meeting_id TEXT, transcript TEXT, timestamp TEXT, audio_start_time REAL, audio_end_time REAL, duration REAL, speaker TEXT); CREATE TABLE people (id TEXT PRIMARY KEY, display_name TEXT NOT NULL, normalized_name TEXT NOT NULL UNIQUE, notes TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL); CREATE TABLE person_speakers (person_id TEXT NOT NULL, meeting_id TEXT NOT NULL, speaker_label TEXT NOT NULL, UNIQUE(meeting_id, speaker_label));").execute(&pool).await.unwrap();
+        sqlx::raw_sql(include_str!("../../../migrations/20261118001400_transcript_versions.sql")).execute(&pool).await.unwrap();
+        sqlx::raw_sql(include_str!("../../../migrations/20261118001401_transcript_version_references.sql")).execute(&pool).await.unwrap();
+        sqlx::raw_sql(include_str!("../../../migrations/20261118001500_post_call_queue.sql")).execute(&pool).await.unwrap();
+        sqlx::raw_sql(include_str!("../../../migrations/20261118001501_post_call_vocabulary.sql")).execute(&pool).await.unwrap();
+        super::super::notes_document::tests::create_notes_schema(&pool).await;
+        pool
+    }
+    #[tokio::test]
+    async fn issue12_notes_follow_normal_save_and_idempotent_recovery() {
+        let pool = pool().await;
+        let notes = super::super::notes_document::write(&pool, "recording:/synthetic/notes", "Private thought, not speech", None, 0).await.unwrap();
+        assert_eq!(notes, 1);
+        let id = TranscriptsRepository::save_transcript(&pool, "Meeting", &[], Some("/synthetic/notes".into()), None).await.unwrap();
+        let retry = TranscriptsRepository::save_transcript(&pool, "Retry", &[], Some("/synthetic/notes".into()), None).await.unwrap();
+        assert_eq!(id, retry);
+        let recovered = TranscriptsRepository::save_recovered_transcript(&pool, "Recovered", &[], Some("/synthetic/notes".into()), None, "notes-recovery").await.unwrap();
+        assert_eq!(id, recovered);
+        let stored = super::super::notes_document::read(&pool, &format!("meeting:{id}")).await.unwrap().unwrap();
+        assert_eq!(stored.markdown.as_deref(), Some("Private thought, not speech"));
+        let speech: i64 = sqlx::query_scalar("SELECT count(*) FROM transcripts").fetch_one(&pool).await.unwrap();
+        assert_eq!(speech, 0);
+    }
+    #[tokio::test]
+    async fn db_commit_then_reply_or_indexeddb_failure_is_idempotent_across_retry() {
+        let pool = pool().await;
+        let first = TranscriptsRepository::save_recovered_transcript(&pool, "Audio", &[], Some("/synthetic/a".into()), None, "draft-42").await.unwrap();
+        let retry = TranscriptsRepository::save_recovered_transcript(&pool, "Audio", &[], Some("/synthetic/a".into()), None, "draft-42").await.unwrap();
+        assert_eq!(first, retry);
+        assert_eq!(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM meetings").fetch_one(&pool).await.unwrap(), 1);
+    }
+    #[tokio::test]
+    async fn recovery_finds_a_normal_save_whose_commit_response_was_lost() {
+        let pool = pool().await;
+        let first = TranscriptsRepository::save_transcript(&pool, "Original", &[], Some("/synthetic/a".into()), None).await.unwrap();
+        let retry = TranscriptsRepository::save_recovered_transcript(&pool, "Recovered", &[], Some("/synthetic/a".into()), None, "draft-42").await.unwrap();
+        assert_eq!(first, retry);
+        assert_eq!(sqlx::query_scalar::<_, String>("SELECT title FROM meetings WHERE id = ?").bind(first).fetch_one(&pool).await.unwrap(), "Original");
+    }
+    #[tokio::test]
+    async fn simultaneous_recovery_callers_create_one_library_entry() {
+        let pool = pool().await;
+        let (a, b) = tokio::join!(
+            TranscriptsRepository::save_recovered_transcript(&pool, "Audio", &[], Some("/synthetic/a".into()), None, "draft-42"),
+            TranscriptsRepository::save_recovered_transcript(&pool, "Audio", &[], Some("/synthetic/a".into()), None, "draft-42"));
+        assert_eq!(a.unwrap(), b.unwrap());
+    }
+    fn turn(text: &str, offset: f64) -> TranscriptSegment {
+        TranscriptSegment { id: "fixture".into(), text: text.into(), timestamp: "2026-11-18T12:00:00Z".into(),
+            audio_start_time: Some(offset), audio_end_time: Some(offset + 1.0), duration: Some(1.0), speaker: Some("Microphone".into()) }
+    }
+    #[tokio::test]
+    async fn recovery_retry_does_not_replace_committed_text_or_labels() {
+        let pool = pool().await;
+        let id = TranscriptsRepository::save_recovered_transcript(&pool, "Original", &[turn("Keep these words", 1.0)], Some("/synthetic/a".into()), None, "draft-42").await.unwrap();
+        TranscriptsRepository::save_recovered_transcript(&pool, "Changed", &[turn("Do not overwrite", 10.0)], Some("/synthetic/a".into()), None, "draft-42").await.unwrap();
+        let rows: Vec<(String, Option<String>, Option<f64>)> = sqlx::query_as("SELECT transcript, speaker, audio_start_time FROM transcripts WHERE meeting_id = ?")
+            .bind(id).fetch_all(&pool).await.unwrap();
+        assert_eq!(rows, vec![("Keep these words".into(), Some("Microphone".into()), Some(1.0))]);
+    }
+    #[tokio::test]
+    async fn recovery_identity_cannot_attach_another_folder() {
+        let pool = pool().await;
+        TranscriptsRepository::save_recovered_transcript(&pool, "A", &[], Some("/synthetic/a".into()), None, "draft-42").await.unwrap();
+        assert!(TranscriptsRepository::save_recovered_transcript(&pool, "B", &[], Some("/synthetic/b".into()), None, "draft-42").await.is_err());
+        assert_eq!(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM meetings").fetch_one(&pool).await.unwrap(), 1);
+    }
+    #[tokio::test]
+    async fn failed_recovery_transaction_leaves_no_ghost_before_retry() {
+        let pool = pool().await;
+        assert!(TranscriptsRepository::save_recovered_transcript(&pool, "Audio", &[turn("Invalid timing", -1.0)], Some("/synthetic/a".into()), None, "draft-42").await.is_err());
+        assert_eq!(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM meetings").fetch_one(&pool).await.unwrap(), 0);
+        TranscriptsRepository::save_recovered_transcript(&pool, "Audio", &[turn("Valid", 1.0)], Some("/synthetic/a".into()), None, "draft-42").await.unwrap();
+        assert_eq!(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM meetings").fetch_one(&pool).await.unwrap(), 1);
+    }
+
 }

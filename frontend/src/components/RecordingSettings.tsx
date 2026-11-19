@@ -29,6 +29,8 @@ export interface PerAppTarget {
 export interface RecordingPreferences {
   save_folder: string;
   auto_save: boolean;
+  microphone_enabled?: boolean;
+  system_audio_enabled?: boolean;
   file_format: string;
   preferred_mic_device: string | null;
   preferred_system_device: string | null;

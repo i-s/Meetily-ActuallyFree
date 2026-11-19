@@ -3645,6 +3645,7 @@ dependencies = [
  "once_cell",
  "ort",
  "posthog-rs",
+ "pulldown-cmark",
  "rand 0.8.6",
  "rayon",
  "realfft",
@@ -4833,6 +4834,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 1.0.109",
+]
+
+[[package]]
+name = "pulldown-cmark"
+version = "0.13.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3db2be46835f013dd3f4fa7f5f7402c537787b54ebb6fe2b94bbdd7e2669bb7b"
+dependencies = [
+ "bitflags 2.11.1",
+ "memchr",
+ "unicase",
 ]
 
 [[package]]

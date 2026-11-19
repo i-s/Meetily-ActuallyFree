@@ -1,25 +1,19 @@
-/**
- * Exports one or more meetings into a single document: for each meeting its
- * notes, action items, AI summary and transcript (whichever were chosen),
- * under the meeting's title. Uses the same save dialog and formats as a
- * single meeting's export.
- */
+/** Shared library/detail export. All required reads fail visibly; absence is data,
+ * not a catch-all for disk/SQLite errors. Each meeting is a separate read snapshot. */
 import { invoke } from '@tauri-apps/api/core';
 import { exportSummaryAs, type ExportFormat } from '@/lib/exportSummary';
-import { completeSummaryMarkdown, parseSummaryData } from '@/lib/summary-markdown';
-import { getMeetingNotes, listActionItems } from '@/lib/workspace-api';
+import { blocksToMarkdown, completeSummaryMarkdown, parseSummaryData } from '@/lib/summary-markdown';
+import { notesForContext } from '@/lib/notes-store';
 import { displayTitle } from '@/lib/meeting-titles';
-import { formatDuration, formatWhen, parseDate } from '@/lib/dates';
+import type { MeetingExportSnapshot } from '@/lib/library-api';
 
 export type ExportPart = 'notes' | 'actions' | 'summary' | 'transcript';
-
 export const EXPORT_PARTS: Array<{ id: ExportPart; label: string }> = [
   { id: 'notes', label: 'Your notes' },
   { id: 'actions', label: 'Action items' },
   { id: 'summary', label: 'AI summary' },
   { id: 'transcript', label: 'Transcript' },
 ];
-
 export interface ExportableMeeting {
   id: string;
   title: string;
@@ -28,99 +22,87 @@ export interface ExportableMeeting {
   groupName?: string | null;
 }
 
-interface TranscriptRow {
-  text: string;
-  speaker?: string | null;
-  audio_start_time?: number | null;
-}
-
-async function allTranscripts(meetingId: string): Promise<TranscriptRow[]> {
-  const first = await invoke<{ total_count: number }>('api_get_meeting_transcripts', { meetingId, limit: 1, offset: 0 });
-  if (!first?.total_count) return [];
-  const all = await invoke<{ transcripts: TranscriptRow[] }>('api_get_meeting_transcripts', {
-    meetingId,
-    limit: first.total_count,
-    offset: 0,
-  });
-  return all?.transcripts ?? [];
+export async function captureMeetingExport(meetingId: string): Promise<MeetingExportSnapshot> {
+  const notes = await notesForContext(`meeting:${meetingId}`);
+  const snapshot = await invoke<MeetingExportSnapshot>('api_export_meeting_snapshot', { meetingId, expectedNotesRevision: notes.revision });
+  // The native transaction rejects cross-WebView revision races. This second
+  // flush/read also rejects an edit/conversion in this WebView during capture.
+  const after = await notesForContext(`meeting:${meetingId}`);
+  if (snapshot.id !== meetingId || snapshot.notes.revision !== notes.revision || after.revision !== notes.revision || after.markdown !== snapshot.notes.markdown) {
+    throw new Error('Notes or meeting changed while export was loading. Retry export.');
+  }
+  return snapshot;
 }
 
 function clock(seconds: number): string {
-  const total = Math.max(0, Math.floor(seconds));
+  const total = Number.isFinite(seconds) ? Math.max(0, Math.floor(seconds)) : 0;
   const h = Math.floor(total / 3600);
-  const m = Math.floor((total % 3600) / 60);
-  const s = total % 60;
-  const mm = String(m).padStart(2, '0');
-  const ss = String(s).padStart(2, '0');
-  return h > 0 ? `${h}:${mm}:${ss}` : `${mm}:${ss}`;
+  const m = String(Math.floor(total % 3600 / 60)).padStart(2, '0');
+  const s = String(total % 60).padStart(2, '0');
+  return h ? `${h}:${m}:${s}` : `${m}:${s}`;
 }
-
-/** Pushes headings down so they sit under the meeting's own sections. */
-function demoteHeadings(markdown: string, levels: number): string {
-  return markdown.replace(/^(#{1,6})(\s)/gm, (_, hashes: string, space: string) => `${'#'.repeat(Math.min(6, hashes.length + levels))}${space}`);
+function literal(text: string): string {
+  return text.replace(/\\/g, '\\\\').replace(/([`*_{}\[\]<>#+!|])/g, '\\$1').replace(/\r?\n/g, ' ');
 }
-
-export async function meetingMarkdown(meeting: ExportableMeeting, parts: Set<ExportPart>): Promise<string> {
-  const start = parseDate(meeting.created_at);
-  const meta = [start ? formatWhen(start) : null, formatDuration(meeting.duration_seconds) || null, meeting.groupName || null]
-    .filter(Boolean)
-    .join(' · ');
-  const sections: string[] = [`# ${displayTitle(meeting.title, meeting.created_at)}`];
-  if (meta) sections.push(`_${meta}_`);
-
-  if (parts.has('notes')) {
-    const notes = await getMeetingNotes(meeting.id).catch(() => null);
-    if (notes?.markdown?.trim()) sections.push(`## Your notes\n\n${demoteHeadings(notes.markdown.trim(), 2)}`);
+/** A raw-text fence preserves every character and prevents transcript/Notes
+ * text from forging another top-level source section, even with backticks. */
+function verbatim(text: string): string {
+  const runs = text.match(/`+/g) ?? [];
+  const fence = '`'.repeat(runs.reduce((longest, run) => Math.max(longest, run.length + 1), 3));
+  return `${fence}text\n${text}\n${fence}`;
+}
+function savedSummary(raw: string | null): string {
+  let value: unknown = raw;
+  for (let depth = 0; depth < 4 && typeof value === 'string'; depth++) {
+    try { value = JSON.parse(value); } catch { break; }
   }
-  if (parts.has('actions')) {
-    const items = await listActionItems({ meetingId: meeting.id }).catch(() => []);
-    if (items.length > 0) {
-      const lines = items.map((item) => {
-        const owner = item.personName ?? item.ownerLabel;
-        const details = [owner, item.dueText].filter(Boolean).join(', ');
-        return `- [${item.done ? 'x' : ' '}] ${item.text}${details ? ` (${details})` : ''}`;
-      });
-      sections.push(`## Action items\n\n${lines.join('\n')}`);
-    }
+  return completeSummaryMarkdown(Array.isArray(value) ? { summary_json: value } : parseSummaryData(value));
+}
+export function renderMeetingMarkdown(snapshot: MeetingExportSnapshot, parts: Set<ExportPart>): string {
+  const sections = [
+    `# ${literal(displayTitle(snapshot.title, snapshot.createdAt))}`,
+    `Meeting ID: ${literal(snapshot.id)}\n\nRecorded: ${snapshot.createdAt}\n\nSnapshot captured: ${snapshot.capturedAt}`,
+    `Audio: ${snapshot.audioAvailable ? 'available locally at capture time (not embedded)' : 'unavailable — file absent or no saved recording'}`,
+    '_Local saved snapshot. Later edits are not included. Notes are the user’s own thoughts, not recognized speech or evidence of an agreement._',
+  ];
+  if (parts.has('notes')) {
+    const rich = snapshot.notes.json;
+    const legacy = !snapshot.notes.markdown.trim() && Array.isArray(rich) && rich.length > 0;
+    const text = legacy ? blocksToMarkdown(rich) : snapshot.notes.markdown;
+    const body = text.trim() ? verbatim(text) : '_No Notes text saved._';
+    const original = legacy ? `\n\nLegacy rich Notes (original blocks retained below; no data was rewritten):\n\n${verbatim(JSON.stringify(rich, null, 2))}` : '';
+    sections.push(`## Your notes\n\nSource: user_notes (user-authored; not recognized speech or agreed conclusions). Revision: ${snapshot.notes.revision}.\n\n${body}${original}`);
   }
   if (parts.has('summary')) {
-    const response = await invoke<{ data?: unknown }>('api_get_summary', { meetingId: meeting.id }).catch(() => null);
-    const summary = completeSummaryMarkdown(parseSummaryData(response?.data)).trim();
-    if (summary) sections.push(`## AI summary\n\n${demoteHeadings(summary, 2)}`);
+    const summary = savedSummary(snapshot.summary);
+    const source = parseSummaryData(snapshot.summary)?.post_call;
+    const provenance = source ? `\n\nPost-call provenance: job epoch ${source.job_epoch}; selected version ${literal(String(source.version_id))}; transcript revision ${source.transcript_revision}; Notes revision ${source.notes_revision}; approved vocabulary revision ${source.vocabulary_revision}. ${parseSummaryData(snapshot.summary)?.user_edited ? 'User-edited projection; original immutable artifact retained.' : 'Generated projection; original immutable artifact retained.'}` : '';
+    sections.push(`## Meeting summary\n\nSource: meeting_summary (generated or user-edited conclusions; not verbatim speech). Status: ${literal(snapshot.summaryStatus ?? 'not generated')}.\n\n${summary.trim() ? verbatim(summary) : '_No summary available._'}${provenance}`);
   }
   if (parts.has('transcript')) {
-    const rows = await allTranscripts(meeting.id).catch(() => []);
-    if (rows.length > 0) {
-      const lines = rows.map((row) => {
-        const time = row.audio_start_time != null ? `[${clock(row.audio_start_time)}] ` : '';
-        const speaker = row.speaker?.trim() ? `**${row.speaker.trim()}:** ` : '';
-        return `${time}${speaker}${row.text.trim()}`;
-      });
-      sections.push(`## Transcript\n\n${lines.join('\n\n')}`);
-    }
+    const lines = snapshot.transcripts.map(row => `${row.audioStartTime != null ? `[${clock(row.audioStartTime)}] ` : ''}${row.speaker?.trim() ? `${row.speaker}: ` : ''}${row.text}`);
+    sections.push(`## Transcript\n\nSource: spoken_transcript (selected editable transcript; speaker labels are not identity proof).\n\n${lines.length ? verbatim(lines.join('\n\n')) : '_No transcript available._'}`);
+  }
+  if (parts.has('actions')) {
+    const lines = snapshot.actions.map(item => `- [${item.done ? 'x' : ' '}] ${item.text}${item.owner ? ` (${item.owner})` : ''}${item.dueText ? ` — ${item.dueText}` : ''} [source: ${item.source}]`);
+    sections.push(`## Action items\n\nSource: saved_action_items (AI-extracted or user-authored; verify against the meeting).\n\n${lines.length ? verbatim(lines.join('\n')) : '_No action items saved._'}`);
   }
   return sections.join('\n\n');
 }
-
-/**
- * Builds the document and asks where to save it. Returns false if the user
- * cancelled the save dialog.
- */
-export async function exportMeetings(
-  meetings: ExportableMeeting[],
-  parts: Set<ExportPart>,
-  format: ExportFormat,
-  onProgress?: (done: number, total: number) => void,
-): Promise<boolean> {
-  const documents: string[] = [];
-  for (const [index, meeting] of meetings.entries()) {
-    documents.push(await meetingMarkdown(meeting, parts));
+export async function meetingMarkdown(meeting: ExportableMeeting, parts: Set<ExportPart>): Promise<string> {
+  return renderMeetingMarkdown(await captureMeetingExport(meeting.id), parts);
+}
+export async function exportMeetings(meetings: ExportableMeeting[], parts: Set<ExportPart>, format: ExportFormat, onProgress?: (done: number, total: number) => void, isCurrent: () => boolean = () => true): Promise<boolean> {
+  if (!meetings.length || !parts.size) throw new Error('Choose at least one meeting and material to export.');
+  const snapshots: MeetingExportSnapshot[] = [];
+  const requested = meetings.map(meeting => ({ ...meeting }));
+  for (const [index, meeting] of requested.entries()) {
+    if (!isCurrent()) return false;
+    snapshots.push(await captureMeetingExport(meeting.id));
+    if (!isCurrent()) return false;
     onProgress?.(index + 1, meetings.length);
   }
-  const markdown = documents.join('\n\n---\n\n');
-  const baseName =
-    meetings.length === 1
-      ? displayTitle(meetings[0].title, meetings[0].created_at)
-      : `Meetings (${meetings.length}) ${new Date().toISOString().slice(0, 10)}`;
-  return exportSummaryAs(format, markdown, baseName);
+  const markdown = snapshots.map(snapshot => renderMeetingMarkdown(snapshot, parts)).join('\n\n---\n\n');
+  const baseName = snapshots.length === 1 ? displayTitle(snapshots[0].title, snapshots[0].createdAt) : `Meetings (${snapshots.length}) ${new Date().toISOString().slice(0, 10)}`;
+  return exportSummaryAs(format, markdown, baseName, isCurrent);
 }

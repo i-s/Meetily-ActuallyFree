@@ -392,7 +392,7 @@ function MeetingDetailsContent() {
   // Initial load only. Once meetingDetails exists, keep PageContent mounted —
   // flipping isLoadingTranscripts used to unmount it and wipe in-flight summary
   // state (status + just-generated aiSummary).
-  if (!meetingDetails) {
+  if (!meetingDetails || meetingDetails.id !== meetingId) {
     return (
       <div className="h-full bg-[var(--af-panel)]">
         {source === 'recording' ? (
@@ -412,15 +412,18 @@ function MeetingDetailsContent() {
   }
 
   return <PageContent
+    key={meetingDetails.id}
     meeting={meetingDetails}
     summaryData={meetingSummary}
     summaryUserEdited={summaryUserEdited}
     focusTranscriptId={focusTranscriptId}
     focusTime={focusTime}
+    focusNotes={searchParams.get('section') === 'notes'}
     isPostCallRecording={source === 'recording'}
     shouldAutoGenerate={shouldAutoGenerate}
     onAutoGenerateComplete={() => setShouldAutoGenerate(false)}
     onSummaryReady={(summary) => setMeetingSummary(summary)}
+    onSummaryInvalidated={() => { setMeetingSummary(null); setSummaryUserEdited(false); }}
     onMeetingUpdated={async () => {
       await Promise.allSettled([fetchMeetingDetails(), refetchMeetings()]);
     }}

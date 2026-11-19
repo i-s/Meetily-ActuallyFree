@@ -15,9 +15,10 @@ import { useConfig } from '@/contexts/ConfigContext';
 import { useWorkspace } from '@/contexts/WorkspaceContext';
 import { TemplateEditorModal } from '@/components/MeetingDetails/TemplateEditorModal';
 import { MeetingExportDialog } from '@/components/MeetingDetails/MeetingExportDialog';
-import { PostCallProcessingDialog } from '@/components/MeetingDetails/PostCallProcessingDialog';
+import { PostCallQueueNotice } from '@/components/PostCallQueue';
 import { ModelConfig } from '@/components/ModelSettingsModal';
 import { VirtualizedTranscriptView } from '@/components/VirtualizedTranscriptView';
+import { TranscriptVersions } from '@/components/MeetingDetails/TranscriptVersions';
 import { MeetingHeader } from '@/components/meeting/MeetingHeader';
 import { MeetingDocument } from '@/components/meeting/MeetingDocument';
 import { AudioPlayerBar } from '@/components/meeting/AudioPlayerBar';
@@ -39,9 +40,6 @@ import { displayTitle } from '@/lib/meeting-titles';
 import { cn } from '@/lib/utils';
 import { displaySpeaker, speakerColorIndexMap, speakerKey } from '@/utils/speakerUtils';
 
-// Page remounts join the same backend-start attempt. Only accepted attempts are
-// persisted in sessionStorage below; failed preflight attempts remain retryable.
-const autoSummaryInFlight = new Map<string, Promise<boolean>>();
 const NOTES_WIDTH_KEY = 'af-meeting-notes-width';
 const TRANSCRIPT_MIN = 340;
 const DOCUMENT_MIN = 380;
@@ -59,6 +57,7 @@ export default function PageContent({
   shouldAutoGenerate = false,
   onAutoGenerateComplete,
   onSummaryReady,
+  onSummaryInvalidated,
   onMeetingUpdated,
   onRefetchTranscripts,
   segments,
@@ -69,6 +68,7 @@ export default function PageContent({
   onLoadMore,
   focusTranscriptId,
   focusTime,
+  focusNotes,
 }: {
   meeting: any;
   summaryData: Summary | null;
@@ -77,6 +77,7 @@ export default function PageContent({
   shouldAutoGenerate?: boolean;
   onAutoGenerateComplete?: () => void;
   onSummaryReady?: (summary: Summary) => void;
+  onSummaryInvalidated?: () => void;
   onMeetingUpdated?: () => Promise<void>;
   onRefetchTranscripts?: () => Promise<void>;
   segments?: TranscriptSegmentData[];
@@ -87,6 +88,7 @@ export default function PageContent({
   onLoadMore?: () => void;
   focusTranscriptId?: string | null;
   focusTime?: number | null;
+  focusNotes?: boolean;
 }) {
   const { setCurrentMeeting } = useSidebar();
   const { modelConfig, setModelConfig } = useConfig();
@@ -108,6 +110,18 @@ export default function PageContent({
   const [regenerateRequest, setRegenerateRequest] = useState<{ open: boolean; context: string; reason?: string } | null>(null);
 
   const meetingData = useMeetingData({ meeting, summaryData });
+  const prepareDocument = useRef<() => Promise<void>>(async () => {});
+  const [transcriptChanging, setTranscriptChanging] = useState(false);
+  const registerTranscriptPreparation = useCallback((prepare: () => Promise<void>) => {
+    prepareDocument.current = prepare;
+    return () => { prepareDocument.current = async () => {}; };
+  }, []);
+  const beforeTranscriptChange = async () => {
+    setTranscriptChanging(true);
+    try { await prepareDocument.current(); }
+    catch (error) { setTranscriptChanging(false); throw error; }
+    return () => setTranscriptChanging(false);
+  };
   const templates = useTemplates();
   const meetingOperations = useMeetingOperations({ meeting });
   const audio = useMeetingAudio(meeting.id);
@@ -241,26 +255,11 @@ export default function PageContent({
       if (!shouldAutoGenerate || meetingData.transcripts.length === 0) return;
       if (isPostCallRecording && postCallDoneFor !== meeting.id) return;
       if (isPostCallRecording) {
-        const key = `post-call-summary-started:${meeting.id}`;
-        if (sessionStorage.getItem(key)) {
-          onAutoGenerateComplete?.();
-          return;
-        }
-        let attempt = autoSummaryInFlight.get(meeting.id);
-        if (!attempt) {
-          attempt = summaryGeneration.handleGenerateSummary('');
-          autoSummaryInFlight.set(meeting.id, attempt);
-        }
-        let accepted = false;
-        try {
-          accepted = await attempt;
-        } finally {
-          if (autoSummaryInFlight.get(meeting.id) === attempt) autoSummaryInFlight.delete(meeting.id);
-        }
-        if (accepted) {
-          sessionStorage.setItem(key, 'started');
-          onAutoGenerateComplete?.();
-        }
+        // #14 creates local candidates only. The old handoff could silently
+        // send meeting text to whichever legacy summary API was configured.
+        // #15 owns an explicit subscriber Codex CLI handoff keyed by selected
+        // version + revision; no automatic product-text request starts here.
+        onAutoGenerateComplete?.();
         return;
       }
       await summaryGeneration.handleGenerateSummary('');
@@ -314,7 +313,7 @@ export default function PageContent({
   // Deep link from search or an action item: the line itself, or the line
   // spoken at the linked time. Load pages until it is present, then show it.
   const focusLineId = useMemo(() => {
-    if (focusTranscriptId) return focusTranscriptId;
+    if (focusTranscriptId && transcriptSegments.some((segment) => segment.id === focusTranscriptId)) return focusTranscriptId;
     if (focusTime == null) return null;
     let match: string | null = null;
     for (const segment of transcriptSegments) {
@@ -323,19 +322,20 @@ export default function PageContent({
     }
     return match;
   }, [focusTranscriptId, focusTime, transcriptSegments]);
-  const focusAttempts = useRef(0);
   useEffect(() => {
     if (!onLoadMore || (!focusTranscriptId && focusTime == null)) return;
     const last = transcriptSegments[transcriptSegments.length - 1];
     const present = focusTranscriptId
       ? transcriptSegments.some((segment) => segment.id === focusTranscriptId)
       : !!last && (last.endTime ?? last.timestamp) >= (focusTime ?? 0);
-    if (present || !hasMore || isLoadingMore || focusAttempts.current > 40) return;
-    focusAttempts.current += 1;
+    if (present || !hasMore || isLoadingMore) return;
     onLoadMore();
   }, [focusTranscriptId, focusTime, transcriptSegments, hasMore, isLoadingMore, onLoadMore]);
 
   const focusedAudio = useRef(false);
+  useEffect(() => {
+    focusedAudio.current = false;
+  }, [meeting.id, focusTranscriptId, focusTime]);
   useEffect(() => {
     if (focusedAudio.current || focusTime == null || audio.status !== 'ready') return;
     focusedAudio.current = true;
@@ -428,11 +428,22 @@ export default function PageContent({
         onTranscriptChanged={() => refreshAfterSpeakerChange()}
       />
 
+      <TranscriptVersions key={`versions:${meeting.id}`} meetingId={meeting.id} onBeforeChange={beforeTranscriptChange} onChanged={async () => {
+        // Native already archived the flushed summary. Refresh just the selected
+        // projection; keeping this tree mounted preserves notes/editor ownership.
+        meetingData.setAiSummary(null);
+        onSummaryInvalidated?.();
+        await onRefetchTranscripts?.();
+        announceChange('people');
+        announceChange('actions', { meetingId: meeting.id });
+      }} />
+
       <div
         ref={frameRef}
         className={cn('flex min-h-0 min-w-0 flex-1 overflow-hidden', stacked ? 'flex-col' : 'flex-row', draggingSplit && 'select-none')}
       >
         <section className="flex min-h-0 min-w-0 flex-1 flex-col" aria-label="Transcript">
+          {focusTranscriptId && !hasMore && !isLoadingMore && !transcriptSegments.some(segment => segment.id === focusTranscriptId) && <p role="status" className="px-4 py-2 text-xs text-af-text-3">This search result is no longer in the selected transcript. Search again to find the current text.</p>}
           <div className="min-h-0 flex-1">
             <VirtualizedTranscriptView
               segments={transcriptSegments}
@@ -482,7 +493,10 @@ export default function PageContent({
           aria-label="Notes and summary"
         >
           <MeetingDocument
+            focusNotes={focusNotes}
             meetingId={meeting.id}
+            transcriptChanging={transcriptChanging}
+            registerTranscriptPreparation={registerTranscriptPreparation}
             aiSummary={meetingData.aiSummary}
             summaryUserEdited={summaryUserEdited}
             onSummaryChange={handleSummaryChange}
@@ -539,17 +553,16 @@ export default function PageContent({
         onDelete={templates.deleteCustomTemplate}
       />
       <MeetingExportDialog
+        key={meeting.id}
         open={exportOpen}
         onOpenChange={setExportOpen}
         hasTranscript={hasTranscript}
         hasSummary={!!meetingData.aiSummary}
         onExport={copyOperations.handleExportMeeting}
       />
-      <PostCallProcessingDialog
+      <PostCallQueueNotice
         enabled={isPostCallRecording}
         meetingId={meeting.id}
-        meetingFolderPath={meeting.folder_path}
-        onRefetchTranscripts={onRefetchTranscripts}
         onComplete={() => setPostCallDoneFor(meeting.id)}
       />
     </motion.div>

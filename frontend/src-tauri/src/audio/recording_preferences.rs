@@ -84,6 +84,8 @@ pub struct PerAppTarget {
 pub struct RecordingPreferences {
     pub save_folder: PathBuf,
     pub auto_save: bool,
+    #[serde(flatten)]
+    pub sources: super::recording_sources::RecordingSources,
     pub file_format: String,
     #[serde(default)]
     pub preferred_mic_device: Option<String>,
@@ -125,6 +127,7 @@ impl Default for RecordingPreferences {
         Self {
             save_folder: get_default_recordings_folder(),
             auto_save: true,
+            sources: super::recording_sources::RecordingSources::default(),
             file_format: "mp4".to_string(),
             preferred_mic_device: None,
             preferred_system_device: None,
@@ -297,12 +300,20 @@ pub fn generate_recording_filename(format: &str) -> String {
 pub async fn load_recording_preferences<R: Runtime>(
     app: &AppHandle<R>,
 ) -> Result<RecordingPreferences> {
+    let _write = PREFERENCES_WRITE.lock().await;
+    load_recording_preferences_locked(app).await
+}
+
+// Caller owns PREFERENCES_WRITE through read, repair/migration, durable save and
+// rollback. Writers use this helper rather than recursively acquiring the lock.
+pub(crate) async fn load_recording_preferences_locked<R: Runtime>(
+    app: &AppHandle<R>,
+) -> Result<RecordingPreferences> {
     // Try to load from Tauri store
     let store = match app.store("recording_preferences.json") {
         Ok(store) => store,
         Err(e) => {
-            warn!("Failed to access store: {}, using defaults", e);
-            return Ok(RecordingPreferences::default());
+            return Err(anyhow::anyhow!("Could not read recording source preferences: {}. Capture was not broadened.", e));
         }
     };
 
@@ -322,8 +333,7 @@ pub async fn load_recording_preferences<R: Runtime>(
                 p
             }
             Err(e) => {
-                warn!("Failed to deserialize preferences: {}, using defaults", e);
-                RecordingPreferences::default()
+                return Err(anyhow::anyhow!("Invalid recording source preferences: {}. Capture was not broadened.", e));
             }
         }
     } else {
@@ -333,25 +343,33 @@ pub async fn load_recording_preferences<R: Runtime>(
 
     #[cfg(target_os = "macos")]
     let prefs = if let Err(error) = reject_current_app_bundle_path(&prefs.save_folder) {
-        warn!(
-            "Ignoring recordings folder inside the app bundle ({}): {error}",
-            prefs.save_folder.display()
-        );
-        let corrected = RecordingPreferences {
-            save_folder: get_default_recordings_folder(),
-            ..prefs
-        };
-        if let Ok(value) = serde_json::to_value(&corrected) {
-            store.set("preferences", value);
-            if let Err(error) = store.save() {
-                warn!("Failed to persist corrected recordings folder: {error}");
-            }
+        warn!("Repairing recordings folder inside the app bundle: {error}");
+        let corrected = RecordingPreferences { save_folder: get_default_recordings_folder(), ..prefs };
+        let previous = store.get("preferences");
+        let mut value = previous.clone().unwrap_or(serde_json::json!({}));
+        value["save_folder"] = serde_json::to_value(&corrected.save_folder)?;
+        store.set("preferences", value);
+        if let Err(error) = store.save() {
+            if let Some(previous) = previous { store.set("preferences", previous); }
+            else { store.delete("preferences"); }
+            return Err(anyhow::anyhow!("Could not repair recording folder: {error}. Capture was not started."));
         }
         corrected
-    } else {
-        prefs
-    };
+    } else { prefs };
 
+    // Persist the source upgrade without replacing unrelated/unknown store keys.
+    // A failed durable write must not pretend the migration completed.
+    if let Some(previous) = store.get("preferences") {
+        let mut migrated = previous.clone();
+        if super::recording_sources::RecordingSources::migrate_preferences(&mut migrated)
+            .map_err(anyhow::Error::msg)? {
+            store.set("preferences", migrated);
+            if let Err(error) = store.save() {
+                store.set("preferences", previous);
+                return Err(anyhow::anyhow!("Could not migrate recording sources: {error}. Capture was not started."));
+            }
+        }
+    }
     let mut prefs = prefs;
     // Auto-migrate single legacy target to targets list if needed
     if prefs.per_app_targets.is_empty() {
@@ -377,7 +395,20 @@ pub async fn load_recording_preferences<R: Runtime>(
 }
 
 /// Save recording preferences to store
+pub(crate) static PREFERENCES_WRITE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Full settings/device/gain writes cannot restore a stale source snapshot.
+/// Source inclusion has one explicit patch command, independent of these edits.
 pub async fn save_recording_preferences<R: Runtime>(
+    app: &AppHandle<R>, preferences: &RecordingPreferences,
+) -> Result<()> {
+    let _write = PREFERENCES_WRITE.lock().await;
+    let mut preferences = preferences.clone();
+    preferences.sources = load_recording_preferences_locked(app).await?.sources;
+    persist_recording_preferences(app, &preferences).await
+}
+
+async fn persist_recording_preferences<R: Runtime>(
     app: &AppHandle<R>,
     preferences: &RecordingPreferences,
 ) -> Result<()> {
@@ -397,6 +428,21 @@ pub async fn save_recording_preferences<R: Runtime>(
             executable: exe.clone(),
             icon: None,
         });
+    }
+
+    if cfg!(target_os = "macos") && preferences.per_app_recording_enabled
+        && preferences.sources.system_audio_enabled && preferences.per_app_targets.len() > 1 {
+        super::recording_mode::validate_app_count(true, preferences.per_app_targets.len())
+            .map_err(anyhow::Error::msg)?;
+    }
+
+    // No app-scoped meter exists. A preference edit must acknowledge teardown of
+    // endpoint preview before publishing its new scope/source choice.
+    let current = load_recording_preferences_locked(app).await?;
+    if current.sources != preferences.sources
+        || current.per_app_recording_enabled != preferences.per_app_recording_enabled
+        || current.per_app_targets != preferences.per_app_targets {
+        super::simple_level_monitor::stop_monitoring().await?;
     }
 
     // Validate first so a bad custom path is never persisted and reused on the
@@ -464,6 +510,29 @@ pub async fn set_recording_preferences<R: Runtime>(
     save_recording_preferences(&app, &preferences)
         .await
         .map_err(|e| format!("Failed to save recording preferences: {}", e))
+}
+
+/// Source-only patch, serialized with Start so an idle click cannot silently
+/// rewrite the frozen source selection of an already-starting/active take.
+#[tauri::command]
+pub async fn set_recording_source_enabled<R: Runtime>(
+    app: AppHandle<R>, source: String, enabled: bool,
+) -> Result<super::recording_sources::RecordingSources, String> {
+    use tauri::Emitter;
+    let _admission = super::recording_source_admission::SOURCE_ADMISSION.lock().await;
+    if super::recording_source_admission::is_starting() || super::recording_commands::is_recording_active() || super::recording_commands::is_recording_stopping() {
+        return Err("Recording already started. Stop before changing captured sources.".into());
+    }
+    let _write = PREFERENCES_WRITE.lock().await;
+    let mut prefs = load_recording_preferences_locked(&app).await.map_err(|e| e.to_string())?;
+    match source.as_str() {
+        "microphone" => prefs.sources.microphone_enabled = enabled,
+        "system" => prefs.sources.system_audio_enabled = enabled,
+        _ => return Err("Unknown recording source".into()),
+    }
+    persist_recording_preferences(&app, &prefs).await.map_err(|e| e.to_string())?;
+    let _ = app.emit("recording-sources-changed", prefs.sources);
+    Ok(prefs.sources)
 }
 
 #[tauri::command]

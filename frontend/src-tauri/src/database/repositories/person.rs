@@ -6,6 +6,7 @@
 //! normalized custom names intentionally auto-link across meetings. All profile
 //! and AI queries join through that mapping instead of guessing from label text.
 
+pub(crate) use super::speaker_identity::{ensure_label_identity, find_person_by_normalized_name, is_person_name, normalize_person_name};
 use serde::{Deserialize, Serialize};
 use sqlx::{Sqlite, SqlitePool, Transaction};
 use std::cmp::Ordering;
@@ -220,122 +221,21 @@ impl PeopleRepository {
             });
         }
 
-        let meetings = sqlx::query_as::<_, (String, String, String)>(
-            "SELECT id, title, created_at FROM meetings \
-             WHERE lower(title) LIKE ? ESCAPE '\\' \
-             ORDER BY created_at DESC LIMIT ?",
-        )
-        .bind(&like_query)
-        .bind(limit)
-        .fetch_all(pool)
-        .await?;
-
-        for (id, title, created_at) in meetings {
+        for hit in super::library::search(pool, query, limit as usize, false).await? {
             ranked.push(RankedResult {
-                score: match_quality(&title.to_lowercase(), &normalized_query),
-                sort_time: created_at.clone(),
-                result: GlobalSearchResult {
-                    kind: "meeting".to_string(),
-                    id: id.clone(),
-                    meeting_id: Some(id),
-                    person_id: None,
-                    transcript_id: None,
-                    title: title.clone(),
-                    snippet: title,
-                    timestamp: Some(created_at),
-                    speaker: None,
-                    audio_start_time: None,
-                    meeting_count: None,
-                    group_id: None,
-                    color: None,
+                score: match hit.kind.as_str() {
+                    "meeting" => match_quality(&hit.title.to_lowercase(), &normalized_query),
+                    "notes" => 19,
+                    "transcript" if hit.speaker.as_deref().is_some_and(|value| value.to_lowercase().contains(&normalized_query)) => 5,
+                    "transcript" => 20,
+                    _ => 25,
                 },
-            });
-        }
-
-        let transcripts = sqlx::query_as::<
-            _,
-            (
-                String,
-                String,
-                String,
-                String,
-                String,
-                Option<String>,
-                Option<f64>,
-            ),
-        >(
-            "SELECT t.id, m.id, m.title, t.transcript, t.timestamp, t.speaker, t.audio_start_time \
-             FROM transcripts t JOIN meetings m ON m.id = t.meeting_id \
-             WHERE lower(t.transcript) LIKE ? ESCAPE '\\' \
-                OR lower(COALESCE(t.speaker, '')) LIKE ? ESCAPE '\\' \
-             ORDER BY m.created_at DESC, t.audio_start_time ASC LIMIT ?",
-        )
-        .bind(&like_query)
-        .bind(&like_query)
-        .bind(limit)
-        .fetch_all(pool)
-        .await?;
-
-        for (id, meeting_id, title, text, timestamp, speaker, audio_start_time) in transcripts {
-            let speaker_match = speaker
-                .as_deref()
-                .map(|value| value.to_lowercase().contains(&normalized_query))
-                .unwrap_or(false);
-            ranked.push(RankedResult {
-                score: if speaker_match { 5 } else { 20 },
-                sort_time: timestamp.clone(),
+                sort_time: hit.timestamp.clone(),
                 result: GlobalSearchResult {
-                    kind: "transcript".to_string(),
-                    id: id.clone(),
-                    meeting_id: Some(meeting_id),
-                    person_id: None,
-                    transcript_id: Some(id),
-                    title,
-                    snippet: snippet_around(&text, query, 180),
-                    timestamp: Some(timestamp),
-                    speaker,
-                    audio_start_time,
-                    meeting_count: None,
-                    group_id: None,
-                    color: None,
-                },
-            });
-        }
-
-        // Summary JSON contains caches and editor structure, so only parsed,
-        // user-visible text is searched. Never use a LIKE against the raw blob.
-        let summaries = sqlx::query_as::<_, (String, String, String, String)>(
-            "SELECT m.id, m.title, m.created_at, s.result \
-             FROM summary_processes s JOIN meetings m ON m.id = s.meeting_id \
-             WHERE s.result IS NOT NULL ORDER BY m.created_at DESC",
-        )
-        .fetch_all(pool)
-        .await?;
-
-        for (meeting_id, title, created_at, raw) in summaries {
-            let Some(visible) = visible_summary_text(&raw) else {
-                continue;
-            };
-            if !visible.to_lowercase().contains(&normalized_query) {
-                continue;
-            }
-            ranked.push(RankedResult {
-                score: 25,
-                sort_time: created_at.clone(),
-                result: GlobalSearchResult {
-                    kind: "summary".to_string(),
-                    id: format!("summary-{}", meeting_id),
-                    meeting_id: Some(meeting_id),
-                    person_id: None,
-                    transcript_id: None,
-                    title,
-                    snippet: snippet_around(&visible, query, 220),
-                    timestamp: Some(created_at),
-                    speaker: None,
-                    audio_start_time: None,
-                    meeting_count: None,
-                    group_id: None,
-                    color: None,
+                    kind: hit.kind, id: hit.id, meeting_id: Some(hit.meeting_id),
+                    person_id: None, transcript_id: hit.transcript_id, title: hit.title,
+                    snippet: hit.snippet, timestamp: Some(hit.timestamp), speaker: hit.speaker,
+                    audio_start_time: hit.audio_start_time, meeting_count: None, group_id: None, color: None,
                 },
             });
         }
@@ -1019,7 +919,7 @@ impl PeopleRepository {
             "SELECT DISTINCT m.id, m.title, m.created_at, s.result \
              FROM person_speakers ps \
              JOIN meetings m ON m.id = ps.meeting_id \
-             LEFT JOIN summary_processes s ON s.meeting_id = m.id \
+             LEFT JOIN current_meeting_summaries s ON s.meeting_id = m.id \
              WHERE ps.person_id = ? \
              ORDER BY m.created_at DESC LIMIT 100",
         )
@@ -1227,51 +1127,6 @@ async fn person_groups(
         .collect())
 }
 
-async fn ensure_label_identity(
-    tx: &mut Transaction<'_, Sqlite>,
-    meeting_id: &str,
-    label: &str,
-) -> Result<(), sqlx::Error> {
-    let existing: Option<String> = sqlx::query_scalar(
-        "SELECT person_id FROM person_speakers WHERE meeting_id = ? AND speaker_label = ?",
-    )
-    .bind(meeting_id)
-    .bind(label)
-    .fetch_optional(&mut **tx)
-    .await?;
-    if existing.is_some() {
-        return Ok(());
-    }
-    let normalized = normalize_person_name(label);
-    let person_id = match find_person_by_normalized_name(tx, &normalized).await? {
-        Some(id) => id,
-        None => {
-            let id = format!("person-{}", Uuid::new_v4());
-            sqlx::query(
-                "INSERT INTO people \
-                 (id, display_name, normalized_name, notes, created_at, updated_at) \
-                 VALUES (?, ?, ?, NULL, datetime('now'), datetime('now'))",
-            )
-            .bind(&id)
-            .bind(label)
-            .bind(&normalized)
-            .execute(&mut **tx)
-            .await?;
-            id
-        }
-    };
-    sqlx::query(
-        "INSERT INTO person_speakers (person_id, meeting_id, speaker_label) \
-         VALUES (?, ?, ?) \
-         ON CONFLICT(meeting_id, speaker_label) DO UPDATE SET person_id = excluded.person_id",
-    )
-    .bind(person_id)
-    .bind(meeting_id)
-    .bind(label)
-    .execute(&mut **tx)
-    .await?;
-    Ok(())
-}
 
 fn clean_field(value: Option<String>) -> Option<String> {
     value.and_then(|text| {
@@ -1344,25 +1199,6 @@ async fn relabel_person(
     Ok(())
 }
 
-pub(crate) fn normalize_person_name(name: &str) -> String {
-    name.trim().to_lowercase()
-}
-
-pub(crate) fn is_person_name(name: &str) -> bool {
-    let trimmed = name.trim();
-    let lower = trimmed.to_ascii_lowercase();
-    if trimmed.is_empty()
-        || matches!(
-            lower.as_str(),
-            "you" | "guest" | "mic" | "microphone" | "system" | "system audio" | "speaker"
-        )
-        || lower.starts_with("speaker ")
-        || trimmed.contains(" + ")
-    {
-        return false;
-    }
-    true
-}
 
 async fn next_available_speaker_label(
     tx: &mut Transaction<'_, Sqlite>,
@@ -1528,7 +1364,7 @@ fn match_quality(value: &str, query: &str) -> i32 {
     }
 }
 
-fn snippet_around(text: &str, query: &str, max_chars: usize) -> String {
+pub(crate) fn snippet_around(text: &str, query: &str, max_chars: usize) -> String {
     let chars: Vec<char> = text.chars().collect();
     if chars.len() <= max_chars {
         return text.to_string();
@@ -1641,31 +1477,6 @@ fn format_audio_time(seconds: f64) -> String {
 /// SQLite's built-in lower/LIKE folding is ASCII-only. Migration values remain
 /// compatible with SQL search, while this Rust fallback compares display names
 /// with Unicode lowercase before deciding that a new identity is necessary.
-async fn find_person_by_normalized_name(
-    tx: &mut Transaction<'_, Sqlite>,
-    normalized: &str,
-) -> Result<Option<String>, sqlx::Error> {
-    if let Some(id) = sqlx::query_scalar("SELECT id FROM people WHERE normalized_name = ?")
-        .bind(normalized)
-        .fetch_optional(&mut **tx)
-        .await?
-    {
-        return Ok(Some(id));
-    }
-
-    let candidates = sqlx::query_as::<_, (String, String, String)>(
-        "SELECT id, display_name, normalized_name FROM people",
-    )
-    .fetch_all(&mut **tx)
-    .await?;
-    Ok(candidates
-        .into_iter()
-        .find(|(_, display_name, stored_normalized)| {
-            normalize_person_name(display_name) == normalized
-                || normalize_person_name(stored_normalized) == normalized
-        })
-        .map(|(id, _, _)| id))
-}
 
 #[cfg(test)]
 mod tests {

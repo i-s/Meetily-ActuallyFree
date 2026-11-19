@@ -38,6 +38,8 @@ export default function MiniBarPage() {
   useAppTheme();
   const [elapsed, setElapsed] = useState(0);
   const [isPaused, setIsPaused] = useState(false);
+  const [micCaptured, setMicCaptured] = useState(false);
+  const [systemCaptured, setSystemCaptured] = useState(false);
   const [isMicMuted, setIsMicMuted] = useState(false);
   const [isChangingMicMute, setIsChangingMicMute] = useState(false);
   const [isSystemMuted, setIsSystemMuted] = useState(false);
@@ -63,6 +65,8 @@ export default function MiniBarPage() {
         if (!mounted) return;
         const duration = state.active_duration ?? state.recording_duration;
         if (duration !== null) setElapsed(Math.max(0, Math.floor(duration)));
+        setMicCaptured(state.microphone_captured === true);
+        setSystemCaptured(state.system_audio_captured === true);
         setIsPaused(state.is_paused);
         setIsMicMuted(state.is_microphone_muted);
         setIsSystemMuted(state.is_system_audio_muted);
@@ -102,7 +106,7 @@ export default function MiniBarPage() {
   }, [isPaused]);
 
   const toggleMicMute = useCallback(async () => {
-    if (isChangingMicMute || isChangingSystemMute || isStopping) return;
+    if (!micCaptured || isChangingMicMute || isChangingSystemMute || isStopping) return;
     setIsChangingMicMute(true);
     try {
       await recordingService.setMicrophoneMuted(!isMicMuted);
@@ -111,10 +115,10 @@ export default function MiniBarPage() {
     } finally {
       setIsChangingMicMute(false);
     }
-  }, [isChangingMicMute, isChangingSystemMute, isMicMuted, isStopping]);
+  }, [micCaptured, isChangingMicMute, isChangingSystemMute, isMicMuted, isStopping]);
 
   const toggleSystemMute = useCallback(async () => {
-    if (isChangingMicMute || isChangingSystemMute || isStopping) return;
+    if (!systemCaptured || isChangingMicMute || isChangingSystemMute || isStopping) return;
     setIsChangingSystemMute(true);
     try {
       await recordingService.setSystemAudioMuted(!isSystemMuted);
@@ -123,7 +127,7 @@ export default function MiniBarPage() {
     } finally {
       setIsChangingSystemMute(false);
     }
-  }, [isChangingMicMute, isChangingSystemMute, isStopping, isSystemMuted]);
+  }, [systemCaptured, isChangingMicMute, isChangingSystemMute, isStopping, isSystemMuted]);
 
   const expand = useCallback(() => {
     invoke('exit_compact_mode').catch((error) => console.error(error));
@@ -193,25 +197,27 @@ export default function MiniBarPage() {
       <button
         type="button"
         onClick={() => void toggleMicMute()}
-        disabled={busy}
-        aria-pressed={isMicMuted}
-        aria-label={isMicMuted ? 'Unmute microphone' : 'Mute microphone'}
-        className={laneButton(isMicMuted)}
+        disabled={busy || !micCaptured}
+        title={!micCaptured ? 'Microphone not captured. Stop, choose sources, then start again.' : undefined}
+        aria-pressed={isMicMuted || !micCaptured}
+        aria-label={!micCaptured ? 'Microphone not captured. Stop, choose sources, then start again.' : isMicMuted ? 'Unmute microphone' : 'Mute microphone'}
+        className={laneButton(isMicMuted || !micCaptured)}
       >
-        {isMicMuted ? <MicOff size={15} strokeWidth={1.75} /> : <Mic size={15} strokeWidth={1.75} />}
-        <LiveAudioVisualizer active={!isPaused && !isStopping && !isMicMuted} source="mic" bars={18} fill className="ml-2 min-w-0 flex-1" />
+        {isMicMuted || !micCaptured ? <MicOff size={15} strokeWidth={1.75} /> : <Mic size={15} strokeWidth={1.75} />}
+        <LiveAudioVisualizer active={micCaptured && !isPaused && !isStopping && !isMicMuted} source="mic" bars={18} fill className="ml-2 min-w-0 flex-1" />
       </button>
 
       <button
         type="button"
         onClick={() => void toggleSystemMute()}
-        disabled={busy}
-        aria-pressed={isSystemMuted}
-        aria-label={isSystemMuted ? 'Unmute output' : 'Mute output'}
-        className={laneButton(isSystemMuted)}
+        disabled={busy || !systemCaptured}
+        title={!systemCaptured ? 'Computer audio not captured. Stop, choose sources, then start again.' : undefined}
+        aria-pressed={isSystemMuted || !systemCaptured}
+        aria-label={!systemCaptured ? 'Computer audio not captured. Stop, choose sources, then start again.' : isSystemMuted ? 'Unmute output' : 'Mute output'}
+        className={laneButton(isSystemMuted || !systemCaptured)}
       >
-        {isSystemMuted ? <VolumeX size={15} strokeWidth={1.75} /> : <Volume2 size={15} strokeWidth={1.75} />}
-        <LiveAudioVisualizer active={!isPaused && !isStopping && !isSystemMuted} source="system" bars={18} fill className="ml-2 min-w-0 flex-1" />
+        {isSystemMuted || !systemCaptured ? <VolumeX size={15} strokeWidth={1.75} /> : <Volume2 size={15} strokeWidth={1.75} />}
+        <LiveAudioVisualizer active={systemCaptured && !isPaused && !isStopping && !isSystemMuted} source="system" bars={18} fill className="ml-2 min-w-0 flex-1" />
       </button>
     </div>
   );

@@ -42,11 +42,13 @@ export function RecordingVoiceLane({
   onGainCommit,
   macDefaultOutput = false,
   live = false,
+  captureIncluded = true,
   muted = false,
   meterActive = false,
   onMute,
   source,
   hideDevice = false,
+  previewScope,
 }: {
   kind: 'mic' | 'output';
   open: boolean;
@@ -62,12 +64,15 @@ export function RecordingVoiceLane({
   macDefaultOutput?: boolean;
   /** Recording is underway. The same button mutes, and the chevron becomes a meter. */
   live?: boolean;
+  /** Native frozen inclusion: an excluded source cannot be unmuted into capture. */
+  captureIncluded?: boolean;
   muted?: boolean;
   meterActive?: boolean;
   onMute?: () => void;
   /** Which audio to record, shown in the panel (system audio). */
   source?: React.ReactNode;
   hideDevice?: boolean;
+  previewScope?: { loaded: boolean; onlyApps: boolean; targets: string[] };
 }) {
   const [listOpen, setListOpen] = useState(false);
   const [meter, setMeter] = useState({ rms: 0, peak: 0, tick: 0 });
@@ -83,8 +88,10 @@ export function RecordingVoiceLane({
     if (!open) setListOpen(false);
   }, [open]);
 
+  const previewAllowed = kind === 'mic' || !previewScope || (previewScope.loaded && !previewScope.onlyApps);
+  const previewTargets = previewScope?.targets.join('\0') ?? '';
   useEffect(() => {
-    if (!open || live) return;
+    if (!open || live || muted || !previewAllowed) return;
     let unlisten: (() => void) | undefined;
     let cancelled = false;
     const opts = optionsRef.current;
@@ -93,7 +100,8 @@ export function RecordingVoiceLane({
     const wantedType = kind === 'mic' ? 'input' : 'output';
 
     runLevelMonitor(async () => {
-      await invoke('start_audio_level_monitoring', { deviceNames: wanted ? [wanted] : [] });
+      if (cancelled) return;
+      await invoke('start_audio_level_monitoring', { deviceNames: wanted ? [wanted] : [], deviceType: wantedType });
     });
 
     void listen<LevelEvent>('audio-levels', (event) => {
@@ -128,18 +136,20 @@ export function RecordingVoiceLane({
       cancelled = true;
       unlisten?.();
       setMeter({ rms: 0, peak: 0, tick: 0 });
-      runLevelMonitor(async () => {
-        await invoke('stop_audio_level_monitoring').catch(() => undefined);
-      });
+      // Cancel native admission now, even if an older Start IPC has not replied.
+      // Queue the acknowledgement so a later valid preview waits for teardown.
+      const stopped = invoke('stop_audio_level_monitoring').catch(() => undefined);
+      runLevelMonitor(async () => { await stopped; });
     };
-  }, [open, live, savedValue, kind]);
+  }, [open, live, muted, savedValue, kind, previewAllowed, previewTargets]);
 
   // macOS has no output to pick, but the panel still opens for `source`.
   const canOpen = !macDefaultOutput || !!source;
   const settingsLabel = kind === 'mic' ? 'Input settings' : 'Output settings';
-  const muteLabel = kind === 'mic'
-    ? (muted ? 'Unmute microphone' : 'Mute microphone')
-    : (muted ? 'Unmute output' : 'Mute output');
+  const sourceName = kind === 'mic' ? 'microphone' : 'computer audio';
+  const muteLabel = live && !captureIncluded
+    ? `${kind === 'mic' ? 'Microphone' : 'Computer audio'} not captured. Stop and enable it before the next recording.`
+    : `${live ? (muted ? 'Unmute' : 'Mute') : (muted ? 'Enable' : 'Disable')} ${sourceName}`;
   const OffIcon = kind === 'mic' ? MicOff : VolumeX;
 
   const ease = 'duration-500 ease-[cubic-bezier(0.22,1,0.36,1)] motion-reduce:transition-none';
@@ -152,8 +162,8 @@ export function RecordingVoiceLane({
         <TooltipTrigger asChild>
           <button
             type="button"
-            disabled={disabled}
-            aria-pressed={muted}
+            disabled={disabled || (live && !captureIncluded)}
+            aria-pressed={live ? muted : !muted}
             aria-label={muteLabel}
             onClick={() => onMute?.()}
             className={`flex items-center justify-center transition-[padding,background-color,color] ${ease} ${

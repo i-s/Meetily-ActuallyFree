@@ -252,6 +252,7 @@ pub async fn api_get_summary<R: Runtime>(
     );
     let pool = state.db_manager.pool();
 
+    crate::post_call::store::projection::recover(pool,Some(&meeting_id)).await?;
     match SummaryProcessesRepository::get_summary_data_for_meeting(pool, &meeting_id).await {
         Ok(Some(process)) => {
             let status = process.status.to_lowercase();

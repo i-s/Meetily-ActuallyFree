@@ -2,6 +2,7 @@
 
 import React, { createContext, useContext, useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { recordingService } from '@/services/recordingService';
+import { listen } from '@tauri-apps/api/event';
 
 /**
  * Recording state synchronized with backend
@@ -25,6 +26,8 @@ export enum RecordingStatus {
 }
 
 interface RecordingState {
+  microphoneCaptured: boolean;
+  systemAudioCaptured: boolean;
   isRecording: boolean;           // Is a recording session active
   isPaused: boolean;              // Is the recording paused
   isMicrophoneMuted: boolean;     // Is only the microphone silenced
@@ -60,6 +63,8 @@ export const useRecordingState = () => {
 
 export function RecordingStateProvider({ children }: { children: React.ReactNode }) {
   const [state, setState] = useState<RecordingState>({
+    microphoneCaptured: false,
+    systemAudioCaptured: false,
     isRecording: false,
     isPaused: false,
     isMicrophoneMuted: false,
@@ -72,6 +77,8 @@ export function RecordingStateProvider({ children }: { children: React.ReactNode
   });
 
   const pollingIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const mountedRef = useRef(false);
+  const revisionRef = useRef(0);
 
   // NEW: Status setter with logging
   const setStatus = useCallback((status: RecordingStatus, message?: string) => {
@@ -90,19 +97,35 @@ export function RecordingStateProvider({ children }: { children: React.ReactNode
    */
   const syncWithBackend = async () => {
     try {
+      const revision = revisionRef.current;
       const backendState = await recordingService.getRecordingState();
+      if (!mountedRef.current || revision !== revisionRef.current) return;
 
       setState(prev => ({
         ...prev,
+        status: backendState.is_stopping
+          ? ([RecordingStatus.PROCESSING_TRANSCRIPTS, RecordingStatus.SAVING].includes(prev.status) ? prev.status : RecordingStatus.STOPPING)
+          : backendState.is_recording && ![RecordingStatus.STOPPING, RecordingStatus.PROCESSING_TRANSCRIPTS, RecordingStatus.SAVING].includes(prev.status)
+            ? RecordingStatus.RECORDING
+            : !backendState.is_recording && prev.status === RecordingStatus.RECORDING ? RecordingStatus.IDLE : prev.status,
+        microphoneCaptured: backendState.microphone_captured ?? false,
+        systemAudioCaptured: backendState.system_audio_captured ?? false,
         isRecording: backendState.is_recording,
         isPaused: backendState.is_paused,
         isMicrophoneMuted: backendState.is_microphone_muted,
         isSystemAudioMuted: backendState.is_system_audio_muted,
         isActive: backendState.is_active,
-        recordingDuration: backendState.recording_duration,
-        activeDuration: backendState.active_duration,
+        // Native shutdown temporarily takes ownership of the manager. Its
+        // absent snapshot must not reset the last captured duration to zero.
+        recordingDuration: backendState.recording_duration ?? (backendState.is_recording ? prev.recordingDuration : null),
+        activeDuration: backendState.active_duration ?? (backendState.is_recording ? prev.activeDuration : null),
       }));
 
+      if (backendState.is_recording) {
+        if (!pollingIntervalRef.current) startPolling();
+      } else {
+        stopPolling();
+      }
       console.log('[RecordingStateContext] Synced with backend:', backendState);
     } catch (error) {
       console.error('[RecordingStateContext] Failed to sync with backend:', error);
@@ -133,33 +156,69 @@ export function RecordingStateProvider({ children }: { children: React.ReactNode
     }
   };
 
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void listen<{ stage: string; message: string }>('recording-shutdown-progress', ({ payload }) => {
+      // Completion is owned by recording-stopped / stop-recording-event, which
+      // carry save metadata. A progress message alone must never finish Stop.
+      if (disposed || payload.stage === 'complete') return;
+      setState(prev => ({
+        ...prev,
+        status: payload.stage === 'processing_transcripts'
+          ? RecordingStatus.PROCESSING_TRANSCRIPTS : RecordingStatus.STOPPING,
+        statusMessage: payload.message,
+      }));
+    }).then(cleanup => {
+      if (disposed) cleanup();
+      else unlisten = cleanup;
+    }).catch(error => console.error('Failed to listen for recording shutdown progress:', error));
+    return () => { disposed = true; unlisten?.(); };
+  }, []);
+
   /**
    * Set up event listeners for backend state changes
    */
   useEffect(() => {
     console.log('[RecordingStateContext] Setting up event listeners');
+    mountedRef.current = true;
+    let disposed = false;
     const unsubscribers: (() => void)[] = [];
+    const register = (cleanup: () => void) => {
+      if (disposed) cleanup();
+      else unsubscribers.push(cleanup);
+    };
 
     const setupListeners = async () => {
       try {
         // Recording started
         const unlistenStarted = await recordingService.onRecordingStarted(() => {
+          if (disposed) return;
+          revisionRef.current++;
           console.log('[RecordingStateContext] Recording started event');
           setState(prev => ({
             ...prev,
             isRecording: true,
             isPaused: false,
-            isMicrophoneMuted: false,
-            isSystemAudioMuted: false,
+            microphoneCaptured: false,
+            systemAudioCaptured: false,
+            isMicrophoneMuted: true,
+            isSystemAudioMuted: true,
             isActive: true,
             status: RecordingStatus.RECORDING,  // NEW: Set status to RECORDING
+            statusMessage: undefined,
           }));
+          // Inclusion/mute comes from native capture, never from an unmute-all
+          // event default. Refresh immediately rather than waiting for polling.
+          void syncWithBackend();
           startPolling();
         });
-        unsubscribers.push(unlistenStarted);
+        register(unlistenStarted);
 
         // Recording stopped
         const unlistenStopped = await recordingService.onRecordingStopped((payload) => {
+          if (disposed) return;
+          revisionRef.current++;
           console.log('[RecordingStateContext] Recording stopped event:', payload);
           setState(prev => {
             // Set status to STOPPING if not already in stop flow
@@ -177,6 +236,8 @@ export function RecordingStateProvider({ children }: { children: React.ReactNode
               status: newStatus,
               statusMessage: newStatus === RecordingStatus.STOPPING ? 'Stopping recording...' : prev.statusMessage,
               isRecording: false,
+              microphoneCaptured: false,
+              systemAudioCaptured: false,
               isPaused: false,
               isMicrophoneMuted: false,
               isSystemAudioMuted: false,
@@ -187,10 +248,12 @@ export function RecordingStateProvider({ children }: { children: React.ReactNode
           });
           stopPolling();
         });
-        unsubscribers.push(unlistenStopped);
+        register(unlistenStopped);
 
         // Recording paused
         const unlistenPaused = await recordingService.onRecordingPaused(() => {
+          if (disposed) return;
+          revisionRef.current++;
           console.log('[RecordingStateContext] Recording paused event');
           setState(prev => ({
             ...prev,
@@ -198,10 +261,12 @@ export function RecordingStateProvider({ children }: { children: React.ReactNode
             isActive: false,
           }));
         });
-        unsubscribers.push(unlistenPaused);
+        register(unlistenPaused);
 
         // Recording resumed
         const unlistenResumed = await recordingService.onRecordingResumed(() => {
+          if (disposed) return;
+          revisionRef.current++;
           console.log('[RecordingStateContext] Recording resumed event');
           setState(prev => ({
             ...prev,
@@ -209,26 +274,31 @@ export function RecordingStateProvider({ children }: { children: React.ReactNode
             isActive: true,
           }));
         });
-        unsubscribers.push(unlistenResumed);
+        register(unlistenResumed);
 
         const unlistenMicrophoneMute = await recordingService.onMicrophoneMuteChanged(({ muted }) => {
+          if (disposed) return;
+          revisionRef.current++;
           console.log('[RecordingStateContext] Microphone mute changed:', muted);
           setState(prev => ({
             ...prev,
             isMicrophoneMuted: muted,
           }));
         });
-        unsubscribers.push(unlistenMicrophoneMute);
+        register(unlistenMicrophoneMute);
 
         const unlistenSystemAudioMute = await recordingService.onSystemAudioMuteChanged(({ muted }) => {
+          if (disposed) return;
+          revisionRef.current++;
           console.log('[RecordingStateContext] System audio mute changed:', muted);
           setState(prev => ({
             ...prev,
             isSystemAudioMuted: muted,
           }));
         });
-        unsubscribers.push(unlistenSystemAudioMute);
+        register(unlistenSystemAudioMute);
 
+        if (!disposed) await syncWithBackend();
         console.log('[RecordingStateContext] Event listeners set up successfully');
       } catch (error) {
         console.error('[RecordingStateContext] Failed to set up event listeners:', error);
@@ -238,19 +308,13 @@ export function RecordingStateProvider({ children }: { children: React.ReactNode
     setupListeners();
 
     return () => {
+      disposed = true;
+      mountedRef.current = false;
+      revisionRef.current++;
       console.log('[RecordingStateContext] Cleaning up event listeners');
       unsubscribers.forEach(unsub => unsub());
       stopPolling();
     };
-  }, []);
-
-  /**
-   * Initial sync on mount - CRITICAL for fixing refresh desync bug
-   * If backend is recording but UI state is false, this will correct it
-   */
-  useEffect(() => {
-    console.log('[RecordingStateContext] Initial mount - syncing with backend');
-    syncWithBackend();
   }, []);
 
   // NEW: Computed helpers from status

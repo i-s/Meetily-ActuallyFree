@@ -89,7 +89,7 @@ fn toggle_recording_handler<R: Runtime>(app: &AppHandle<R>) {
             let stop_result = crate::audio::recording_commands::stop_recording(
                 app_clone.clone(),
                 crate::audio::recording_commands::RecordingArgs {
-                    save_path: save_path.to_string_lossy().to_string(),
+                    save_path: save_path.to_string_lossy().to_string(), expected: None, manual_generation: None,
                 },
             )
             .await;
@@ -118,7 +118,7 @@ fn toggle_recording_handler<R: Runtime>(app: &AppHandle<R>) {
 
             log::info!("Emitting start recording event from tray");
             if let Some(window) = app_clone.get_webview_window("main") {
-                let _ = window.eval("sessionStorage.setItem('autoStartRecording', 'true')"); // Set the flag to start recording automatically
+                let _ = window.eval("sessionStorage.setItem('autoStartRecording', JSON.stringify({kind:'manual'}))"); // Set the flag to start recording automatically
                 let _ = window.eval("window.location.assign('/')");
             }
         }
@@ -179,7 +179,7 @@ fn stop_recording_handler<R: Runtime>(app: &AppHandle<R>) {
         let stop_result = crate::audio::recording_commands::stop_recording(
             app_clone.clone(),
             crate::audio::recording_commands::RecordingArgs {
-                save_path: save_path.to_string_lossy().to_string(),
+                save_path: save_path.to_string_lossy().to_string(), expected: None, manual_generation: None,
             },
         )
         .await;
@@ -250,6 +250,12 @@ async fn get_current_recording_state() -> RecordingState {
     if !is_recording {
         log::info!("Tray: Recording state is Stopped");
         return RecordingState::Stopped;
+    }
+
+    // The manager is detached during finalization but the session remains
+    // active until save completes. Never advertise that phase as recording.
+    if crate::audio::recording_commands::is_recording_stopping() {
+        return RecordingState::Stopping;
     }
 
     // Check if paused

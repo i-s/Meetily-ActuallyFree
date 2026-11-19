@@ -186,11 +186,11 @@ export function AppAudioSource({
   const hint = live
     ? 'Applies from your next recording.'
     : choice.onlyApps && choice.targets.length === 0
-      ? 'Until you add an app, all computer audio is recorded.'
+      ? "Until you add an app, the recording can't start. No other audio source is substituted."
       : choice.onlyApps && platform === 'macos'
-        ? 'On macOS the first chosen app that is open is recorded.'
+        ? (choice.targets.length > 1 ? "macOS supports one app at a time. Clear this saved list and select one app; recording can't start with multiple apps." : "Only this app is recorded. macOS supports one app at a time; if it is unavailable the recording can't start.")
         : choice.onlyApps
-          ? "Only these apps are recorded. If none is open when you start, the recording can't start."
+          ? "Only these apps are recorded. Every selected app must be open, or the recording can't start."
           : null;
 
   return (
@@ -202,9 +202,12 @@ export function AppAudioSource({
             <AppChip key={target.executable} target={target} choice={choice} disabled={live} />
           ))}
           <li>
-            <AddAppButton choice={choice} disabled={live} />
+            <AddAppButton choice={choice} disabled={live || (platform === 'macos' && choice.targets.length >= 1)} />
           </li>
         </ul>
+      )}
+      {platform === 'macos' && choice.onlyApps && choice.targets.length > 1 && !live && (
+        <button type="button" onClick={choice.clearApps} className="text-xs text-af-accent">Clear selected apps</button>
       )}
       {hint && <p className={cn('leading-relaxed text-af-text-3', compact ? 'text-[11px]' : 'text-xs')}>{hint}</p>}
       {choice.onlyApps && !compact && choice.targets.length > 0 && (

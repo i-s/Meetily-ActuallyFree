@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { toast } from 'sonner';
 import { cn } from '@/lib/utils';
 import { Button } from '@/components/ui/button';
@@ -28,13 +28,19 @@ export function ExportMeetingsDialog({
   onOpenChange: (open: boolean) => void;
   meetings: ExportableMeeting[];
 }) {
-  const [parts, setParts] = useState<Set<ExportPart>>(() => new Set<ExportPart>(['notes', 'actions', 'summary']));
-  const [format, setFormat] = useState<ExportFormat>('pdf');
+  const identity = JSON.stringify(meetings.map(meeting => meeting.id));
+  const active = useRef<string | null>(identity);
+  active.current = open ? identity : null;
+  const runId = useRef(0);
+  useEffect(() => () => { active.current = null; ++runId.current; }, []);
+  const [parts, setParts] = useState<Set<ExportPart>>(() => new Set<ExportPart>(['notes', 'actions', 'summary', 'transcript']));
+  const [format, setFormat] = useState<ExportFormat>('markdown');
   const [progress, setProgress] = useState<{ done: number; total: number } | null>(null);
 
   useEffect(() => {
-    if (open) setProgress(null);
-  }, [open]);
+    ++runId.current;
+    setProgress(null);
+  }, [open, identity]);
 
   const toggle = (part: ExportPart, on: boolean) =>
     setParts((current) => {
@@ -48,17 +54,20 @@ export function ExportMeetingsDialog({
   const busy = progress !== null;
 
   const run = async () => {
+    const run = ++runId.current;
+    const key = identity;
+    const isCurrent = () => active.current === key && runId.current === run;
     setProgress({ done: 0, total: count });
     try {
-      const saved = await exportMeetings(meetings, parts, format, (done, total) => setProgress({ done, total }));
-      if (saved) {
+      const saved = await exportMeetings(meetings, parts, format, (done, total) => { if (isCurrent()) setProgress({ done, total }); }, isCurrent);
+      if (saved && isCurrent()) {
         toast.success(count === 1 ? 'Meeting exported' : `${count} meetings exported`);
         onOpenChange(false);
       }
     } catch (error) {
-      toast.error('Export failed', { description: error instanceof Error ? error.message : String(error) });
+      if (isCurrent()) toast.error('Export failed', { description: error instanceof Error ? error.message : String(error) });
     } finally {
-      setProgress(null);
+      if (isCurrent()) setProgress(null);
     }
   };
 
@@ -68,7 +77,7 @@ export function ExportMeetingsDialog({
         <DialogHeader>
           <DialogTitle>{count === 1 ? 'Export this meeting' : `Export ${count} meetings`}</DialogTitle>
           <DialogDescription>
-            {count === 1 ? 'Saved as one document.' : 'They go into one document, with a section for each meeting.'}
+            {count === 1 ? 'One saved snapshot, with transcript, Notes and summary kept distinct.' : 'One document with a separately timestamped saved snapshot for each meeting.'}
           </DialogDescription>
         </DialogHeader>
 

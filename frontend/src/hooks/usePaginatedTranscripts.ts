@@ -56,7 +56,6 @@ export function usePaginatedTranscripts({
     const offsetRef = useRef(0);
     const loadedMeetingIdRef = useRef<string | null>(null);
     const isLoadingRef = useRef(false);
-    const lastLoadTimeRef = useRef(0); // Debounce protection
     const requestGenerationRef = useRef(0);
     const activeMeetingIdRef = useRef(meetingId);
     activeMeetingIdRef.current = meetingId;
@@ -72,6 +71,7 @@ export function usePaginatedTranscripts({
         setHasMore(false);
         setError(null);
         offsetRef.current = 0;
+        isLoadingRef.current = false;
     }, []);
 
     // Load meeting metadata
@@ -164,24 +164,23 @@ export function usePaginatedTranscripts({
         }
     }, [meetingId]);
 
-    // Load next page with debounce protection
+    // Load the next page under a synchronous in-flight guard
     const loadMore = useCallback(async () => {
-        const now = Date.now();
-        // Debounce: require at least 100ms between calls
-        if (now - lastLoadTimeRef.current < 100) {
-            return;
-        }
-
         if (isLoadingRef.current || !hasMore || !meetingId || isLoading) return;
 
-        lastLoadTimeRef.current = now;
+        // The synchronous in-flight guard already serializes offsets. A time
+        // debounce can strand a fast deep-link load after its second page.
+        const expectedGeneration = requestGenerationRef.current;
+        const requestMeetingId = meetingId;
         isLoadingRef.current = true;
         setIsLoadingMore(true);
         try {
             await loadTranscriptsAtOffset(offsetRef.current, true);
         } finally {
-            setIsLoadingMore(false);
-            isLoadingRef.current = false;
+            if (requestGenerationRef.current === expectedGeneration && activeMeetingIdRef.current === requestMeetingId) {
+                setIsLoadingMore(false);
+                isLoadingRef.current = false;
+            }
         }
     }, [hasMore, meetingId, loadTranscriptsAtOffset, isLoading]);
 
@@ -191,6 +190,8 @@ export function usePaginatedTranscripts({
 
         const expectedGeneration = requestGenerationRef.current + 1;
         requestGenerationRef.current = expectedGeneration;
+        isLoadingRef.current = false;
+        setIsLoadingMore(false);
         setIsLoading(true);
         try {
             const refreshedMetadata = await loadMetadata(true, false, expectedGeneration);

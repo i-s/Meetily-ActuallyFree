@@ -703,6 +703,7 @@ impl Sortformer {
         let mut all_chunk_preds = Vec::new();
 
         for chunk_idx in 0..num_chunks {
+            crate::diarization::batch_control::check()?;
             let start = chunk_idx * chunk_stride;
             let end = (start + feed_size).min(total_frames);
             let current_len = end - start;

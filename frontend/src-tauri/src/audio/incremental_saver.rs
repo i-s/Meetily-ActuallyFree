@@ -1,15 +1,14 @@
 use std::path::PathBuf;
 use anyhow::{Result, anyhow};
-use log::{info, warn, error};
+use log::{info, warn};
 use super::encode::encode_single_audio;
 use super::recording_state::AudioChunk;
 use serde::{Serialize, Deserialize};
 
-use super::ffmpeg::find_ffmpeg_path;
 
+#[cfg(test)]
 fn ffconcat_file_line(path: &std::path::Path) -> String {
-    let escaped = path.to_string_lossy().replace('\'', "'\\''");
-    format!("file '{}'\n", escaped)
+    super::track_commit::concat_line(path)
 }
 
 /// Audio data for one track
@@ -112,12 +111,18 @@ impl IncrementalAudioSaver {
             .join(format!("{}_chunk_{:03}.mp4", self.track, self.checkpoint_count));
 
         // Encode and save checkpoint
+        // A failed encode must not leave a corrupt .mp4 that recovery mistakes
+        // for a committed checkpoint, or block retry with FFmpeg's overwrite prompt.
+        let pending_path = checkpoint_path.with_extension("pending");
+        let _ = std::fs::remove_file(&pending_path);
         encode_single_audio(
             bytemuck::cast_slice(&audio_data),
             self.sample_rate,
             1,  // mono
-            &checkpoint_path
+            &pending_path
         )?;
+        std::fs::File::open(&pending_path)?.sync_all()?;
+        std::fs::rename(&pending_path, &checkpoint_path)?;
 
         let duration_seconds = audio_data.len() as f32 / self.sample_rate as f32;
         self.checkpoint_count += 1;
@@ -131,6 +136,10 @@ impl IncrementalAudioSaver {
         );
 
         Ok(())
+    }
+
+    pub fn has_audio(&self) -> bool {
+        self.checkpoint_count > 0 || self.checkpoint_buffer.iter().any(|chunk| !chunk.data.is_empty())
     }
 
     /// Finalize the recording: save final checkpoint, merge all checkpoints, cleanup
@@ -161,19 +170,8 @@ impl IncrementalAudioSaver {
         let final_audio_path = self.meeting_folder.join(format!("{}.mp4", self.track));
         self.merge_checkpoints(&final_audio_path).await?;
 
-        // Clean up this track's checkpoints directory
-        info!(
-            "Cleaning up {} {} checkpoint files",
-            self.checkpoint_count, self.track
-        );
-        if let Err(e) = std::fs::remove_dir_all(&self.checkpoints_dir) {
-            warn!("Failed to clean up checkpoints directory: {}", e);
-            // Non-fatal - user can manually delete
-        }
-        // Removes only when all sibling tracks have also finished.
-        if let Some(parent) = self.checkpoints_dir.parent() {
-            let _ = std::fs::remove_dir(parent);
-        }
+        // RecordingSaver owns meeting-level commit and cleanup. A different
+        // source or metadata write can still fail after this track succeeds.
 
         info!("Finalized track: {}", final_audio_path.display());
 
@@ -183,70 +181,12 @@ impl IncrementalAudioSaver {
     /// Merge all checkpoint files into final audio.mp4 using FFmpeg concat
     /// Uses concat demuxer for fast merging without re-encoding
     async fn merge_checkpoints(&self, output: &PathBuf) -> Result<()> {
-        info!("Merging {} checkpoints into final audio file...", self.checkpoint_count);
-
-        // Create concat list file for FFmpeg
-        let list_file = self.checkpoints_dir.join("concat_list.txt");
-        let mut list_content = String::new();
-
-        for i in 0..self.checkpoint_count {
-            let checkpoint_path = self.checkpoints_dir
-                .join(format!("{}_chunk_{:03}.mp4", self.track, i));
-
-            // Verify checkpoint exists
-            if !checkpoint_path.exists() {
-                return Err(anyhow!("Checkpoint file missing: {}", checkpoint_path.display()));
-            }
-
-            // Use absolute path for FFmpeg (required for safe mode)
-            let abs_path = checkpoint_path.canonicalize()?;
-            list_content.push_str(&ffconcat_file_line(&abs_path));
-        }
-
-        std::fs::write(&list_file, list_content)?;
-
-        let ffmpeg_path = find_ffmpeg_path()
-            .ok_or_else(|| anyhow!("FFmpeg not found. Please install FFmpeg to finalize recordings."))?;
-        info!("Using FFmpeg at: {:?}", ffmpeg_path);
-
-        // Run FFmpeg concat command
-        // Using concat demuxer with copy codec for fast merging (no re-encoding)
-        
-        let mut command = std::process::Command::new(ffmpeg_path);
-        
-        command.args(&[
-            "-f", "concat",          // Use concat demuxer
-            "-safe", "0",            // Allow absolute paths
-            "-i", list_file.to_str().unwrap(),
-            "-c", "copy",            // Copy codec - no re-encoding!
-            "-y",                    // Overwrite output file
-            output.to_str().unwrap()
-        ]);
-
-        // Hide console window on Windows to prevent CMD popup during finalization
-        #[cfg(target_os = "windows")]
-        {
-            use std::os::windows::process::CommandExt;
-            const CREATE_NO_WINDOW: u32 = 0x08000000;
-            command.creation_flags(CREATE_NO_WINDOW);
-        }
-
-        let ffmpeg_output = command.output()?;
-
-        if !ffmpeg_output.status.success() {
-            let stderr = String::from_utf8_lossy(&ffmpeg_output.stderr);
-            error!("FFmpeg merge failed: {}", stderr);
-            return Err(anyhow!("FFmpeg concat failed: {}", stderr));
-        }
-
-        // Verify output file was created
-        if !output.exists() {
-            return Err(anyhow!("Merged audio file was not created: {}", output.display()));
-        }
-
-        info!("Successfully merged {} checkpoints → {}",
-              self.checkpoint_count, output.display());
-
+        let directory = self.checkpoints_dir.clone();
+        let output = output.clone();
+        let count = self.checkpoint_count;
+        tokio::task::spawn_blocking(move || recover_checkpoint_track(&directory, &output, Some(count)))
+            .await.map_err(|e| anyhow!("Track finalization task failed: {e}"))?
+            .map_err(anyhow::Error::msg)?;
         Ok(())
     }
 
@@ -278,198 +218,157 @@ fn recover_checkpoint_track(
     output_path: &PathBuf,
     expected_count: Option<u32>,
 ) -> Result<u32, String> {
-    let mut checkpoint_files: Vec<PathBuf> = std::fs::read_dir(checkpoints_dir)
-        .map_err(|e| format!("Failed to read {}: {e}", checkpoints_dir.display()))?
-        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-        .filter(|path| path.extension().and_then(|s| s.to_str()) == Some("mp4"))
-        .collect();
-    checkpoint_files.sort();
-    if checkpoint_files.is_empty() {
-        return Err(format!("No checkpoints found in {}", checkpoints_dir.display()));
-    }
-    if let Some(expected) = expected_count {
-        if checkpoint_files.len() < expected as usize {
-            return Err(format!(
-                "{} has {} checkpoints; expected at least {expected}",
-                checkpoints_dir.display(),
-                checkpoint_files.len()
-            ));
-        }
-        checkpoint_files.truncate(expected as usize);
-    }
-
-    let concat_file = checkpoints_dir.join("concat_list.txt");
-    let mut concat_content = String::new();
-    for path in &checkpoint_files {
-        let path = path
-            .canonicalize()
-            .map_err(|e| format!("Failed to canonicalize {}: {e}", path.display()))?;
-        concat_content.push_str(&ffconcat_file_line(&path));
-    }
-    std::fs::write(&concat_file, concat_content)
-        .map_err(|e| format!("Failed to write {}: {e}", concat_file.display()))?;
-
-    let ffmpeg = find_ffmpeg_path()
-        .ok_or_else(|| "FFmpeg not found. Please install FFmpeg to recover audio.".to_string())?;
-    let temp_output = output_path.with_extension("mp4.recovering");
-    let _ = std::fs::remove_file(&temp_output);
-    let mut command = std::process::Command::new(ffmpeg);
-    command.args([
-        "-f",
-        "concat",
-        "-safe",
-        "0",
-        "-i",
-        concat_file.to_str().ok_or("Invalid checkpoint path")?,
-        "-c",
-        "copy",
-        "-y",
-        temp_output.to_str().ok_or("Invalid output path")?,
-    ]);
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(0x08000000);
-    }
-
-    let output = command
-        .output()
-        .map_err(|e| format!("Failed to run FFmpeg: {e}"))?;
-    if !output.status.success() {
-        let _ = std::fs::remove_file(&temp_output);
-        return Err(format!(
-            "FFmpeg failed for {}: {}",
-            output_path.display(),
-            String::from_utf8_lossy(&output.stderr)
-        ));
-    }
-    if !temp_output.is_file() {
-        return Err(format!("FFmpeg did not create {}", temp_output.display()));
-    }
-    if output_path.exists() {
-        std::fs::remove_file(output_path)
-            .map_err(|e| format!("Failed to replace {}: {e}", output_path.display()))?;
-    }
-    std::fs::rename(&temp_output, output_path)
-        .map_err(|e| format!("Failed to promote {}: {e}", output_path.display()))?;
-    std::fs::write(checkpoints_dir.join(".recovered"), b"ok")
-        .map_err(|e| format!("Failed to mark recovered track: {e}"))?;
-    let _ = std::fs::remove_file(concat_file);
-    Ok(checkpoint_files.len() as u32)
+    let count = super::track_commit::commit_checkpoint_track(checkpoints_dir, output_path, expected_count)?;
+    // Informational only. Cleanup always validates the durable hash proof again.
+    std::fs::write(checkpoints_dir.join(".recovered"), b"track-commit-v1")
+        .map_err(|e| format!("Could not mark committed track: {e}"))?;
+    Ok(count)
 }
 
-#[tauri::command]
-pub async fn recover_audio_from_checkpoints(
-    meeting_folder: String,
-    _sample_rate: u32
-) -> Result<AudioRecoveryStatus, String> {
-    info!("Starting audio recovery for folder: {}", meeting_folder);
-
-    let folder_path = PathBuf::from(&meeting_folder);
-    let checkpoints_root = folder_path.join(".checkpoints");
-    // New format stores each track in its own subfolder. Recover mixed playback
-    // exactly as legacy recovery did; mic/system remain optional diagnostics.
-    let checkpoints_dir = if checkpoints_root.join("audio").is_dir() {
-        checkpoints_root.join("audio")
-    } else {
-        checkpoints_root.clone()
+fn finalized_mixed_audio(folder: &std::path::Path) -> Result<Option<super::track_commit::ValidatedTrack>, String> {
+    let output = folder.join("audio.mp4");
+    if let Some(valid) = super::track_commit::validate_committed_track(None, &output)? { return Ok(Some(valid)); }
+    if !output.is_file() { return Ok(None); }
+    // Compatibility for completed recordings predating per-track proofs. They
+    // may be saved to the library, but are never proof to delete checkpoints.
+    let metadata = match std::fs::read(folder.join("metadata.json")) {
+        Ok(bytes) => serde_json::from_slice::<serde_json::Value>(&bytes).map_err(|e| e.to_string())?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.to_string()),
     };
+    if metadata.get("status").and_then(|v| v.as_str()) != Some("completed")
+        || metadata.get("audio_file").and_then(|v| v.as_str()) != Some("audio.mp4") { return Ok(None); }
+    let duration_seconds = super::track_commit::validate_decodable_audio(&output)?;
+    Ok(Some(super::track_commit::ValidatedTrack { checkpoint_count: 0, duration_seconds }))
+}
 
-    if !checkpoints_dir.exists() {
-        info!("No checkpoints directory found at: {}", checkpoints_dir.display());
-        return Ok(AudioRecoveryStatus {
-            status: "none".to_string(),
-            chunk_count: 0,
-            estimated_duration_seconds: 0.0,
-            audio_file_path: None,
-            message: "No audio checkpoints found".to_string(),
-        });
+pub(crate) fn validated_final_audio_available(folder: &std::path::Path) -> Result<bool, String> {
+    Ok(finalized_mixed_audio(folder)?.is_some())
+}
+
+fn recover_recording_audio(folder: &std::path::Path) -> Result<AudioRecoveryStatus, String> {
+    let root = folder.join(".checkpoints");
+    let mut mixed = None;
+    let mut failures = Vec::new();
+    let mut source_counts = Vec::new();
+    let mut any_inputs = false;
+    // Attempt each track independently even when another output already exists
+    // or conflicts. A failed source is not permission to replace good playback.
+    for track in ["audio", "mic", "system"] {
+        let output = folder.join(format!("{track}.mp4"));
+        let directory = if track == "audio" && !root.join("audio").is_dir() { root.clone() } else { root.join(track) };
+        let files = match super::track_commit::checkpoint_files(&directory) {
+            Ok(files) => files,
+            Err(error) => {
+                failures.push(format!("{track}: {error}"));
+                if track == "audio" { mixed = finalized_mixed_audio(folder).ok().flatten(); }
+                continue;
+            }
+        };
+        if directory.is_dir() {
+            match std::fs::read_dir(&directory) {
+                Ok(entries) => {
+                    if entries.filter_map(Result::ok).any(|entry| entry.path().extension().and_then(|e| e.to_str()) == Some("pending")) {
+                        failures.push(format!("{track}: uncommitted pending audio was retained for review"));
+                    }
+                },
+                Err(error) => failures.push(format!("{track}: could not inspect pending audio: {error}")),
+            }
+        }
+        let result = if !files.is_empty() {
+            any_inputs = true;
+            recover_checkpoint_track(&directory, &output, None)
+                .and_then(|_| super::track_commit::validate_committed_track(Some(&directory), &output))
+        } else if track == "audio" { finalized_mixed_audio(folder) }
+        else { super::track_commit::validate_committed_track(None, &output) };
+        match result {
+            Ok(valid) if track == "audio" => mixed = valid,
+            Ok(Some(valid)) => source_counts.push((track, valid.checkpoint_count)),
+            Ok(None) => {},
+            Err(error) => {
+                failures.push(format!("{track}: {error}"));
+                // A conflicting input must stay untouched, but a previously
+                // committed, byte-validated playback track is still usable.
+                if track == "audio" { mixed = finalized_mixed_audio(folder).ok().flatten(); }
+            },
+        }
     }
-
-    let output_path = folder_path.join("audio.mp4");
-    let chunk_count = match recover_checkpoint_track(&checkpoints_dir, &output_path, None) {
-        Ok(count) => count,
-        Err(error) if error.starts_with("No checkpoints") => {
-            return Ok(AudioRecoveryStatus {
-                status: "none".to_string(),
-                chunk_count: 0,
-                estimated_duration_seconds: 0.0,
-                audio_file_path: None,
-                message: error,
-            });
-        }
-        Err(error) => {
-            error!("Mixed audio recovery failed: {error}");
-            return Ok(AudioRecoveryStatus {
-                status: "failed".to_string(),
-                chunk_count: 0,
-                estimated_duration_seconds: 0.0,
-                audio_file_path: None,
-                message: error,
-            });
-        }
-    };
-
-    let mut source_failures = Vec::new();
-    for track in ["mic", "system"] {
-        let track_dir = checkpoints_root.join(track);
-        if track_dir.is_dir() {
-            if let Err(error) = recover_checkpoint_track(
-                &track_dir,
-                &folder_path.join(format!("{track}.mp4")),
-                Some(chunk_count),
-            ) {
-                warn!("Could not recover {track} track: {error}");
-                source_failures.push(format!("{track}: {error}"));
+    if let Some(valid) = &mixed {
+        for (track, count) in source_counts {
+            if count < valid.checkpoint_count {
+                failures.push(format!("{track}: recovered {count} checkpoints versus {} playback checkpoints; source tail needs review", valid.checkpoint_count));
             }
         }
     }
-
-    let status = if source_failures.is_empty() { "success" } else { "partial" };
-    let message = if source_failures.is_empty() {
-        format!("Successfully recovered {chunk_count} audio chunks and available source tracks")
-    } else {
-        format!("Recovered mixed audio; source-track recovery failed ({})", source_failures.join("; "))
+    let (status, chunk_count, duration, path) = match mixed {
+        Some(valid) => (if failures.is_empty() { "success" } else { "partial" }, valid.checkpoint_count as u32,
+            valid.duration_seconds, Some(folder.join("audio.mp4").to_string_lossy().into_owned())),
+        None => (if failures.is_empty() && !any_inputs { "none" } else { "failed" }, 0, 0.0, None),
     };
-    Ok(AudioRecoveryStatus {
-        status: status.to_string(),
-        chunk_count,
-        estimated_duration_seconds: chunk_count as f64 * 30.0,
-        audio_file_path: Some(output_path.to_string_lossy().into_owned()),
-        message,
+    Ok(AudioRecoveryStatus { status: status.into(), chunk_count, estimated_duration_seconds: duration,
+        audio_file_path: path,
+        message: if failures.is_empty() { if status == "none" { "No validated audio or checkpoints found".into() } else { "Validated recorded audio and available source tracks".into() } }
+            else { format!("Recovery requires review; existing audio and checkpoints were preserved ({})", failures.join("; ")) },
     })
 }
 
-/// Clean up checkpoint files after successful recording or recovery
-/// This command is called by the frontend after successful save to clean up checkpoint files
+#[tauri::command]
+pub async fn recover_audio_from_checkpoints(meeting_folder: String, _sample_rate: u32) -> Result<AudioRecoveryStatus, String> {
+    // Recovery can read finalized tracks too. Share offline admission with
+    // cleanup until the blocking recovery worker has actually drained.
+    let operation = crate::diarization::operation_guard().await;
+    tokio::task::spawn_blocking(move || {
+        let _operation = operation;
+        recover_recording_audio(std::path::Path::new(&meeting_folder))
+    }).await.map_err(|e| e.to_string())?
+}
+
+/// Startup detection includes validated finalized audio, not just checkpoints.
+#[tauri::command]
+pub async fn has_recoverable_audio(meeting_folder: String) -> Result<bool, String> {
+    let operation = crate::diarization::operation_guard().await;
+    tokio::task::spawn_blocking(move || {
+        let _operation = operation;
+        let folder = PathBuf::from(meeting_folder);
+        if finalized_mixed_audio(&folder)?.is_some() { return Ok(true); }
+        let root = folder.join(".checkpoints");
+        let directory = if root.join("audio").is_dir() { root.join("audio") } else { root };
+        Ok(!super::track_commit::checkpoint_files(&directory)?.is_empty())
+    }).await.map_err(|e| e.to_string())?
+}
+
+/// Independent IPC cleanup shares admission with saved-audio readers/deletion.
 #[tauri::command]
 pub async fn cleanup_checkpoints(meeting_folder: String) -> Result<(), String> {
-    info!("Cleaning up checkpoints for folder: {}", meeting_folder);
+    let operation = crate::diarization::operation_guard().await;
+    tokio::task::spawn_blocking(move || {
+        let _operation = operation;
+        cleanup_checkpoint_files(std::path::Path::new(&meeting_folder))
+    }).await.map_err(|e| e.to_string())?
+}
 
-    let folder_path = PathBuf::from(&meeting_folder);
-    let checkpoints_root = folder_path.join(".checkpoints");
+/// Native Stop already owns engine lifecycle while finalizing this recording.
+/// It must not acquire offline here: refinement owns offline before lifecycle.
+/// Unlike independent recovery/IPC, this owner just committed every final track
+/// and metadata; the same proof checks still govern each checkpoint unlink.
+pub(super) async fn cleanup_finalized_checkpoints(meeting_folder: String) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || {
+        cleanup_checkpoint_files(std::path::Path::new(&meeting_folder))
+    }).await.map_err(|e| e.to_string())?
+}
 
-    if checkpoints_root.exists() {
-        if checkpoints_root.join("audio").is_dir() {
-            for track in ["audio", "mic", "system"] {
-                let track_dir = checkpoints_root.join(track);
-                if folder_path.join(format!("{track}.mp4")).is_file()
-                    && track_dir.join(".recovered").is_file()
-                {
-                    std::fs::remove_dir_all(&track_dir)
-                        .map_err(|e| format!("Failed to remove {}: {e}", track_dir.display()))?;
-                }
-            }
-            let _ = std::fs::remove_dir(&checkpoints_root);
-        } else if folder_path.join("audio.mp4").is_file() {
-            std::fs::remove_dir_all(&checkpoints_root)
-                .map_err(|e| format!("Failed to remove checkpoints directory: {e}"))?;
+fn cleanup_checkpoint_files(folder: &std::path::Path) -> Result<(), String> {
+    let root = folder.join(".checkpoints");
+    for track in ["audio", "mic", "system"] {
+        let directory = if track == "audio" && !root.join("audio").is_dir() { root.clone() } else { root.join(track) };
+        if !directory.is_dir() { continue; }
+        match super::track_commit::validate_committed_track(Some(&directory), &folder.join(format!("{track}.mp4"))) {
+            Ok(Some(_)) => super::track_commit::cleanup_checkpoint_track(&directory, &folder.join(format!("{track}.mp4")))?,
+            Ok(None) => {}, // Unknown/legacy audio is never authority to delete input.
+            Err(error) => warn!("Keeping checkpoint track {}: {}", track, error),
         }
-        info!("Cleaned checkpoints for successfully recovered tracks");
-    } else {
-        info!("No checkpoints directory to clean up");
     }
-
+    let _ = std::fs::remove_dir(&root);
     Ok(())
 }
 
@@ -545,8 +444,8 @@ mod tests {
         let final_path = saver.finalize().await.unwrap();
         assert!(final_path.exists());
 
-        // Verify checkpoints directory deleted
-        assert!(!meeting_folder.join(".checkpoints").exists());
+        // A track finalization alone must not erase crash-recovery evidence.
+        assert!(meeting_folder.join(".checkpoints/audio").exists());
     }
 
     #[tokio::test]
@@ -565,5 +464,210 @@ mod tests {
         let result = saver.finalize().await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("No audio checkpoints"));
+    }
+}
+
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+    use super::super::recording_state::DeviceType;
+
+    fn chunk() -> AudioChunk {
+        AudioChunk { data: vec![0.2; 48_000], sample_rate: 48_000,
+            timestamp: 1.0, chunk_id: 0, device_type: DeviceType::Microphone }
+    }
+
+    #[test]
+    fn recovers_committed_checkpoint_and_ignores_incomplete_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut saver = IncrementalAudioSaver::new_track(dir.path().to_path_buf(), 48_000, "mic").unwrap();
+        saver.add_chunk(chunk()).unwrap();
+        saver.save_checkpoint().unwrap();
+        std::fs::write(saver.checkpoints_dir.join("mic_chunk_001.pending"), b"incomplete").unwrap();
+        let output = dir.path().join("mic.mp4");
+        assert_eq!(recover_checkpoint_track(&saver.checkpoints_dir, &output, None).unwrap(), 1);
+        assert!(output.metadata().unwrap().len() > 0);
+        assert!(saver.checkpoints_dir.join("mic_chunk_000.mp4").exists(), "recovery retains evidence until explicit cleanup");
+    }
+
+    #[test]
+    fn recovery_never_replaces_existing_user_audio() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut saver = IncrementalAudioSaver::new(dir.path().to_path_buf(), 48_000).unwrap();
+        saver.add_chunk(chunk()).unwrap();
+        saver.save_checkpoint().unwrap();
+        let output = dir.path().join("audio.mp4");
+        std::fs::write(&output, b"existing user audio").unwrap();
+        assert!(recover_checkpoint_track(&saver.checkpoints_dir, &output, None).unwrap_err().contains("not replaced"));
+        assert_eq!(std::fs::read(output).unwrap(), b"existing user audio");
+    }
+
+    #[test]
+    fn checkpoint_failure_keeps_buffer_and_does_not_commit_partial_mp4() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut saver = IncrementalAudioSaver::new(dir.path().to_path_buf(), 48_000).unwrap();
+        saver.checkpoint_interval_samples = 1;
+        // Deterministic storage failure, even under an elevated test account.
+        std::fs::remove_dir(&saver.checkpoints_dir).unwrap();
+        std::fs::write(&saver.checkpoints_dir, b"not a directory").unwrap();
+        assert!(saver.add_chunk(chunk()).is_err());
+        assert_eq!(saver.checkpoint_count, 0);
+        assert_eq!(saver.checkpoint_buffer[0].data.len(), 48_000);
+    }
+}
+
+#[cfg(test)]
+mod issue9_retry_tests {
+    use super::*;
+    use super::super::recording_state::DeviceType;
+
+    fn checkpoint(folder: &std::path::Path, track: &str) -> IncrementalAudioSaver {
+        let mut saver = IncrementalAudioSaver::new_track(folder.to_path_buf(), 48_000, track).unwrap();
+        saver.add_chunk(AudioChunk { data: vec![0.2; 48_000], sample_rate: 48_000, timestamp: 1.0,
+            chunk_id: 0, device_type: DeviceType::Mixed }).unwrap();
+        saver.save_checkpoint().unwrap();
+        saver.checkpoint_buffer.clear();
+        saver
+    }
+
+    #[tokio::test]
+    async fn retry_after_mixed_promotion_and_source_failure_resumes_each_track() {
+        let dir = tempfile::tempdir().unwrap();
+        let _mixed = checkpoint(dir.path(), "audio");
+        let mic = checkpoint(dir.path(), "mic");
+        let _system = checkpoint(dir.path(), "system");
+        let input = mic.checkpoints_dir.join("mic_chunk_000.mp4");
+        let bytes = std::fs::read(&input).unwrap();
+        std::fs::write(&input, b"interrupted source checkpoint").unwrap();
+        let first = recover_audio_from_checkpoints(dir.path().to_string_lossy().into_owned(), 48_000).await.unwrap();
+        assert_eq!(first.status, "partial");
+        let mixed = std::fs::read(dir.path().join("audio.mp4")).unwrap();
+        std::fs::write(input, bytes).unwrap();
+        let retry = recover_audio_from_checkpoints(dir.path().to_string_lossy().into_owned(), 48_000).await.unwrap();
+        assert_eq!(retry.status, "success", "retry must not stop at already promoted mixed audio: {}", retry.message);
+        assert_eq!(std::fs::read(dir.path().join("audio.mp4")).unwrap(), mixed);
+        assert!(dir.path().join("mic.mp4").is_file());
+        assert!(dir.path().join("system.mp4").is_file());
+    }
+
+    #[tokio::test]
+    async fn normal_partial_finalize_then_recovery_and_repeated_db_retry_are_safe() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mixed = checkpoint(dir.path(), "audio");
+        let _mic = checkpoint(dir.path(), "mic");
+        mixed.finalize().await.unwrap(); // Normal Stop promoted playback before another track/DB failed.
+        let bytes = std::fs::read(dir.path().join("audio.mp4")).unwrap();
+        for _ in 0..2 {
+            let result = recover_audio_from_checkpoints(dir.path().to_string_lossy().into_owned(), 48_000).await.unwrap();
+            assert_eq!(result.status, "success", "{}", result.message);
+        }
+        assert_eq!(std::fs::read(dir.path().join("audio.mp4")).unwrap(), bytes);
+        assert!(dir.path().join(".checkpoints/audio").is_dir());
+    }
+
+    #[tokio::test]
+    async fn interruption_after_promotion_before_cleanup_marker_is_resumable() {
+        let dir = tempfile::tempdir().unwrap();
+        let mixed = checkpoint(dir.path(), "audio");
+        recover_checkpoint_track(&mixed.checkpoints_dir, &dir.path().join("audio.mp4"), None).unwrap();
+        std::fs::remove_file(mixed.checkpoints_dir.join(".recovered")).unwrap();
+        let retry = recover_audio_from_checkpoints(dir.path().to_string_lossy().into_owned(), 48_000).await.unwrap();
+        assert_eq!(retry.status, "success", "{}", retry.message);
+    }
+}
+
+
+#[cfg(test)]
+mod issue9_finalized_tests {
+    use super::*;
+    #[tokio::test]
+    async fn finalized_audio_without_checkpoints_is_available_after_db_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut saver = IncrementalAudioSaver::new(dir.path().to_path_buf(), 48_000).unwrap();
+        saver.add_chunk(super::super::recording_state::AudioChunk { data: vec![0.2; 48_000], sample_rate: 48_000, timestamp: 1.0,
+            chunk_id: 0, device_type: super::super::recording_state::DeviceType::Mixed }).unwrap();
+        saver.finalize().await.unwrap();
+        let folder = dir.path().to_string_lossy().into_owned();
+        cleanup_checkpoints(folder.clone()).await.unwrap();
+        assert!(!dir.path().join(".checkpoints").exists());
+        assert!(has_recoverable_audio(folder.clone()).await.unwrap());
+        let result = recover_audio_from_checkpoints(folder, 48_000).await.unwrap();
+        assert_eq!(result.status, "success");
+        assert!(result.audio_file_path.is_some());
+    }
+    #[tokio::test]
+    async fn legacy_completed_audio_requires_metadata_and_a_successful_decode() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("audio.mp4");
+        let samples = vec![0.2f32; 48_000];
+        encode_single_audio(bytemuck::cast_slice(&samples), 48_000, 1, &output).unwrap();
+        let folder = dir.path().to_string_lossy().into_owned();
+        assert!(!has_recoverable_audio(folder.clone()).await.unwrap()); // Unknown file alone is not proof.
+        std::fs::write(dir.path().join("metadata.json"), br#"{"status":"completed","audio_file":"audio.mp4"}"#).unwrap();
+        assert!(has_recoverable_audio(folder.clone()).await.unwrap());
+        std::fs::write(output, b"not audio").unwrap();
+        assert!(has_recoverable_audio(folder).await.is_err());
+    }
+}
+
+
+#[cfg(test)]
+mod issue9_independent_track_tests {
+    use super::*;
+    #[tokio::test]
+    async fn valid_playback_survives_changed_checkpoint_without_authorizing_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let samples = vec![0.2f32; 48_000];
+        let input_dir = dir.path().join(".checkpoints/audio");
+        std::fs::create_dir_all(&input_dir).unwrap();
+        let input = input_dir.join("audio_chunk_000.mp4");
+        encode_single_audio(bytemuck::cast_slice(&samples), 48_000, 1, &input).unwrap();
+        let folder = dir.path().to_string_lossy().into_owned();
+        assert_eq!(recover_audio_from_checkpoints(folder.clone(), 48_000).await.unwrap().status, "success");
+        std::fs::write(&input, b"modified checkpoint").unwrap();
+        let result = recover_audio_from_checkpoints(folder.clone(), 48_000).await.unwrap();
+        assert_eq!(result.status, "partial");
+        assert!(result.audio_file_path.is_some());
+        cleanup_checkpoints(folder).await.unwrap();
+        assert_eq!(std::fs::read(input).unwrap(), b"modified checkpoint");
+    }
+    #[tokio::test]
+    async fn fewer_source_checkpoints_are_recovered_but_reported_as_partial_not_discarded() {
+        let dir = tempfile::tempdir().unwrap();
+        let samples = vec![0.2f32; 48_000];
+        for track in ["audio", "mic"] {
+            let inputs = dir.path().join(".checkpoints").join(track);
+            std::fs::create_dir_all(&inputs).unwrap();
+            let first = inputs.join(format!("{track}_chunk_000.mp4"));
+            encode_single_audio(bytemuck::cast_slice(&samples), 48_000, 1, &first).unwrap();
+            if track == "audio" { std::fs::copy(&first, inputs.join("audio_chunk_001.mp4")).unwrap(); }
+        }
+        let result = recover_audio_from_checkpoints(dir.path().to_string_lossy().into_owned(), 48_000).await.unwrap();
+        assert_eq!(result.status, "partial");
+        assert!(result.audio_file_path.is_some());
+        assert!(dir.path().join("mic.mp4").exists());
+        assert!(dir.path().join(".checkpoints/mic/mic_chunk_000.mp4").exists());
+    }
+}
+
+
+#[cfg(test)]
+mod issue9_pending_tests {
+    use super::*;
+    #[tokio::test]
+    async fn pending_tail_stays_visible_as_partial_and_survives_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let inputs = dir.path().join(".checkpoints/audio");
+        std::fs::create_dir_all(&inputs).unwrap();
+        let samples = vec![0.2f32; 48_000];
+        encode_single_audio(bytemuck::cast_slice(&samples), 48_000, 1, &inputs.join("audio_chunk_000.mp4")).unwrap();
+        std::fs::write(inputs.join("audio_chunk_001.pending"), b"uncommitted tail").unwrap();
+        let folder = dir.path().to_string_lossy().into_owned();
+        let result = recover_audio_from_checkpoints(folder.clone(), 48_000).await.unwrap();
+        assert_eq!(result.status, "partial");
+        assert!(result.audio_file_path.is_some());
+        cleanup_checkpoints(folder).await.unwrap();
+        assert_eq!(std::fs::read(inputs.join("audio_chunk_001.pending")).unwrap(), b"uncommitted tail");
     }
 }

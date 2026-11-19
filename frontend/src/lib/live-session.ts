@@ -1,8 +1,7 @@
 /**
- * What the app (not Rust) owns about the recording in progress: the title
- * shown in the header, and notes typed during the call. Rust keeps the name
- * the recording started with, so changes made mid-call live here until the
- * meeting is saved, then land on the saved meeting.
+ * Frontend live title ownership. New Notes use notes-store.ts and native
+ * recording-folder identity; the legacy unassociated draft is retained only
+ * for manual copying, never automatically attached or cleared.
  */
 import { defaultMeetingTitle, finalizeDefaultTitle, groupMeetingTitle } from '@/lib/meeting-titles';
 
@@ -81,14 +80,12 @@ export function writeLiveNotes(notes: { markdown: string; json: unknown[] | null
   write(local(), NOTES_KEY, notes ? { ...notes, updatedAt: Date.now() } : null);
 }
 
-/** A new recording starts with its automatic title and an empty page. */
+/** A new recording starts with its automatic title. Notes identity is native. */
 export function beginLiveSession(title: string, startedAt: number) {
-  writeLiveNotes(null);
   writeLiveTitle({ title, manual: false, startedAt });
 }
 
 export function endLiveSession() {
-  writeLiveNotes(null);
   writeLiveTitle(null);
 }
 
