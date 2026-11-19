@@ -11,6 +11,12 @@ let fail = false;
 let readFailure = false;
 let readGate: Promise<void> | undefined;
 let readRelease: (() => void) | undefined;
+let replyGate: Promise<void> | undefined;
+type Selection = typeof prefs;
+const subscribers = new Set<(event: { payload: Selection }) => void>();
+function publish(value: Selection) {
+  subscribers.forEach(handler => handler({ payload: value }));
+}
 const calls: any[] = [];
 mock.module('@tauri-apps/api/core', () => ({ invoke: async (name: string, args: any) => {
   calls.push({ name, args });
@@ -19,11 +25,18 @@ mock.module('@tauri-apps/api/core', () => ({ invoke: async (name: string, args: 
     await gate;
     if (fail) throw new Error('Synthetic disk write failure');
     prefs = { ...prefs, [args.source === 'system' ? 'system_audio_enabled' : 'microphone_enabled']: args.enabled };
-    return { ...prefs };
+    const result = { ...prefs };
+    await replyGate;
+    return result;
   }
   throw new Error(name);
 } }));
-mock.module('@tauri-apps/api/event', () => ({ listen: async () => () => {} }));
+mock.module('@tauri-apps/api/event', () => ({
+  listen: async (_event: string, handler: (event: { payload: Selection }) => void) => {
+    subscribers.add(handler);
+    return () => subscribers.delete(handler);
+  },
+}));
 mock.module('sonner', () => ({ toast: { error: () => {} } }));
 const { useRecordingSources } = await import('../../src/hooks/useRecordingSources');
 const { flushRecordingSources } = await import('../../src/lib/recording-sources');
@@ -79,9 +92,33 @@ test('temporary initial read error can be retried in-place and late read cannot 
     expect(current!.error).toBeNull();
     readGate = new Promise<void>(resolve => { readRelease = resolve; });
     await act(async () => { void current!.retry(); await flush(); });
-    await act(async () => { bus.dispatchEvent(new CustomEvent('meetily-recording-sources-changed', { detail: { microphone_enabled: true, system_audio_enabled: false } })); });
+    readGate = undefined; // Only the first read is held.
+    prefs = { microphone_enabled: true, system_audio_enabled: false };
+    await act(async () => { publish(prefs); await flush(); });
     await act(async () => { readRelease!(); await flush(); });
     expect(current!.sources?.system_audio_enabled).toBe(false);
     expect(current!.error).toBeNull();
   } finally { readFailure = false; readGate = undefined; act(() => view.unmount()); }
+});
+
+test.each([true, false])('a delayed reply or event cannot reverse the other window’s system audio choice (%s)', async enabled => {
+  prefs = { microphone_enabled: true, system_audio_enabled: enabled };
+  let view!: ReturnType<typeof create>;
+  let acknowledge!: () => void;
+  replyGate = new Promise<void>(resolve => { acknowledge = resolve; });
+  await act(async () => { view = create(<Probe />); await flush(); });
+  try {
+    await act(async () => { current.setEnabled('system', !enabled); await flush(); });
+    const firstCommit = { ...prefs };
+    expect(firstCommit.system_audio_enabled).toBe(!enabled);
+    await act(async () => { publish(firstCommit); await flush(); });
+    // B commits after A. A's setter reply is still in transit.
+    prefs = { ...prefs, system_audio_enabled: enabled };
+    await act(async () => { publish(prefs); await flush(); });
+    expect(current.sources).toEqual(prefs);
+    await act(async () => { acknowledge(); await flushRecordingSources(); await flush(); });
+    expect(current.sources).toEqual(prefs);
+    await act(async () => { publish(firstCommit); await flush(); });
+    expect(current.sources).toEqual(prefs);
+  } finally { acknowledge(); replyGate = undefined; act(() => view.unmount()); }
 });

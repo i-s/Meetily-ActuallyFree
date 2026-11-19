@@ -104,3 +104,17 @@ Minibar initializes both inclusion flags to false until its first native snapsho
 - Expected negative fixtures print injected storage/capture/transport errors; no failing tests remain.
 
 The original manual milestone above is still **NOT RUN**, now additionally covering physical chosen-app preview teardown, Windows duplex-device reconnect, macOS shared-preview applicability, contextual retry and minibar source truth. No physical Windows/Mac or real model inference result is claimed. This correction is author-verified, not a new independent review.
+
+## Cross-window source updates (R2)
+
+The native setter serializes durable writes. Delivery of a command reply to one
+window can lag behind another window's later write and notification. The
+record card treats both notifications and successful setter replies as reasons
+to reread the current preferences. Only the latest read for this mount can
+update the icons. Source controls and the card’s Start action wait for that
+read, with the existing Retry control available on failure.
+
+The mounted hook regression holds A's reply after its write, commits the
+opposite choice in B, then delivers A's old reply and an old notification.
+It covers both final values of system audio. Native persistence and capture
+admission use the R1 implementation.

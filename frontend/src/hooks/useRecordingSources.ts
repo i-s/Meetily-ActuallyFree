@@ -15,40 +15,42 @@ export function useRecordingSources() {
   const mounted = useRef(false);
   const revision = useRef(0);
 
-  const accept = useCallback((value: unknown) => {
-    const next = recordingSources(value);
-    revision.current++;
-    if (mounted.current) { setSources(next); setError(null); }
-  }, []);
-
   const retry = useCallback(async () => {
     const before = ++revision.current;
+    setSources(null);
     try {
       const value = await invoke('get_recording_preferences');
-      if (mounted.current && before === revision.current) accept(value);
+      if (mounted.current && before === revision.current) {
+        setSources(recordingSources(value));
+        setError(null);
+      }
     } catch (error) {
       if (mounted.current && before === revision.current) setError(String(error));
     }
-  }, [accept]);
+  }, []);
 
   useEffect(() => {
     mounted.current = true;
-    const local = (event: Event) => accept((event as CustomEvent).detail);
-    window.addEventListener(CHANGED, local);
-    const unlisten = listen<RecordingSources>('recording-sources-changed', event => accept(event.payload));
-    void retry();
+    let active = true;
+    // Replies and events can arrive out of commit order across windows.
+    // Both invalidate the view; only a fresh preference read supplies its state.
+    const refresh = () => { if (active) void retry(); };
+    window.addEventListener(CHANGED, refresh);
+    const unlisten = listen('recording-sources-changed', refresh);
+    void unlisten.then(refresh, refresh);
     return () => {
       mounted.current = false;
+      active = false;
       revision.current++;
-      window.removeEventListener(CHANGED, local);
+      window.removeEventListener(CHANGED, refresh);
       void unlisten.then(stop => stop()).catch(console.error);
     };
-  }, [accept, retry]);
+  }, [retry]);
 
   const setEnabled = useCallback((source: 'microphone' | 'system', enabled: boolean) => {
     setSaving(true);
-    void setRecordingSourceEnabled(source, enabled).then(next => {
-      window.dispatchEvent(new CustomEvent(CHANGED, { detail: next }));
+    void setRecordingSourceEnabled(source, enabled).then(() => {
+      window.dispatchEvent(new Event(CHANGED));
     }).catch(error => {
       if (mounted.current) toast.error('Could not save recording sources', { description: String(error) });
     }).finally(() => { if (mounted.current) setSaving(false); });
