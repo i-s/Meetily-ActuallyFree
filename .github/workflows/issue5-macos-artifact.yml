@@ -18,9 +18,9 @@ concurrency:
 env:
   # Candidate source metadata; update SOURCE_SHA after the authorized remote import
   # and keep ORIGINAL_LOCAL_SHA equal to the local approved commit below.
-  SOURCE_SHA: e37be614bcf286c0c401fb5edf64efa93282be03
-  SOURCE_TREE: 9aeca6832be9b4d267dcb137b1ddfc5b3a7e1034
-  ORIGINAL_LOCAL_SHA: e37be614bcf286c0c401fb5edf64efa93282be03
+  SOURCE_SHA: ecdfad7c2780b8c23e69bdabadaa075e3a5f88e1
+  SOURCE_TREE: 4d152ee05540f80dbbcf75cbba17a7fc19d8ab7c
+  ORIGINAL_LOCAL_SHA: 7f003048e3739fcafbdcb51271a7f322f50c57eb
   ACCEPTED_BASE_SHA: 50f6e973a637f8da9239df058d7df6d0bece2730
   MACOSX_DEPLOYMENT_TARGET: '14.2'
   PNPM_CONFIG_ENABLE_GLOBAL_VIRTUAL_STORE: 'false'
