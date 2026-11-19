@@ -95,6 +95,7 @@ pub fn get_discord_automation_status()->Status{STATUS.lock().unwrap().clone().un
 struct Manager;
 impl Manager {
  fn is_paused(&self)->bool{false} fn get_state(&self)->&Self{self}
+ fn active_capture_sources(&self)->Option<(bool,bool)>{Some((true,true))}
  fn is_microphone_muted(&self)->bool{false} fn is_system_audio_muted(&self)->bool{false}
  fn is_active(&self)->bool{true} fn get_recording_duration(&self)->Option<f64>{Some(1.)}
  fn get_active_recording_duration(&self)->Option<f64>{Some(1.)}
@@ -159,6 +160,7 @@ pub mod post_call {{
  pub mod worker {{pub static PRIORITY:std::sync::LazyLock<std::sync::Arc<super::priority::Priority>>=std::sync::LazyLock::new(||std::sync::Arc::new(super::priority::Priority::default()));}}
 }}
 pub mod audio {{
+ #[path="{AUDIO}/recording_source_admission.rs"] pub mod recording_source_admission;
  #[path="{work}/src/recording_ownership.rs"] pub mod recording_ownership;
  #[path="{work}/src/recording_start_authority.rs"] pub mod recording_start_authority;
  #[path="{AUDIO}/recording_start_sources.rs"] pub mod recording_start_sources;

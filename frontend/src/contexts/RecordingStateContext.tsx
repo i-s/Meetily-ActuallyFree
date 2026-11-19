@@ -26,7 +26,8 @@ export enum RecordingStatus {
 }
 
 interface RecordingState {
-  inPerson: boolean;
+  microphoneCaptured: boolean;
+  systemAudioCaptured: boolean;
   isRecording: boolean;           // Is a recording session active
   isPaused: boolean;              // Is the recording paused
   isMicrophoneMuted: boolean;     // Is only the microphone silenced
@@ -62,7 +63,8 @@ export const useRecordingState = () => {
 
 export function RecordingStateProvider({ children }: { children: React.ReactNode }) {
   const [state, setState] = useState<RecordingState>({
-    inPerson: false,
+    microphoneCaptured: false,
+    systemAudioCaptured: false,
     isRecording: false,
     isPaused: false,
     isMicrophoneMuted: false,
@@ -106,7 +108,8 @@ export function RecordingStateProvider({ children }: { children: React.ReactNode
           : backendState.is_recording && ![RecordingStatus.STOPPING, RecordingStatus.PROCESSING_TRANSCRIPTS, RecordingStatus.SAVING].includes(prev.status)
             ? RecordingStatus.RECORDING
             : !backendState.is_recording && prev.status === RecordingStatus.RECORDING ? RecordingStatus.IDLE : prev.status,
-        inPerson: backendState.in_person ?? false,
+        microphoneCaptured: backendState.microphone_captured ?? false,
+        systemAudioCaptured: backendState.system_audio_captured ?? false,
         isRecording: backendState.is_recording,
         isPaused: backendState.is_paused,
         isMicrophoneMuted: backendState.is_microphone_muted,
@@ -197,12 +200,17 @@ export function RecordingStateProvider({ children }: { children: React.ReactNode
             ...prev,
             isRecording: true,
             isPaused: false,
-            isMicrophoneMuted: false,
-            isSystemAudioMuted: false,
+            microphoneCaptured: false,
+            systemAudioCaptured: false,
+            isMicrophoneMuted: true,
+            isSystemAudioMuted: true,
             isActive: true,
             status: RecordingStatus.RECORDING,  // NEW: Set status to RECORDING
             statusMessage: undefined,
           }));
+          // Inclusion/mute comes from native capture, never from an unmute-all
+          // event default. Refresh immediately rather than waiting for polling.
+          void syncWithBackend();
           startPolling();
         });
         register(unlistenStarted);
@@ -228,6 +236,8 @@ export function RecordingStateProvider({ children }: { children: React.ReactNode
               status: newStatus,
               statusMessage: newStatus === RecordingStatus.STOPPING ? 'Stopping recording...' : prev.statusMessage,
               isRecording: false,
+              microphoneCaptured: false,
+              systemAudioCaptured: false,
               isPaused: false,
               isMicrophoneMuted: false,
               isSystemAudioMuted: false,

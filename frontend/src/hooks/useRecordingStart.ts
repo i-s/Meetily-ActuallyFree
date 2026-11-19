@@ -6,6 +6,7 @@ import { useSidebar } from '@/components/Sidebar/SidebarProvider';
 import { useConfig } from '@/contexts/ConfigContext';
 import { useRecordingState, RecordingStatus } from '@/contexts/RecordingStateContext';
 import { recordingService } from '@/services/recordingService';
+import { flushRecordingSources } from '@/lib/recording-sources';
 import { readPendingGroup } from '@/lib/groups';
 import { automaticTitle, beginLiveSession } from '@/lib/live-session';
 import { START_RECORDING_EVENT, readRecordingLaunchIntent, takeRecordingLaunchIntent, requestRecordingStop, type RecordingLaunchIntent } from '@/lib/recording-launch';
@@ -239,6 +240,8 @@ export function useRecordingStart(
     const current = () => mountedRef.current && (!call || (loadLabsPreferences().meetingAutomation && reservationCurrent(call, 'inflight')));
     try {
       if (!current()) return false;
+      await flushRecordingSources();
+      if (!current()) return false;
       setStatus(RecordingStatus.STARTING, 'Preparing transcription model…');
       const sttReady = await prefetchSttModel(call ?? undefined);
       if (!current()) return false;
@@ -252,6 +255,9 @@ export function useRecordingStart(
       const startedAt = Date.now();
       const group = readPendingGroup();
       const title = automaticTitle(new Date(startedAt), group?.name, meetings.map(meeting => meeting.title));
+      // Model preparation may outlive a source write queued by another control.
+      await flushRecordingSources();
+      if (!current()) return false;
       let lease: RecordingLease | void;
       if (call) {
         const capability = await recordingService.getRecordingStartCapability();

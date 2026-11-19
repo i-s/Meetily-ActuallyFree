@@ -41,7 +41,7 @@ pub fn validate_sources(in_person: bool, per_app: bool, targets: usize, system_a
         validate_app_count(cfg!(target_os = "macos"), targets)?;
     }
     if !in_person && !per_app && !system_available {
-        return Err("System audio is unavailable. Connect an output device or explicitly choose In-person meeting in Recording settings.");
+        return Err("System audio is unavailable. Connect an output device or enable only the microphone before recording.");
     }
     Ok(())
 }
@@ -117,7 +117,7 @@ mod selection_tests {
 /// call. Reject visibly; never broaden capture or rewrite user preferences.
 pub fn validate_zoom_sources(in_person: bool, per_app: bool, executables: &[&str]) -> Result<(), &'static str> {
     if in_person {
-        return Err("Zoom automation cannot use In-person microphone-only mode. Choose call capture in Recording settings.");
+        return Err("Zoom automation requires explicitly enabled computer audio. Enable it before recording.");
     }
     if per_app && (executables.len() != 1 || executables[0] != "zoom.us") {
         return Err("Zoom automation requires Zoom (zoom.us) as the one selected target application, or explicit all-system capture. Recording source preferences were not changed.");

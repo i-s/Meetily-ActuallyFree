@@ -388,7 +388,7 @@ export default function RootLayout({
 
         // In-app prompt with a one-click start action.
         toast(`${app} meeting detected`, {
-          description: 'Capture mic + system audio in Meetily.',
+          description: 'Start with your saved audio sources in Meetily.',
           duration: 20000,
           action: {
             label: 'Start recording',

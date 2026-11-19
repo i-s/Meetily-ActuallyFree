@@ -27,7 +27,7 @@ pub fn validate_sources(source: &str, in_person: bool, per_app: bool, executable
     match source {
         "zoom" => super::recording_mode::validate_zoom_sources(in_person, per_app, executables),
         "discord" => {
-            if in_person { return Err("Automatic Discord recording cannot use In-person room mode"); }
+            if in_person { return Err("Automatic Discord recording requires explicitly enabled computer audio"); }
             if per_app && (executables.len() != 1 || !executables[0].eq_ignore_ascii_case("Discord")) {
                 return Err("Automatic Discord recording requires Discord as the single selected app or explicit global capture");
             }

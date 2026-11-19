@@ -1,7 +1,7 @@
 //! Lightweight pre-recording level meters (mic + system/loopback).
 //! Used by onboarding audio test and DeviceSelection meters.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -29,121 +29,119 @@ pub struct AudioLevelUpdate {
 }
 
 static IS_MONITORING: AtomicBool = AtomicBool::new(false);
-
+static GENERATION: AtomicU64 = AtomicU64::new(0);
+static SESSION: tokio::sync::Mutex<Option<MonitorSession>> = tokio::sync::Mutex::const_new(None);
+struct MonitorSession {
+    running: Arc<AtomicBool>,
+    thread: thread::JoinHandle<()>,
+}
 /// Latest levels keyed by device name (shared with cpal callbacks).
 type LevelMap = Arc<Mutex<std::collections::HashMap<String, AudioLevelData>>>;
 
-/// Start real level monitoring for the given device names.
-/// Empty list → default mic (input) + default output (system loopback on WASAPI).
+// Awaited acknowledgement means the old thread has dropped its streams, not
+// merely that the WebView stopped rendering its meter. Never block Tokio on join.
+async fn stop_session(session: &mut Option<MonitorSession>) -> Result<()> {
+    if let Some(old) = session.take() {
+        old.running.store(false, Ordering::SeqCst);
+        tokio::task::spawn_blocking(move || old.thread.join())
+            .await.map_err(|e| anyhow!("Level monitor shutdown: {e}"))?
+            .map_err(|_| anyhow!("Level monitor thread panicked"))?;
+    }
+    IS_MONITORING.store(false, Ordering::SeqCst);
+    Ok(())
+}
+
+/// CPAL endpoint preview is never a selected-app preview, on any platform.
+/// Serialize policy read and final stream-open acknowledgement against changes
+/// to capture preferences. A queued older request cannot revive cancelled audio.
 pub async fn start_monitoring<R: Runtime>(
     app_handle: AppHandle<R>,
     mut device_names: Vec<String>,
+    device_type: Option<String>,
 ) -> Result<()> {
-    stop_monitoring().await?;
-    tokio::time::sleep(Duration::from_millis(80)).await;
-
-    if device_names.is_empty() {
-        device_names = default_monitor_devices();
+    let generation = GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+    if device_type.as_deref().is_some_and(|kind| kind != "input" && kind != "output") {
+        return Err(anyhow!("Unknown level-monitor source"));
     }
-    if device_names.is_empty() {
-        return Err(anyhow!("No audio devices available to monitor"));
+    let _preferences = super::recording_preferences::PREFERENCES_WRITE.lock().await;
+    let prefs = match super::recording_preferences::load_recording_preferences_locked(&app_handle).await {
+        Ok(prefs) => prefs,
+        Err(error) => {
+            stop_session(&mut *SESSION.lock().await).await?;
+            return Err(error);
+        }
+    };
+    let mut session = SESSION.lock().await;
+    if generation != GENERATION.load(Ordering::SeqCst) { return Ok(()); }
+    stop_session(&mut session).await?;
+    let input = device_type.as_deref() != Some("output");
+    let output = device_type.as_deref() != Some("input");
+    // Explicit single-source record-card previews obey source inclusion. Legacy
+    // onboarding dual requests fail closed if either requested source is excluded.
+    if (output && (prefs.per_app_recording_enabled || !prefs.sources.system_audio_enabled))
+        || (input && !prefs.sources.microphone_enabled) {
+        return Ok(());
     }
-
-    info!("Starting real audio level monitoring for: {:?}", device_names);
-    IS_MONITORING.store(true, Ordering::SeqCst);
-
+    if device_names.is_empty() { device_names = default_monitor_devices(device_type.as_deref()); }
+    if device_names.is_empty() { return Err(anyhow!("No audio devices available to monitor")); }
+    if generation != GENERATION.load(Ordering::SeqCst) { return Ok(()); }
     let levels: LevelMap = Arc::new(Mutex::new(std::collections::HashMap::new()));
-    let levels_for_emit = levels.clone();
     let running = Arc::new(AtomicBool::new(true));
-    let running_flag = running.clone();
-
-    // Build streams on a dedicated thread (cpal streams are !Send on some hosts).
-    let names = device_names.clone();
-    let stream_thread = thread::Builder::new()
-        .name("af-level-monitor".into())
-        .spawn(move || {
-            let mut _streams: Vec<cpal::Stream> = Vec::new();
-
-            for name in &names {
-                match open_level_stream(name, levels.clone()) {
-                    Ok(stream) => {
-                        if let Err(e) = stream.play() {
-                            warn!("Failed to play level stream for '{}': {}", name, e);
-                        } else {
-                            info!("Level stream playing: {}", name);
-                            _streams.push(stream);
-                        }
+    let thread_running = running.clone();
+    let thread_levels = levels.clone();
+    let (ready, opened) = tokio::sync::oneshot::channel();
+    let handle = thread::Builder::new().name("af-level-monitor".into()).spawn(move || {
+        let mut streams = Vec::new();
+        for name in &device_names {
+            if !thread_running.load(Ordering::SeqCst) || generation != GENERATION.load(Ordering::SeqCst) { break; }
+            match open_level_stream(name, thread_levels.clone(), device_type.as_deref()) {
+                Ok(stream) => {
+                    if generation == GENERATION.load(Ordering::SeqCst) && thread_running.load(Ordering::SeqCst) {
+                        if let Err(error) = stream.play() { warn!("Level preview: {error}"); }
+                        else { streams.push(stream); }
                     }
-                    Err(e) => warn!("Could not open level stream for '{}': {}", name, e),
                 }
-            }
-
-            if _streams.is_empty() {
-                error!("No level streams started");
-                running_flag.store(false, Ordering::SeqCst);
-                IS_MONITORING.store(false, Ordering::SeqCst);
-                return;
-            }
-
-            while IS_MONITORING.load(Ordering::SeqCst) {
-                thread::sleep(Duration::from_millis(50));
-            }
-
-            for s in _streams {
-                let _ = s.pause();
-                drop(s);
-            }
-            running_flag.store(false, Ordering::SeqCst);
-            info!("Level monitor streams stopped");
-        })
-        .map_err(|e| anyhow!("Failed to spawn level monitor thread: {}", e))?;
-
-    // Detach stream thread lifetime from the emit loop (join would block the runtime).
-    std::mem::forget(stream_thread);
-
-    // Emit aggregated levels to the UI ~12 Hz
-    let app = app_handle.clone();
-    tokio::spawn(async move {
-        while IS_MONITORING.load(Ordering::SeqCst) {
-            tokio::time::sleep(Duration::from_millis(80)).await;
-            let snapshot: Vec<AudioLevelData> = {
-                let guard = levels_for_emit.lock().unwrap_or_else(|e| e.into_inner());
-                guard.values().cloned().collect()
-            };
-            if snapshot.is_empty() {
-                continue;
-            }
-            let update = AudioLevelUpdate {
-                timestamp: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as u64,
-                levels: snapshot,
-            };
-            if let Err(e) = app.emit("audio-levels", &update) {
-                error!("Failed to emit audio-levels: {}", e);
-                break;
+                Err(error) => warn!("Level preview: {error}"),
             }
         }
-        IS_MONITORING.store(false, Ordering::SeqCst);
-        info!("Level monitor emit loop ended");
+        let active = !streams.is_empty();
+        let _ = ready.send(active);
+        while active && thread_running.load(Ordering::SeqCst) && generation == GENERATION.load(Ordering::SeqCst) {
+            thread::sleep(Duration::from_millis(10));
+        }
+        for stream in streams { let _ = stream.pause(); drop(stream); }
+        thread_running.store(false, Ordering::SeqCst);
+    }).map_err(|e| anyhow!("Failed to spawn level monitor: {e}"))?;
+    *session = Some(MonitorSession { running: running.clone(), thread: handle });
+    let active = opened.await.unwrap_or(false);
+    if !active || generation != GENERATION.load(Ordering::SeqCst) {
+        stop_session(&mut session).await?;
+        return Ok(());
+    }
+    IS_MONITORING.store(true, Ordering::SeqCst);
+    tokio::spawn(async move {
+        while running.load(Ordering::SeqCst) && generation == GENERATION.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            if !running.load(Ordering::SeqCst) || generation != GENERATION.load(Ordering::SeqCst) { break; }
+            let snapshot: Vec<AudioLevelData> = levels.lock().unwrap_or_else(|e| e.into_inner()).values().cloned().collect();
+            if snapshot.is_empty() { continue; }
+            let update = AudioLevelUpdate { timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64, levels: snapshot };
+            if app_handle.emit("audio-levels", &update).is_err() { running.store(false, Ordering::SeqCst); break; }
+        }
     });
-
     Ok(())
 }
 
 pub async fn stop_monitoring() -> Result<()> {
-    info!("Stopping audio level monitoring");
-    IS_MONITORING.store(false, Ordering::SeqCst);
-    tokio::time::sleep(Duration::from_millis(60)).await;
-    Ok(())
+    GENERATION.fetch_add(1, Ordering::SeqCst);
+    stop_session(&mut *SESSION.lock().await).await
 }
 
 pub fn is_monitoring() -> bool {
     IS_MONITORING.load(Ordering::SeqCst)
 }
 
-fn default_monitor_devices() -> Vec<String> {
+fn default_monitor_devices(device_type: Option<&str>) -> Vec<String> {
     let mut out = Vec::new();
 
     #[cfg(target_os = "windows")]
@@ -151,12 +149,12 @@ fn default_monitor_devices() -> Vec<String> {
     #[cfg(not(target_os = "windows"))]
     let host = cpal::default_host();
 
-    if let Some(d) = host.default_input_device() {
+    if let Some(d) = host.default_input_device().filter(|_| device_type != Some("output")) {
         if let Ok(n) = d.name() {
             out.push(n);
         }
     }
-    if let Some(d) = host.default_output_device() {
+    if let Some(d) = host.default_output_device().filter(|_| device_type != Some("input")) {
         if let Ok(n) = d.name() {
             if !out.contains(&n) {
                 out.push(n);
@@ -167,14 +165,14 @@ fn default_monitor_devices() -> Vec<String> {
 }
 
 /// Open a cpal input stream for levels. Tries mic input first, then WASAPI loopback on output.
-fn open_level_stream(device_name: &str, levels: LevelMap) -> Result<cpal::Stream> {
+fn open_level_stream(device_name: &str, levels: LevelMap, device_type: Option<&str>) -> Result<cpal::Stream> {
     #[cfg(target_os = "windows")]
     let host = cpal::host_from_id(cpal::HostId::Wasapi).unwrap_or_else(|_| cpal::default_host());
     #[cfg(not(target_os = "windows"))]
     let host = cpal::default_host();
 
     // 1) Input (microphone)
-    if let Ok(devices) = host.input_devices() {
+    if let Some(Ok(devices)) = (device_type != Some("output")).then(|| host.input_devices()) {
         for device in devices {
             if let Ok(name) = device.name() {
                 if name == device_name || name.contains(device_name) || device_name.contains(&name)
@@ -194,7 +192,7 @@ fn open_level_stream(device_name: &str, levels: LevelMap) -> Result<cpal::Stream
     }
 
     // 2) Output device via WASAPI loopback (system audio) — build_input_stream on output device
-    if let Ok(devices) = host.output_devices() {
+    if let Some(Ok(devices)) = (device_type != Some("input")).then(|| host.output_devices()) {
         for device in devices {
             if let Ok(name) = device.name() {
                 if name == device_name || name.contains(device_name) || device_name.contains(&name)

@@ -122,7 +122,7 @@ mod nemotron{{
 extern crate self as tauri;
 pub struct State<'a,T>(pub &'a T);
 impl<'a,T> std::ops::Deref for State<'a,T>{{type Target=T;fn deref(&self)->&T{{self.0}}}}
-mod state{{pub struct AppState{{pub db_manager:DbManager}} pub struct DbManager(pub sqlx::SqlitePool);impl DbManager{{pub fn pool(&self)->&sqlx::SqlitePool{{&self.0}}}}}}
+mod state{{pub struct AppState{{pub db_manager:DbManager}} #[derive(Clone)] pub struct DbManager(pub sqlx::SqlitePool);impl DbManager{{pub fn pool(&self)->&sqlx::SqlitePool{{&self.0}}}}}}
 #[path="{NATIVE}/speaker_labels.rs"] mod speaker_labels;
 pub mod command;
 pub use command as diarization;
