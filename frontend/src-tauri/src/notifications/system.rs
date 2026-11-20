@@ -1,4 +1,6 @@
 use crate::notifications::types::{Notification, NotificationPriority, NotificationTimeout};
+#[cfg(windows)]
+use super::types::NotificationType;
 use anyhow::{Result, anyhow};
 use log::{info as log_info, error as log_error};
 use tauri::{AppHandle, Runtime};
@@ -34,11 +36,12 @@ impl<R: Runtime> SystemNotificationHandler<R> {
         // never end up showing no toast at all.
         #[cfg(windows)]
         {
-            match crate::notifications::native_windows::show_toast(
-                &self.app_handle,
-                &notification.title,
-                &notification.body,
-            ) {
+            let result = match &notification.notification_type {
+                NotificationType::MeetingDetected { process, session_id } =>
+                    super::native_windows::show_meeting_toast(&self.app_handle, &notification.title, &notification.body, process.clone(), *session_id),
+                _ => super::native_windows::show_toast(&self.app_handle, &notification.title, &notification.body),
+            };
+            match result {
                 Ok(_) => {
                     log_info!("Showed native Windows toast: {}", notification.title);
                     return Ok(());

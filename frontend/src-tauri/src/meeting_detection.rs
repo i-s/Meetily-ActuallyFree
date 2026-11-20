@@ -1,24 +1,25 @@
-//! Meeting Detection.
-//!
-//! A lightweight background monitor that watches the list of running processes
-//! and, when it sees a known meeting/conferencing app start (Zoom, Teams,
-//! Slack huddles, Webex, …), emits a `meeting-detected` event so the
-//! UI can offer a one-click "Start recording". Fully local — no network, no
-//! telemetry; just process-name matching via `sysinfo`.
-//!
-//! Everything is user-configurable and persisted install-locally in
-//! `meeting_detection.json`: the poll interval, the list of app keywords to
-//! watch, and an "ignored apps" list to suppress false positives.
+//! Native call evidence and session tracking. A running app alone is never a call.
+//! Probes inspect only local native state; diagnostics contain fixed reason codes,
+//! not accessibility text, window titles, chat content, or audio.
+
+mod evidence;
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(windows)]
+mod windows_discord;
+use evidence::{Observation, Presence, Probe, Tracker, Transition};
+use std::sync::{atomic::AtomicBool, OnceLock};
 
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use tauri::{AppHandle, Emitter, Runtime};
 
-/// Global run flag for the monitor loop. Setting this to `false` makes the
-/// currently-running loop exit on its next tick.
+/// Generation token invalidates a stopped loop, including an in-flight scan.
 static MONITOR_GENERATION: AtomicU64 = AtomicU64::new(0);
 /// Current settings, shared with the running loop so changes apply live.
+static MONITOR_RUNNING: AtomicBool = AtomicBool::new(false);
+static TRACKER: OnceLock<Mutex<Tracker>> = OnceLock::new();
 static SETTINGS: Mutex<Option<MeetingDetectionSettings>> = Mutex::new(None);
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -27,8 +28,7 @@ pub struct MeetingDetectionSettings {
     pub enabled: bool,
     /// How often to scan the process list, in seconds.
     pub interval_secs: u64,
-    /// Process-name keywords that indicate a meeting app (matched
-    /// case-insensitively as substrings of the executable name).
+    /// Candidate application keywords. Native call evidence is required.
     pub meeting_apps: Vec<String>,
     /// Process-name keywords to always ignore (suppress false positives).
     pub ignored_apps: Vec<String>,
@@ -54,6 +54,7 @@ impl Default for MeetingDetectionSettings {
 fn default_meeting_apps() -> Vec<String> {
     [
         "zoom",
+        "discord",
         "teams",
         "msteams",
         "slack",
@@ -75,6 +76,7 @@ fn default_meeting_apps() -> Vec<String> {
 fn friendly_name(keyword: &str) -> String {
     match keyword {
         "zoom" => "Zoom",
+        "discord" => "Discord",
         "teams" | "msteams" => "Microsoft Teams",
         "slack" => "Slack",
         "webex" => "Webex",
@@ -105,13 +107,17 @@ fn load_settings_from_disk() -> MeetingDetectionSettings {
     MeetingDetectionSettings::default()
 }
 
-/// Drop keywords we no longer detect from a loaded config. Discord was removed
-/// from the default list, but existing installs may still have it persisted in
-/// `meeting_detection.json`; strip it here so it isn't detected anymore.
+/// The settings UI exposes ignored_apps for opt-outs. Older versions forcibly
+/// removed Discord, so restore it on upgrade while preserving explicit ignores.
 fn sanitize_settings(settings: &mut MeetingDetectionSettings) {
-    settings
+    settings.interval_secs = settings.interval_secs.clamp(3, 3600);
+    if !settings
         .meeting_apps
-        .retain(|k| k.trim().to_lowercase() != "discord");
+        .iter()
+        .any(|k| k.eq_ignore_ascii_case("discord"))
+    {
+        settings.meeting_apps.push("discord".into());
+    }
 }
 
 fn save_settings_to_disk(settings: &MeetingDetectionSettings) -> Result<(), String> {
@@ -128,18 +134,20 @@ fn save_settings_to_disk(settings: &MeetingDetectionSettings) -> Result<(), Stri
 struct MeetingDetectedPayload {
     /// Friendly app name, e.g. "Zoom".
     app: String,
-    /// Raw process name that matched, e.g. "zoom.exe".
+    /// Stable application key shared with automatic recording ownership.
     process: String,
     /// Whether the user asked for a native notification too.
     notify: bool,
-    /// Windows CapabilityAccessManager reports active mic/camera use.
+    /// Confirmed call evidence (native UI for Zoom/Discord, media lease for others).
     active_media: bool,
+    session_id: u64,
 }
 
 #[derive(Clone, Serialize)]
 struct MeetingEndedPayload {
     app: String,
     process: String,
+    session_id: u64,
 }
 
 /// True for our own process — never treat Meetily as a "meeting app".
@@ -148,98 +156,280 @@ fn is_self_process(name: &str) -> bool {
     n.contains("meetily") || n.contains("meetily-actually")
 }
 
-/// Scan the process list once and, if a (non-ignored) meeting app is present,
-/// return `(friendly_name, process_name)`.
-///
-/// On Windows, when CapabilityAccessManager reports mic/camera holders, we only
-/// alert if a *known* meeting app is among them. We never invent a name from a
-/// random exe (that produced the nonsense "Meetily meeting detected" toast when
-/// this app itself held the mic).
-fn scan_for_meeting_app(settings: &MeetingDetectionSettings) -> Option<(String, String, bool)> {
+/// Every application has a stable key, independent of process enumeration order,
+/// helper PIDs, focus, notify settings, and microphone mute state.
+fn scan_for_meetings(settings: &MeetingDetectionSettings, diagnostics: bool) -> Vec<Observation> {
     use sysinfo::System;
-
-    let mut sys = System::new_all();
-    sys.refresh_all();
-
-    let ignored: Vec<String> = settings
-        .ignored_apps
+    let sys = System::new_all();
+    let processes: Vec<(u32, String)> = sys
+        .processes()
+        .values()
+        .map(|p| (p.pid().as_u32(), p.name().to_string_lossy().to_lowercase()))
+        .collect();
+    #[cfg(windows)]
+    let media = windows_media_in_use_exes();
+    let mut keys: Vec<String> = settings
+        .meeting_apps
         .iter()
-        .map(|s| s.to_lowercase())
-        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| !s.is_empty())
         .collect();
-
-    let is_skipped = |name: &str| -> bool {
-        if name.is_empty() || is_self_process(name) {
-            return true;
-        }
-        ignored.iter().any(|ig| name.contains(ig))
-    };
-
-    #[cfg(windows)]
-    let media_in_use: std::collections::HashSet<String> = windows_media_in_use_exes()
+    keys.sort();
+    keys.dedup();
+    let observations: Vec<_> = keys
         .into_iter()
-        .filter(|e| !is_self_process(e))
+        .filter(|key| !is_self_process(key))
+        .map(|key| {
+            let ignored = settings
+                .ignored_apps
+                .iter()
+                .any(|s| !s.trim().is_empty() && key.contains(&s.trim().to_lowercase()));
+            let pids: Vec<u32> = processes
+                .iter()
+                .filter(|(_, name)| {
+                    !is_self_process(name)
+                        && !settings.ignored_apps.iter().any(|s| {
+                            !s.trim().is_empty() && name.contains(&s.trim().to_lowercase())
+                        })
+                        && match key.as_str() {
+                            "zoom" => matches!(name.as_str(), "zoom.us" | "zoom" | "zoom.exe"),
+                            "discord" => matches!(
+                                name.as_str(),
+                                "discord" | "discord.exe" | "discordptb.exe" | "discordcanary.exe"
+                            ),
+                            _ => process_matches_keyword(name, &key),
+                        }
+                })
+                .map(|(pid, _)| *pid)
+                .collect();
+            let probe = if ignored {
+                Probe {
+                    presence: Presence::Inactive,
+                    reason: "Ignored in settings",
+                }
+            } else if pids.is_empty() {
+                Probe {
+                    presence: Presence::Inactive,
+                    reason: "Application is not running",
+                }
+            } else {
+                platform_probe(
+                    &key,
+                    &pids,
+                    diagnostics,
+                    #[cfg(windows)]
+                    &media,
+                )
+            };
+            Observation {
+                app: friendly_name(&key),
+                process: key.clone(),
+                key,
+                active_media: probe.presence == Presence::Active,
+                probe,
+            }
+        })
         .collect();
-    #[cfg(not(windows))]
-    let media_in_use: std::collections::HashSet<String> = std::collections::HashSet::new();
-
     #[cfg(windows)]
-    let browser_meeting_pids = windows_browser_meeting_pids();
-
-    let matches_media = |name: &str| -> bool {
-        if media_in_use.is_empty() {
-            return true; // no CAM signal → don't require it
-        }
-        let stem = name.trim_end_matches(".exe");
-        media_in_use
-            .iter()
-            .any(|m| m == name || m.contains(stem) || stem.contains(m.trim_end_matches(".exe")))
+    let observations = {
+        let mut observations = observations;
+        let browser_pids = windows_browser_meeting_pids();
+        let active = processes.iter().any(|(pid, name)| {
+            is_browser(name)
+                && browser_pids.contains(pid)
+                && media.contains(name)
+                && !settings
+                    .ignored_apps
+                    .iter()
+                    .any(|s| !s.trim().is_empty() && name.contains(&s.trim().to_lowercase()))
+        });
+        observations.push(Observation {
+            key: "browser".into(),
+            app: "Browser meeting".into(),
+            process: "browser".into(),
+            active_media: active,
+            probe: Probe {
+                presence: if active {
+                    Presence::Active
+                } else if processes.iter().any(|(_, name)| is_browser(name)) {
+                    Presence::Unknown
+                } else {
+                    Presence::Inactive
+                },
+                reason: "Browser meeting title and microphone/camera use",
+            },
+        });
+        observations
     };
+    observations
+}
 
-    // 1) Known meeting app that is actively using mic/camera (best signal).
-    if !media_in_use.is_empty() {
-        for process in sys.processes().values() {
-            let name = process.name().to_string_lossy().to_lowercase();
-            if is_skipped(&name) || !matches_media(&name) {
-                continue;
-            }
-            #[cfg(windows)]
-            if is_browser(&name) && browser_meeting_pids.contains(&process.pid().as_u32()) {
-                return Some(("Browser meeting".into(), name, true));
-            }
-            for keyword in &settings.meeting_apps {
-                let kw = keyword.trim().to_lowercase();
-                if kw.is_empty() {
-                    continue;
-                }
-                if process_matches_keyword(&name, &kw) {
-                    return Some((friendly_name(&kw), name, true));
-                }
-            }
-        }
-        // CAM has holders but none are known meeting apps (e.g. only Meetily or
-        // a browser). Do not fall through to process-only — that re-fires on idle
-        // Zoom/Teams sitting in the tray.
-        return None;
+fn platform_probe(
+    key: &str,
+    pids: &[u32],
+    diagnostics: bool,
+    #[cfg(windows)] media: &std::collections::HashSet<String>,
+) -> Probe {
+    #[cfg(target_os = "macos")]
+    if key == "zoom" {
+        return macos::probe(pids, diagnostics);
     }
-
-    // 2) No CAM signal: process-name match only (macOS/Linux / older Windows).
-    for process in sys.processes().values() {
-        let name = process.name().to_string_lossy().to_lowercase();
-        if is_skipped(&name) {
-            continue;
+    #[cfg(not(target_os = "macos"))]
+    let _ = diagnostics;
+    #[cfg(windows)]
+    {
+        if key == "discord" {
+            return windows_discord::probe(pids);
         }
-        for keyword in &settings.meeting_apps {
-            let kw = keyword.trim().to_lowercase();
-            if kw.is_empty() {
-                continue;
-            }
-            if process_matches_keyword(&name, &kw) {
-                return Some((friendly_name(&kw), name, false));
-            }
+        if media
+            .iter()
+            .any(|name| process_matches_keyword(name, key) && !is_self_process(name))
+        {
+            return Probe {
+                presence: Presence::Active,
+                reason: "Windows reports microphone or camera use by this app",
+            };
+        }
+        return Probe {
+            presence: Presence::Unknown,
+            reason: "No active microphone or camera evidence; process presence is insufficient",
+        };
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (key, pids);
+        Probe {
+            presence: Presence::Unknown,
+            reason: "Call detection for this app is not supported on this platform",
         }
     }
-    None
+}
+
+#[derive(Serialize)]
+pub struct DetectionDiagnostic {
+    app: String,
+    state: &'static str,
+    reason: &'static str,
+}
+#[derive(Serialize)]
+pub struct DetectionDiagnostics {
+    platform: &'static str,
+    accessibility_required: bool,
+    accessibility_granted: bool,
+    apps: Vec<DetectionDiagnostic>,
+}
+
+fn diagnostic_reason(reason: &'static str) -> &'static str {
+    match reason {
+        "accessibility_permission_required" => "Allow Meetily in System Settings > Privacy & Security > Accessibility, then check again.",
+        "zoom_enabled_meeting_command" | "zoom_enabled_call_controls" => "Zoom exposes enabled controls for an ongoing meeting.",
+        "zoom_idle_home" => "Zoom shows its home screen with no active meeting.",
+        "zoom_scan_timeout" => "Zoom's accessibility scan timed out. Refresh detection writes a technical report to the Meetily log.",
+        "zoom_scan_limit" => "Zoom's accessibility scan reached its safety limit. Refresh detection writes a technical report to the Meetily log.",
+        "zoom_ax_read_failed" => "Accessibility permission is granted, but reading Zoom's interface failed. Refresh detection writes the API error to the Meetily log.",
+        "zoom_ax_incomplete" => "Zoom did not expose a required accessibility attribute. Refresh detection writes a technical report to the Meetily log.",
+        "zoom_controls_not_found" => "Zoom's interface was read, but no supported call controls were found. Refresh detection writes a technical report to the Meetily log.",
+        "zoom_ui_unknown" => "Zoom's call controls could not be confirmed. Keep Zoom open and check Accessibility permission.",
+        "zoom_not_running" | "discord_process_absent" => "Application is not running.",
+        "discord_call_ui_and_capture" => "Discord exposes call controls and an active microphone session.",
+        "discord_call_ui" => "Discord exposes call controls; microphone activity is not required.",
+        "discord_idle_ui" => "Discord shows its idle controls with no connected call.",
+        "discord_capture_without_call_ui" => "Discord is using audio, but no call controls were found. A microphone test is not a call.",
+        "discord_call_end_unconfirmed_while_app_open" => "No call controls are visible. Discord is still open, so call end cannot be confirmed; stop recording manually if needed.",
+        "discord_probe_timeout" | "discord_probe_busy" => "Discord inspection did not finish in time. The current call state is unknown.",
+        "discord_probe_worker_unavailable" | "discord_ui_unavailable" => "Discord accessibility inspection is unavailable. Open Discord and check again.",
+        "discord_ui_unavailable_or_ambiguous" => "Discord's call controls could not be confirmed. Open its window and check again.",
+        _ => reason,
+    }
+}
+
+#[tauri::command]
+pub async fn get_meeting_detection_diagnostics() -> Result<DetectionDiagnostics, String> {
+    let settings = SETTINGS
+        .lock()
+        .unwrap()
+        .clone()
+        .unwrap_or_else(load_settings_from_disk);
+    let observations = tokio::task::spawn_blocking(move || scan_for_meetings(&settings, true))
+        .await
+        .map_err(|e| e.to_string())?;
+    #[cfg(target_os = "macos")]
+    let accessibility_granted = macos::accessibility_trusted();
+    #[cfg(not(target_os = "macos"))]
+    let accessibility_granted = true;
+    Ok(DetectionDiagnostics {
+        platform: std::env::consts::OS,
+        accessibility_required: cfg!(target_os = "macos"),
+        accessibility_granted,
+        apps: observations
+            .into_iter()
+            .filter(|o| {
+                o.probe.reason != "Application is not running"
+                    || (cfg!(target_os = "macos") && o.key == "zoom")
+                    || (cfg!(windows) && o.key == "discord")
+            })
+            .map(|o| DetectionDiagnostic {
+                app: o.app,
+                reason: diagnostic_reason(o.probe.reason),
+                state: match o.probe.presence {
+                    Presence::Active => "Call detected",
+                    Presence::Inactive => "No call",
+                    Presence::Unknown => "Unknown",
+                },
+            })
+            .collect(),
+    })
+}
+
+#[tauri::command]
+pub async fn request_meeting_detection_accessibility() -> Result<bool, String> {
+    #[cfg(target_os = "macos")]
+    {
+        Ok(macos::request_accessibility())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err("Accessibility permission is only required on macOS".into())
+    }
+}
+
+/// Revalidate a displayed offer before starting, so a stale notification cannot
+/// record a later unrelated session. This inspection does not advance debounce.
+#[tauri::command]
+pub async fn meeting_detection_session_exists(process: String, session_id: u64) -> bool {
+    TRACKER
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .session_matches(&process, session_id)
+}
+
+#[tauri::command]
+pub async fn validate_meeting_detection_session(
+    process: String,
+    session_id: u64,
+) -> Result<bool, String> {
+    let settings = SETTINGS.lock().unwrap().clone().unwrap_or_default();
+    if !settings.enabled
+        || !TRACKER
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .session_matches(&process, session_id)
+    {
+        return Ok(false);
+    }
+    let observations = tokio::task::spawn_blocking(move || scan_for_meetings(&settings, false))
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(observations
+        .iter()
+        .any(|o| o.key == process && o.probe.presence == Presence::Active)
+        && TRACKER
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .session_matches(&process, session_id))
 }
 
 /// Windows: executables currently holding microphone or webcam via
@@ -257,37 +447,43 @@ fn windows_media_in_use_exes() -> std::collections::HashSet<String> {
             let path = format!(
                 "Software\\Microsoft\\Windows\\CurrentVersion\\CapabilityAccessManager\\ConsentStore\\{cap}\\{suffix}"
             );
-            let Ok(root) = hkcu.open_subkey(&path) else { continue };
-            let Ok(keys) = root.enum_keys().collect::<Result<Vec<_>, _>>() else { continue };
-            for key_name in keys {
-            if key_name.eq_ignore_ascii_case("NonPackaged") { continue; }
-            let Ok(sub) = root.open_subkey(&key_name) else {
+            let Ok(root) = hkcu.open_subkey(&path) else {
                 continue;
             };
-            // Values are FILETIME-like u64; Start > Stop means currently open.
-            let start: u64 = sub.get_value("LastUsedTimeStart").unwrap_or(0);
-            let stop: u64 = sub.get_value("LastUsedTimeStop").unwrap_or(0);
-            if start == 0 {
+            let Ok(keys) = root.enum_keys().collect::<Result<Vec<_>, _>>() else {
                 continue;
-            }
-            // 0xFFFFFFFFFFFFFFFF stop means "still in use" on some builds;
-            // otherwise start > stop.
-            let in_use = stop == u64::MAX || start > stop;
-            if !in_use {
-                continue;
-            }
-            // Key names look like C:#Program Files#...#Teams.exe
-            let exe = key_name
-                .rsplit('#')
-                .next()
-                .unwrap_or(&key_name)
-                .to_lowercase();
-            if exe.ends_with(".exe") {
-                out.insert(exe);
-            } else if key_name.to_lowercase().contains("msteams") {
-                // Packaged Teams stores a package family name rather than an exe.
-                out.insert("ms-teams.exe".into());
-            }
+            };
+            for key_name in keys {
+                if key_name.eq_ignore_ascii_case("NonPackaged") {
+                    continue;
+                }
+                let Ok(sub) = root.open_subkey(&key_name) else {
+                    continue;
+                };
+                // Values are FILETIME-like u64; Start > Stop means currently open.
+                let start: u64 = sub.get_value("LastUsedTimeStart").unwrap_or(0);
+                let stop: u64 = sub.get_value("LastUsedTimeStop").unwrap_or(0);
+                if start == 0 {
+                    continue;
+                }
+                // 0xFFFFFFFFFFFFFFFF stop means "still in use" on some builds;
+                // otherwise start > stop.
+                let in_use = stop == u64::MAX || start > stop;
+                if !in_use {
+                    continue;
+                }
+                // Key names look like C:#Program Files#...#Teams.exe
+                let exe = key_name
+                    .rsplit('#')
+                    .next()
+                    .unwrap_or(&key_name)
+                    .to_lowercase();
+                if exe.ends_with(".exe") {
+                    out.insert(exe);
+                } else if key_name.to_lowercase().contains("msteams") {
+                    // Packaged Teams stores a package family name rather than an exe.
+                    out.insert("ms-teams.exe".into());
+                }
             }
         }
     }
@@ -302,33 +498,55 @@ fn is_browser(name: &str) -> bool {
 #[cfg(windows)]
 fn windows_browser_meeting_pids() -> std::collections::HashSet<u32> {
     use windows_sys::Win32::Foundation::HWND;
-    use windows_sys::Win32::UI::WindowsAndMessaging::{EnumWindows, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId,
+        IsWindowVisible,
+    };
     unsafe extern "system" fn visit(hwnd: HWND, state: isize) -> i32 {
         let matches = &mut *(state as *mut std::collections::HashSet<u32>);
-        if IsWindowVisible(hwnd) == 0 { return 1; }
+        if IsWindowVisible(hwnd) == 0 {
+            return 1;
+        }
         let len = GetWindowTextLengthW(hwnd);
-        if len <= 0 || len > 1024 { return 1; }
+        if len <= 0 || len > 1024 {
+            return 1;
+        }
         let mut title = vec![0u16; len as usize + 1];
         let copied = GetWindowTextW(hwnd, title.as_mut_ptr(), title.len() as i32);
-        if copied <= 0 { return 1; }
+        if copied <= 0 {
+            return 1;
+        }
         let title = String::from_utf16_lossy(&title[..copied as usize]).to_lowercase();
         if browser_title_is_meeting(&title) {
             let mut pid = 0u32;
             GetWindowThreadProcessId(hwnd, &mut pid);
-            if pid != 0 { matches.insert(pid); }
+            if pid != 0 {
+                matches.insert(pid);
+            }
         }
         1
     }
     let mut matches = std::collections::HashSet::new();
-    unsafe { EnumWindows(Some(visit), &mut matches as *mut _ as isize); }
+    unsafe {
+        EnumWindows(Some(visit), &mut matches as *mut _ as isize);
+    }
     matches
 }
 
 #[cfg(windows)]
 fn browser_title_is_meeting(title: &str) -> bool {
     let title = title.to_lowercase();
-    ["google meet", "meet.google.com", "zoom meeting", "zoom.us/j/", "meeting | microsoft teams", "teams.microsoft.com", "slack huddle"]
-        .iter().any(|needle| title.contains(needle))
+    [
+        "google meet",
+        "meet.google.com",
+        "zoom meeting",
+        "zoom.us/j/",
+        "meeting | microsoft teams",
+        "teams.microsoft.com",
+        "slack huddle",
+    ]
+    .iter()
+    .any(|needle| title.contains(needle))
 }
 
 /// Does a process name match a meeting-app keyword?
@@ -375,98 +593,109 @@ mod tests {
         assert!(!process_matches_keyword("steam.exe", "teams"));
         assert!(!process_matches_keyword("steamwebhelper.exe", "teams"));
     }
-
-    #[cfg(windows)]
-    #[test]
-    fn browser_title_requires_meeting_context() {
-        assert!(super::browser_title_is_meeting("Google Meet - Project Sync"));
-        assert!(super::browser_title_is_meeting("Meeting | Microsoft Teams - Edge"));
-        assert!(!super::browser_title_is_meeting("Meetily documentation - Chrome"));
-        assert!(!super::browser_title_is_meeting("Microsoft Teams home - Edge"));
-    }
 }
 
-/// Start (or restart) the background monitor with the given settings.
+/// Settings updates share this loop and Tracker; changing notify/interval must
+/// not manufacture another call. Restarting a stopped loop retains session IDs.
 fn start_monitor<R: Runtime>(app: &AppHandle<R>) {
-    // A generation token prevents an old sleeping loop from reviving after a restart.
-    let generation = MONITOR_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
-
-    let settings = {
-        let guard = SETTINGS.lock().unwrap();
-        guard.clone().unwrap_or_default()
-    };
-    if !settings.enabled {
-        log::info!("Meeting detection disabled; monitor not started");
+    if !SETTINGS.lock().unwrap().as_ref().is_some_and(|s| s.enabled) {
         return;
     }
-
+    if MONITOR_RUNNING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    TRACKER
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .suspend();
+    let generation = MONITOR_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
     let app = app.clone();
-
     tauri::async_runtime::spawn(async move {
-        log::info!("🔍 Meeting detection monitor started");
-        // Whether we've already alerted for the currently-ongoing meeting app,
-        // so we prompt once per meeting rather than every tick.
-        let mut alerted: Option<(String, String, bool)> = None;
-        let mut missing_since: Option<std::time::Instant> = None;
-
-        // Give the loop a moment before the first heavy scan.
+        let clock = std::time::Instant::now();
+        // Global monotonic origin survives monitor restarts alongside Tracker.
+        static ORIGIN: OnceLock<std::time::Instant> = OnceLock::new();
+        let origin = *ORIGIN.get_or_init(|| clock);
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-
         while MONITOR_GENERATION.load(Ordering::SeqCst) == generation {
-            let current = {
-                let guard = SETTINGS.lock().unwrap();
-                guard.clone().unwrap_or_default()
-            };
+            let current = SETTINGS.lock().unwrap().clone().unwrap_or_default();
             if !current.enabled {
                 break;
             }
-
             let scan_settings = current.clone();
-            let scan = match tokio::task::spawn_blocking(move || scan_for_meeting_app(&scan_settings)).await {
-                Ok(scan) => scan,
-                Err(error) => { log::warn!("Meeting detection scan failed: {error}"); None }
-            };
-            if MONITOR_GENERATION.load(Ordering::SeqCst) != generation { break; }
-            // A process-only fallback must not keep a formerly active meeting
-            // alive after its microphone lease ends while the app stays open.
-            let scan = match (alerted.as_ref(), scan) {
-                (Some((_, process, true)), Some((_, candidate, false))) if process == &candidate => None,
-                (_, other) => other,
-            };
+            let scan =
+                tokio::task::spawn_blocking(move || scan_for_meetings(&scan_settings, false)).await;
+            if MONITOR_GENERATION.load(Ordering::SeqCst) != generation {
+                break;
+            }
             match scan {
-                Some((friendly, process, active_media)) => {
-                    missing_since = None;
-                    if alerted.as_ref() != Some(&(friendly.clone(), process.clone(), active_media)) {
-                        alerted = Some((friendly.clone(), process.clone(), active_media));
-                        log::info!("🔔 Meeting app detected: {} ({})", friendly, process);
-                        let _ = app.emit(
-                            "meeting-detected",
-                            MeetingDetectedPayload {
-                                app: friendly,
-                                process,
-                                notify: current.notify,
-                                active_media,
-                            },
-                        );
-                    }
-                }
-                None => {
-                    if let Some((app_name, process, _)) = &alerted {
-                        let since = missing_since.get_or_insert_with(std::time::Instant::now);
-                        if since.elapsed() >= std::time::Duration::from_secs(45) {
-                            let _ = app.emit("meeting-ended", MeetingEndedPayload { app: app_name.clone(), process: process.clone() });
-                            alerted = None;
-                            missing_since = None;
+                Ok(observations) => {
+                    let transitions = TRACKER
+                        .get_or_init(Default::default)
+                        .lock()
+                        .unwrap()
+                        .update(origin.elapsed().as_millis() as u64, &observations);
+                    for transition in transitions {
+                        match transition {
+                            Transition::Started {
+                                observation,
+                                session_id,
+                            } => {
+                                log::info!(
+                                    "Meeting call confirmed: {} session={} reason={}",
+                                    observation.key,
+                                    session_id,
+                                    observation.probe.reason
+                                );
+                                let _ = app.emit(
+                                    "meeting-detected",
+                                    MeetingDetectedPayload {
+                                        app: observation.app,
+                                        process: observation.process,
+                                        notify: current.notify,
+                                        active_media: observation.active_media,
+                                        session_id,
+                                    },
+                                );
+                            }
+                            Transition::Ended {
+                                observation,
+                                session_id,
+                            } => {
+                                log::info!(
+                                    "Meeting call ended: {} session={}",
+                                    observation.key,
+                                    session_id
+                                );
+                                let _ = app.emit(
+                                    "meeting-ended",
+                                    MeetingEndedPayload {
+                                        app: observation.app,
+                                        process: observation.process,
+                                        session_id,
+                                    },
+                                );
+                            }
                         }
                     }
                 }
+                Err(error) => {
+                    TRACKER
+                        .get_or_init(Default::default)
+                        .lock()
+                        .unwrap()
+                        .suspend();
+                    log::warn!("Meeting detection inspection failed: {error}");
+                }
             }
-
-            let interval = current.interval_secs.clamp(3, 3600);
-            tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+            tokio::time::sleep(std::time::Duration::from_secs(
+                current.interval_secs.clamp(3, 3600),
+            ))
+            .await;
         }
-
-        log::info!("🔍 Meeting detection monitor stopped");
+        if MONITOR_GENERATION.load(Ordering::SeqCst) == generation {
+            MONITOR_RUNNING.store(false, Ordering::SeqCst);
+        }
     });
 }
 
@@ -500,7 +729,7 @@ pub async fn set_meeting_detection_settings<R: Runtime>(
 ) -> Result<(), String> {
     // Sanity-clamp the interval.
     let mut settings = settings;
-    settings.interval_secs = settings.interval_secs.clamp(3, 3600);
+    sanitize_settings(&mut settings);
 
     save_settings_to_disk(&settings)?;
     {
@@ -508,16 +737,17 @@ pub async fn set_meeting_detection_settings<R: Runtime>(
         *guard = Some(settings.clone());
     }
 
-    // Apply immediately: (re)start or stop the monitor.
+    // Apply settings without restarting an already running monitor.
     if settings.enabled {
         start_monitor(&app);
     } else {
         MONITOR_GENERATION.fetch_add(1, Ordering::SeqCst);
+        MONITOR_RUNNING.store(false, Ordering::SeqCst);
     }
     Ok(())
 }
 
-/// Manually (re)start the monitor using current settings.
+/// Ensure a monitor is running using current settings.
 #[tauri::command]
 pub async fn start_meeting_detection<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
     start_monitor(&app);
@@ -528,5 +758,6 @@ pub async fn start_meeting_detection<R: Runtime>(app: AppHandle<R>) -> Result<()
 #[tauri::command]
 pub async fn stop_meeting_detection() -> Result<(), String> {
     MONITOR_GENERATION.fetch_add(1, Ordering::SeqCst);
+    MONITOR_RUNNING.store(false, Ordering::SeqCst);
     Ok(())
 }

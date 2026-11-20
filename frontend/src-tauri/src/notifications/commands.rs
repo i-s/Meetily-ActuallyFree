@@ -125,6 +125,25 @@ pub async fn show_simple_notification(
     }
 }
 
+/// Bind a meeting notification action to the exact detected session. Older
+/// notifications must never resolve to whichever call happened most recently.
+#[tauri::command]
+pub async fn show_meeting_detection_notification(
+    title: String,
+    body: String,
+    process: String,
+    session_id: u64,
+    manager_state: State<'_, NotificationManagerState<Wry>>,
+) -> Result<(), String> {
+    let notification = Notification::new(title, body, NotificationType::MeetingDetected { process, session_id });
+    let manager_lock = manager_state.read().await;
+    if let Some(manager) = manager_lock.as_ref() {
+        manager.show_notification(notification).await.map_err(|e| format!("Failed to show notification: {e}"))
+    } else {
+        Err("Notification manager not initialized".into())
+    }
+}
+
 /// Show a test notification
 #[tauri::command]
 pub async fn show_test_notification(

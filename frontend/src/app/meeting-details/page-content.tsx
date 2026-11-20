@@ -18,6 +18,8 @@ import { MeetingExportDialog } from '@/components/MeetingDetails/MeetingExportDi
 import { PostCallProcessingDialog } from '@/components/MeetingDetails/PostCallProcessingDialog';
 import { ModelConfig } from '@/components/ModelSettingsModal';
 import { VirtualizedTranscriptView } from '@/components/VirtualizedTranscriptView';
+import { useAskAiContext } from '@/hooks/useAskAiContext';
+import { askBoundaryLabel } from '@/lib/ask-ai-context';
 import { MeetingHeader } from '@/components/meeting/MeetingHeader';
 import { MeetingDocument } from '@/components/meeting/MeetingDocument';
 import { AudioPlayerBar } from '@/components/meeting/AudioPlayerBar';
@@ -293,6 +295,7 @@ export default function PageContent({
       })),
     [segments, meetingData.transcripts],
   );
+  const askContext = useAskAiContext(meeting.id, transcriptSegments, false);
 
   const speakers = useMemo(() => {
     const counts = new Map<string, number>();
@@ -434,9 +437,15 @@ export default function PageContent({
         className={cn('flex min-h-0 min-w-0 flex-1 overflow-hidden', stacked ? 'flex-col' : 'flex-row', draggingSplit && 'select-none')}
       >
         <section className="flex min-h-0 min-w-0 flex-1 flex-col" aria-label="Transcript">
+          {askContext.error && <p role="status" className="px-4 py-2 text-xs text-af-warning">Не удалось обновить границу Ask AI: {askContext.error}</p>}
+          {askContext.range?.truncated && <p className="px-4 py-2 text-xs text-af-text-3">
+            {askBoundaryLabel(askContext.range)}
+            {askContext.range.startTranscriptId && !transcriptSegments.some(segment => segment.id === askContext.range!.startTranscriptId) && ' — граница находится за пределами загруженных фрагментов.'}
+          </p>}
           <div className="min-h-0 flex-1">
             <VirtualizedTranscriptView
               segments={transcriptSegments}
+              askContextBoundary={askContext.range}
               disableAutoScroll
               hasMore={hasMore}
               isLoadingMore={isLoadingMore}

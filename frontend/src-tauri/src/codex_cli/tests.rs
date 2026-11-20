@@ -1,6 +1,86 @@
 use super::*;
 
 #[test]
+fn codex_cli_command_removes_parent_session_identity() {
+    let cmd = command(Path::new("codex"), &[], Path::new("."));
+    let env: std::collections::HashMap<_, _> = cmd.as_std().get_envs().collect();
+    for key in [
+        "CODEX_THREAD_ID",
+        "CODEX_SESSION_ID",
+        "OPENAI_API_KEY",
+        "CODEX_API_KEY",
+    ] {
+        assert_eq!(env.get(std::ffi::OsStr::new(key)), Some(&None), "{key}");
+    }
+}
+
+#[test]
+fn codex_cli_nonfatal_warnings_and_plan_metadata_allow_completed_answers() {
+    // Real 0.159.0-alpha.3 emits item.error for configuration warnings, even
+    // when the response completes successfully without calling any tools.
+    let events = r#"{"type":"item.completed","item":{"type":"error","message":"`[features].memory_tool` is deprecated. Use `[features].memories` instead."}}
+{"type":"item.started","item":{"type":"todo_list","items":[]}}
+{"type":"item.updated","item":{"type":"todo_list","items":[]}}
+{"type":"item.completed","item":{"type":"todo_list","items":[]}}
+{"type":"item.completed","item":{"type":"agent_message","text":"Summary"}}
+{"type":"turn.completed"}"#;
+    assert_eq!(parse_response(events).unwrap(), "Summary");
+    assert!(parse_response(&events.replace("turn.completed", "turn.failed")).is_err());
+    assert!(parse_response(&format!(
+        "{events}\n{{\"type\":\"error\",\"message\":\"private\"}}"
+    ))
+    .is_err());
+}
+
+#[test]
+fn codex_cli_accepts_only_recovered_stream_errors() {
+    let retry = r#"{"type":"error","message":"Reconnecting... 1/5 (private diagnostic)"}"#;
+    let answer = r#"{"type":"item.completed","item":{"type":"agent_message","text":"Summary"}}"#;
+    let completed = r#"{"type":"turn.completed"}"#;
+    assert_eq!(
+        parse_response(&format!("{retry}\n{answer}\n{completed}")).unwrap(),
+        "Summary"
+    );
+    for events in [
+        retry.to_owned(),
+        format!("{retry}\n{answer}"),
+        format!("{retry}\n{answer}\n{{\"type\":\"turn.failed\"}}"),
+        format!("{answer}\n{completed}\n{retry}"),
+    ] {
+        let error = parse_response(&events).unwrap_err();
+        assert!(!error.contains("private"));
+    }
+}
+
+#[test]
+fn codex_cli_rejects_execution_items_in_every_lifecycle_phase() {
+    for kind in [
+        "command_execution",
+        "file_change",
+        "mcp_tool_call",
+        "collab_tool_call",
+        "web_search",
+    ] {
+        for phase in ["item.started", "item.updated", "item.completed"] {
+            let events = format!("{{\"type\":\"{phase}\",\"item\":{{\"type\":\"{kind}\",\"text\":\"private\"}}}}\n{{\"type\":\"item.completed\",\"item\":{{\"type\":\"agent_message\",\"text\":\"Summary\"}}}}\n{{\"type\":\"turn.completed\"}}");
+            let error = parse_response(&events).unwrap_err();
+            assert!(error.contains("tool"), "{phase}/{kind}: {error}");
+            assert!(!error.contains("private"));
+        }
+    }
+}
+
+#[test]
+fn codex_cli_unknown_items_fail_without_claiming_tool_use() {
+    let events = r#"{"type":"item.completed","item":{"type":"future_item","text":"private"}}
+{"type":"item.completed","item":{"type":"agent_message","text":"Summary"}}
+{"type":"turn.completed"}"#;
+    let error = parse_response(events).unwrap_err();
+    assert!(error.contains("unsupported item"), "{error}");
+    assert!(!error.contains("private"));
+}
+
+#[test]
 fn codex_cli_response_requires_completion_and_uses_last_agent_message() {
     let events = "{\"type\":\"thread.started\"}\n{\"type\":\"item.completed\",\"item\":{\"type\":\"reasoning\",\"text\":\"private reasoning\"}}\n{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"Answer in Russian: да\"}}\n{\"type\":\"turn.completed\"}";
     assert_eq!(parse_response(events).unwrap(), "Answer in Russian: да");
@@ -89,10 +169,19 @@ else:
         "features.shell_tool=false",
         "features.unified_exec=false",
         "features.apply_patch_freeform=false",
+        "features.goals=false",
+        "tools.experimental_request_user_input.enabled=false",
+        "features.code_mode_host=false",
+        "features.skill_mcp_dependency_install=false",
+        "features.skill_search=false",
+        "features.skip_host_skill_discovery=true",
+        "skills.include_instructions=false",
+        "skills.bundled.enabled=false",
     ] {
         assert!(args.contains(&serde_json::json!(flag)), "missing {flag}");
     }
     assert!(!args.contains(&serde_json::json!("--model")));
+    assert!(!args.contains(&serde_json::json!("features.memory_tool=false")));
     assert!(!args
         .iter()
         .any(|a| a.as_str().unwrap_or("").contains("Transcript:")));
@@ -159,4 +248,121 @@ async fn codex_cli_nonzero_exit_does_not_leak_diagnostics() {
         .unwrap_err();
     assert!(error.contains("Codex CLI failed"));
     assert!(!error.contains("SECRET") && !error.contains("sk-private"));
+}
+
+/// Opt-in CLI contract probe: no real account, transcript, or model inference.
+/// Use MEETILY_CODEX_TEST_BINARY to select an already installed native CLI.
+#[tokio::test]
+#[ignore = "requires an installed Codex CLI; uses only a localhost Responses fixture"]
+async fn codex_cli_real_binary_advertises_no_tools_and_accepts_diagnostics() {
+    real_binary_contract(false).await;
+}
+
+#[tokio::test]
+#[ignore = "requires an installed Codex CLI; uses only a localhost Responses fixture"]
+async fn codex_cli_real_binary_accepts_recovered_stream_error() {
+    real_binary_contract(true).await;
+}
+
+async fn real_binary_contract(interrupt_first_stream: bool) {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    let binary = std::env::var_os("MEETILY_CODEX_TEST_BINARY")
+        .map(PathBuf::from)
+        .expect("set MEETILY_CODEX_TEST_BINARY to an installed native Codex executable");
+    let dir = tempfile::tempdir().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = async move {
+        for attempt in 0..=usize::from(interrupt_first_stream) {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut socket = BufReader::new(socket);
+            let mut content_length = None;
+            loop {
+                let mut line = String::new();
+                assert!(socket.read_line(&mut line).await.unwrap() > 0);
+                if line == "\r\n" {
+                    break;
+                }
+                let lower = line.to_ascii_lowercase();
+                assert!(
+                    !lower.starts_with("authorization:"),
+                    "fixture must not receive credentials"
+                );
+                if let Some(value) = lower.strip_prefix("content-length:") {
+                    content_length = Some(value.trim().parse::<usize>().unwrap());
+                }
+            }
+            let count = content_length.expect("CLI must send Content-Length");
+            assert!(count < 1024 * 1024);
+            let mut body = vec![0; count];
+            socket.read_exact(&mut body).await.unwrap();
+            let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let message = serde_json::json!({"id":"msg_fixture", "type":"message", "role":"assistant", "status":"completed", "content":[{"type":"output_text", "text":"Synthetic summary", "annotations":[]}]});
+            let events = [
+                serde_json::json!({"type":"response.created", "response":{"id":"resp_fixture", "status":"in_progress", "output":[]}}),
+                serde_json::json!({"type":"response.output_item.added", "output_index":0, "item":message}),
+                serde_json::json!({"type":"response.output_item.done", "output_index":0, "item":message}),
+                serde_json::json!({"type":"response.completed", "response":{"id":"resp_fixture", "status":"completed", "output":[message], "usage":{"input_tokens":1, "output_tokens":1, "total_tokens":2}}}),
+            ];
+            // A cleanly closed SSE connection without response.completed forces
+            // Codex to reconnect and emit its actual retry event.
+            let event_count = if interrupt_first_stream && attempt == 0 {
+                1
+            } else {
+                events.len()
+            };
+            let data: String = events[..event_count]
+                .iter()
+                .map(|e| format!("data: {e}\n\n"))
+                .collect();
+            let reply = format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{data}", data.len());
+            socket.write_all(reply.as_bytes()).await.unwrap();
+            socket.shutdown().await.unwrap();
+            assert_eq!(
+                request["tools"],
+                serde_json::json!([]),
+                "CLI advertised tools"
+            );
+        }
+    };
+    let provider = format!("model_providers.fixture={{name=\"Local fixture\",base_url=\"http://{address}/v1\",wire_api=\"responses\",requires_openai_auth=false}}");
+    let mut args = generation_args("gpt-5.4");
+    // Only replace provider routing. Exercise the exact production isolation
+    // settings; an empty auth home and cleared environment prevent account use.
+    args.pop();
+    args.extend(["-c", "model_provider=\"fixture\"", "-c", &provider, "-"]);
+    let mut cmd = command(&binary, &args, dir.path());
+    cmd.env_clear()
+        .env("HOME", dir.path())
+        .env("CODEX_HOME", dir.path())
+        .env("USERPROFILE", dir.path())
+        .env("PATH", binary.parent().unwrap())
+        .env("CI", "1");
+    #[cfg(windows)]
+    if let Some(root) = std::env::var_os("SystemRoot") {
+        cmd.env("SystemRoot", root);
+    }
+    let client = run(
+        cmd,
+        Some("Return a synthetic meeting summary.".into()),
+        Duration::from_secs(30),
+        None,
+    );
+    let (_, result) = tokio::time::timeout(Duration::from_secs(35), async {
+        tokio::join!(server, client)
+    })
+    .await
+    .expect("local CLI contract probe timed out");
+    let output = result.unwrap();
+    assert!(output.success, "isolated CLI execution failed");
+    if interrupt_first_stream {
+        assert!(
+            output.stdout.lines().any(|line| {
+                serde_json::from_str::<serde_json::Value>(line)
+                    .is_ok_and(|event| event["type"] == "error")
+            }),
+            "CLI must emit a retry error before recovering"
+        );
+    }
+    assert_eq!(parse_response(&output.stdout).unwrap(), "Synthetic summary");
 }

@@ -12,6 +12,7 @@ import { storageService } from '@/services/storageService';
 import { applyPinnedSummaryLanguageToMeeting } from '@/lib/summary-language-preferences';
 import { toast } from 'sonner';
 import { announceChange } from '@/lib/workspace-api';
+import { flushMeetingNotes, forgetMeetingNotes } from '@/lib/meeting-notes-store';
 import { editedSpeaker } from '@/lib/live-speaker-edits';
 
 interface AudioRecoveryStatus {
@@ -120,22 +121,13 @@ export function useTranscriptRecovery(): UseTranscriptRecoveryReturn {
 
       // 2. Load all transcripts
       const transcripts = await loadMeetingTranscripts(meetingId);
-      if (transcripts.length === 0) {
-        throw new Error('No transcripts found for this meeting');
-      }
+
 
       // 3. Check for folder path
       let folderPath = metadata.folderPath;
 
 
-      if (!folderPath) {
-        // Try to get from backend (might exist if only app crashed, not system)
-        try {
-          folderPath = await invoke<string>('get_meeting_folder_path');
-        } catch (error) {
-          folderPath = undefined;
-        }
-      }
+      // Recovery must never borrow a newer recording's native folder.
 
       // 4. Attempt audio recovery if folder path exists
       let audioRecoveryStatus: AudioRecoveryStatus | null = null;
@@ -165,7 +157,7 @@ export function useTranscriptRecovery(): UseTranscriptRecoveryReturn {
 
       // 5. Convert StoredTranscripts to the format expected by storageService
       const formattedTranscripts = transcripts.map((t, index) => ({
-        id: t.id?.toString() || `${Date.now()}-${index}`,
+        id: `${meetingId}:seg_${t.sequenceId ?? index}`,
         text: t.text,
         timestamp: t.timestamp,
         sequence_id: t.sequenceId || index,
@@ -179,12 +171,15 @@ export function useTranscriptRecovery(): UseTranscriptRecoveryReturn {
         speaker: editedSpeaker(meetingId, t.sequenceId ?? index, (t as any).speaker ?? (t as any).source ?? undefined),
       }));
 
+      await flushMeetingNotes(meetingId);
+
       // 6. Save to backend database using existing save utilities
       const saveResponse = await storageService.saveMeeting(
         metadata.title,
         formattedTranscripts,
         folderPath ?? null,
-        new Date(metadata.startTime).toISOString()
+        new Date(metadata.startTime).toISOString(),
+        meetingId
       );
 
       const savedMeetingId = saveResponse.meeting_id;
@@ -235,7 +230,10 @@ export function useTranscriptRecovery(): UseTranscriptRecoveryReturn {
    */
   const deleteRecoverableMeeting = useCallback(async (meetingId: string): Promise<void> => {
     try {
+      await invoke('api_delete_meeting', { meetingId });
+      forgetMeetingNotes(meetingId);
       await indexedDBService.deleteMeeting(meetingId);
+      announceChange('meetings', { meetingId });
       setRecoverableMeetings(prev => prev.filter(m => m.meetingId !== meetingId));
     } catch (error) {
       console.error('Failed to delete meeting:', error);

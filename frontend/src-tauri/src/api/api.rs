@@ -1199,6 +1199,7 @@ pub async fn api_save_transcript<R: Runtime>(
     folder_path: Option<String>,
     recording_started_at: Option<String>,
     auth_token: Option<String>,
+    meeting_id: Option<String>,
 ) -> Result<serde_json::Value, String> {
     log_info!(
         "api_save_transcript called for meeting: {}, transcripts: {}, folder_path: {:?}, auth_token: {}",
@@ -1258,16 +1259,15 @@ pub async fn api_save_transcript<R: Runtime>(
     let recording_started_at = metadata_recording_start.or(supplied_recording_start);
 
     // Now, call the repository with the correctly typed data.
-    match TranscriptsRepository::save_transcript(
-        pool,
-        &meeting_title,
-        &transcripts_to_save,
-        folder_path,
-        recording_started_at,
-    )
-    .await
+    let result = if let Some(meeting_id) = meeting_id {
+        TranscriptsRepository::finish_recording(pool, &meeting_id, &meeting_title, &transcripts_to_save, folder_path).await
+    } else {
+        TranscriptsRepository::save_transcript(pool, &meeting_title, &transcripts_to_save, folder_path, recording_started_at).await
+    };
+    match result
     {
         Ok(meeting_id) => {
+            crate::audio::recording_commands::acknowledge_recording_persisted(&meeting_id);
             log_info!(
                 "Successfully saved transcript and created meeting with id: {}",
                 meeting_id

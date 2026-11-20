@@ -29,6 +29,7 @@ import { Spinner } from '@/components/ui/spinner';
 import { cn } from '@/lib/utils';
 import { cleanTranscriptText } from '@/lib/labs';
 import { displaySpeaker, isUserSpeaker, speakerColor, speakerColorIndexMap, speakerColorValue, speakerDot, speakerKey } from '@/utils/speakerUtils';
+import { transcriptWithAskBoundary, type AskBoundary, type ContextTranscriptSegment } from '@/lib/ask-ai-context';
 
 /**
  * How line text is shown. `tidy` drops filler words (the default); with Labs
@@ -39,6 +40,7 @@ export type TranscriptTextMode = 'tidy' | 'clean' | 'verbatim';
 
 export interface VirtualizedTranscriptViewProps {
   segments: TranscriptSegmentData[];
+  askContextBoundary?: AskBoundary | null;
   isRecording?: boolean;
   isPaused?: boolean;
   isProcessing?: boolean;
@@ -80,7 +82,7 @@ export interface VirtualizedTranscriptViewProps {
 
 const VIRTUALIZATION_THRESHOLD = 10;
 
-interface Turn extends TranscriptSegmentData {
+interface Turn extends ContextTranscriptSegment {
   memberIds: string[];
 }
 
@@ -105,16 +107,17 @@ function shownText(text: string, mode: TranscriptTextMode): string {
 }
 
 /** One turn per speaker run, joining fragments less than 2.5s apart. */
-function mergeTurns(segments: TranscriptSegmentData[], maxGapSecs = 2.5): Turn[] {
+function mergeTurns(segments: ContextTranscriptSegment[], maxGapSecs = 2.5): Turn[] {
   const out: Turn[] = [];
   for (const segment of segments) {
     const last = out[out.length - 1];
     const lastEnd = last?.endTime ?? last?.timestamp ?? 0;
     const gap = segment.timestamp - lastEnd;
-    if (last && speakerKey(last.speaker) === speakerKey(segment.speaker) && gap >= 0 && gap <= maxGapSecs) {
+    if (last && !last.preventMergeAfter && !segment.askBoundary && speakerKey(last.speaker) === speakerKey(segment.speaker) && gap >= 0 && gap <= maxGapSecs) {
       last.text = `${last.text.trim()} ${segment.text.trim()}`.replace(/\s+/g, ' ').trim();
       last.endTime = segment.endTime ?? segment.timestamp;
       last.memberIds.push(segment.id);
+      last.preventMergeAfter = segment.preventMergeAfter;
       if (segment.confidence != null) last.confidence = Math.min(last.confidence ?? 1, segment.confidence);
     } else {
       out.push({ ...segment, memberIds: [segment.id] });
@@ -189,7 +192,7 @@ const TurnRow = memo(function TurnRow({
                 <button
                   type="button"
                   onClick={(event) =>
-                    onSpeakerClick ? onSpeakerClick(speaker, turn.id, event.currentTarget) : onRenameSpeaker?.(speaker, turn.id)
+                    onSpeakerClick ? onSpeakerClick(speaker, turn.originalSegmentId ?? turn.id, event.currentTarget) : onRenameSpeaker?.(speaker, turn.originalSegmentId ?? turn.id)
                   }
                   className={cn(
                     'rounded px-0.5 text-xs font-semibold transition-colors hover:bg-af-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-af-accent/60',
@@ -245,6 +248,7 @@ const TurnRow = memo(function TurnRow({
 
 export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps> = ({
   segments,
+  askContextBoundary,
   isRecording = false,
   isPaused = false,
   isProcessing = false,
@@ -269,7 +273,7 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
   colorIndices: givenColorIndices,
 }) => {
   const userName = useUserName();
-  const turns = useMemo(() => mergeTurns(segments), [segments]);
+  const turns = useMemo(() => mergeTurns(transcriptWithAskBoundary(segments, askContextBoundary ?? null)), [segments, askContextBoundary]);
   // One colour per speaker in first-spoken order, so a renamed speaker keeps theirs.
   const ownColorIndices = useMemo(
     () => speakerColorIndexMap(turns.map((turn) => turn.speaker ?? '').filter(Boolean)),
@@ -372,6 +376,8 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
   }, [onLoadMore, hasMore, isLoadingMore, isRecording]);
 
   const row = (turn: Turn, index: number) => (
+    <>
+    {turn.askBoundary && <p data-ask-ai-boundary className="my-3 border-y border-af-accent/30 py-2 text-xs text-af-text-2">{turn.askBoundary}</p>}
     <TurnRow
       turn={turn}
       text={getDisplayText(turn)}
@@ -386,6 +392,7 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
       onMergeSpeaker={onMergeSpeaker}
       onSeek={onSeek}
     />
+    </>
   );
 
   const footer = (

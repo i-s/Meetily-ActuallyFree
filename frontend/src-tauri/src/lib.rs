@@ -57,6 +57,7 @@ pub mod anthropic;
 pub mod groq;
 pub mod openrouter;
 pub mod live_assistant;
+pub mod meeting_chat;
 pub mod meeting_detection;
 pub mod minibar;
 pub mod parakeet_engine;
@@ -76,10 +77,10 @@ use tokio::sync::RwLock;
 
 static RECORDING_FLAG: AtomicBool = AtomicBool::new(false);
 
-// Global language preference storage (default to "auto-translate" for automatic translation to English)
-// Frontend overwrites on startup from OS locale (en if English, else auto).
+// Detect the spoken language until the frontend restores an explicit preference.
+// The operating system locale must not force English transcription or translation.
 static LANGUAGE_PREFERENCE: std::sync::LazyLock<StdMutex<String>> =
-    std::sync::LazyLock::new(|| StdMutex::new("en".to_string()));
+    std::sync::LazyLock::new(|| StdMutex::new("auto".to_string()));
 
 #[tauri::command]
 fn get_check_updates_on_launch() -> bool {
@@ -809,6 +810,10 @@ pub fn run() {
             database::repositories::meeting_notes::api_save_meeting_notes,
             api::api_get_meeting_audio,
             meeting_detection::get_meeting_detection_settings,
+            meeting_detection::get_meeting_detection_diagnostics,
+            meeting_detection::request_meeting_detection_accessibility,
+            meeting_detection::validate_meeting_detection_session,
+            meeting_detection::meeting_detection_session_exists,
             meeting_detection::set_meeting_detection_settings,
             meeting_detection::start_meeting_detection,
             meeting_detection::stop_meeting_detection,
@@ -861,6 +866,7 @@ pub fn run() {
             api::api_test_custom_openai_connection,
             // Summary commands
             summary::commands::api_process_transcript,
+            summary::commands::api_get_summary_input_snapshot,
             summary::commands::api_get_summary,
             summary::commands::api_save_meeting_summary,
             summary::commands::api_get_meeting_summary_language,
@@ -879,6 +885,11 @@ pub fn run() {
             live_assistant::ask_live_assistant,
             live_assistant::ask_person,
             live_assistant::api_ask_meeting,
+            live_assistant::send_meeting_chat,
+            live_assistant::get_meeting_chat,
+            live_assistant::get_meeting_chat_context,
+            live_assistant::get_ask_ai_context_settings,
+            live_assistant::set_ask_ai_context_settings,
             live_assistant::ollama_embed,
             // Built-in AI commands
             summary::summary_engine::commands::builtin_ai_list_models,
@@ -910,6 +921,7 @@ pub fn run() {
             notifications::commands::request_notification_permission,
             notifications::commands::show_notification,
             notifications::commands::show_simple_notification,
+            notifications::commands::show_meeting_detection_notification,
             notifications::commands::show_test_notification,
             notifications::commands::is_dnd_active,
             notifications::commands::get_system_dnd_status,

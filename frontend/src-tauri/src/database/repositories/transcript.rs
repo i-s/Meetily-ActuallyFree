@@ -103,6 +103,45 @@ impl TranscriptsRepository {
         Ok(meeting_id)
     }
 
+    /// Finalization/recovery updates the meeting allocated at Start. Never insert
+    /// a missing meeting: a late completion must not resurrect a deleted one.
+    pub async fn finish_recording(
+        pool: &SqlitePool, meeting_id: &str, title: &str,
+        segments: &[TranscriptSegment], folder_path: Option<String>,
+    ) -> Result<String, SqlxError> {
+        let mut tx = pool.begin().await?;
+        let updated = sqlx::query("UPDATE meetings SET title=?, updated_at=?, folder_path=COALESCE(?,folder_path), title_is_manual=? WHERE id=?")
+            .bind(title).bind(Utc::now()).bind(folder_path).bind(!is_default_meeting_title(title)).bind(meeting_id)
+            .execute(&mut *tx).await?;
+        if updated.rows_affected() == 0 { return Err(SqlxError::RowNotFound); }
+        for segment in segments {
+            Self::write_recording_segment(&mut tx, meeting_id, segment).await?;
+        }
+        crate::database::repositories::person::PeopleRepository::link_named_speakers(&mut tx, meeting_id).await?;
+        tx.commit().await?;
+        Ok(meeting_id.to_string())
+    }
+
+    pub async fn persist_live_segment(pool: &SqlitePool, meeting_id: &str, segment: &TranscriptSegment) -> Result<(), SqlxError> {
+        let mut tx = pool.begin().await?;
+        Self::write_recording_segment(&mut tx, meeting_id, segment).await?;
+        tx.commit().await
+    }
+
+    async fn write_recording_segment(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>, meeting_id: &str, segment: &TranscriptSegment) -> Result<(), SqlxError> {
+        let start: DateTime<Utc> = sqlx::query_scalar("SELECT created_at FROM meetings WHERE id=?")
+            .bind(meeting_id).fetch_one(&mut **tx).await?;
+        let timestamp = match segment.audio_start_time {
+            Some(offset) => timestamp_from_offset(start, offset)?,
+            None => segment.timestamp.clone(),
+        };
+        sqlx::query("INSERT INTO transcripts (id,meeting_id,transcript,timestamp,audio_start_time,audio_end_time,duration,speaker) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET transcript=excluded.transcript,timestamp=excluded.timestamp,audio_start_time=excluded.audio_start_time,audio_end_time=excluded.audio_end_time,duration=excluded.duration WHERE transcripts.meeting_id=excluded.meeting_id")
+            .bind(&segment.id).bind(meeting_id).bind(&segment.text).bind(timestamp)
+            .bind(segment.audio_start_time).bind(segment.audio_end_time).bind(segment.duration).bind(&segment.speaker)
+            .execute(&mut **tx).await?;
+        Ok(())
+    }
+
     /// Searches for a query string across a meeting's transcript text, its
     /// generated summary, and its title. Returns one result per matching
     /// meeting (deduplicated), preferring a transcript snippet for context,
@@ -300,6 +339,28 @@ fn matches_timestamp_shape(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn recording_identity_keeps_silent_meeting_and_recovered_transcripts() {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::raw_sql("CREATE TABLE meetings (id TEXT PRIMARY KEY, title TEXT, created_at TEXT, updated_at TEXT, folder_path TEXT, title_is_manual INTEGER); CREATE TABLE transcripts (id TEXT PRIMARY KEY, meeting_id TEXT, transcript TEXT, timestamp TEXT, audio_start_time REAL, audio_end_time REAL, duration REAL, speaker TEXT); CREATE TABLE people (id TEXT PRIMARY KEY, display_name TEXT NOT NULL, normalized_name TEXT NOT NULL UNIQUE, notes TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL); CREATE TABLE person_speakers (person_id TEXT NOT NULL, meeting_id TEXT NOT NULL, speaker_label TEXT NOT NULL, UNIQUE(meeting_id, speaker_label)); CREATE TABLE meeting_notes (meeting_id TEXT PRIMARY KEY, markdown TEXT);").execute(&pool).await.unwrap();
+        let first = TranscriptsRepository::save_transcript(&pool, "Silent short call", &[], None, None).await.unwrap();
+        sqlx::query("INSERT INTO meeting_notes VALUES (?, 'Keep my notes')").bind(&first).execute(&pool).await.unwrap();
+        TranscriptsRepository::finish_recording(&pool, &first, "Silent short call", &[], None).await.unwrap();
+        let second = TranscriptsRepository::save_transcript(&pool, "Next call", &[], None, None).await.unwrap();
+        assert_ne!(first, second);
+        let turn = TranscriptSegment { id: "turn-1".into(), text: "Recovered turn".into(), timestamp: "00:01".into(), audio_start_time: Some(1.0), audio_end_time: Some(2.0), duration: Some(1.0), speaker: Some("You".into()) };
+        TranscriptsRepository::persist_live_segment(&pool, &second, &turn).await.unwrap();
+        TranscriptsRepository::persist_live_segment(&pool, &second, &turn).await.unwrap();
+        // Empty WebView recovery must not erase native-owned transcript rows.
+        TranscriptsRepository::finish_recording(&pool, &second, "Recovered", &[], None).await.unwrap();
+        assert_eq!(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM transcripts").fetch_one(&pool).await.unwrap(), 1);
+        assert_eq!(sqlx::query_scalar::<_, String>("SELECT markdown FROM meeting_notes WHERE meeting_id=?").bind(&first).fetch_one(&pool).await.unwrap(), "Keep my notes");
+        assert_eq!(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM meetings").fetch_one(&pool).await.unwrap(), 2);
+        sqlx::query("DELETE FROM meetings WHERE id=?").bind(&second).execute(&pool).await.unwrap();
+        assert!(TranscriptsRepository::finish_recording(&pool, &second, "Late completion", &[], None).await.is_err());
+        assert!(TranscriptsRepository::persist_live_segment(&pool, &second, &turn).await.is_err());
+    }
 
     #[tokio::test]
     async fn save_links_live_named_speaker_for_enrollment() {

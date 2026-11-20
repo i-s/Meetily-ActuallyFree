@@ -344,7 +344,6 @@ pub async fn api_get_summary<R: Runtime>(
 pub async fn api_process_transcript<R: Runtime>(
     app: AppHandle<R>,
     state: tauri::State<'_, AppState>,
-    text: String,
     model: String,
     model_name: String,
     meeting_id: Option<String>,
@@ -365,7 +364,7 @@ pub async fn api_process_transcript<R: Runtime>(
     );
 
     let pool = state.db_manager.pool().clone();
-    let final_prompt = custom_prompt.unwrap_or_else(|| "".to_string());
+    let custom_prompt = custom_prompt.unwrap_or_default();
     let final_template_id = template_id.unwrap_or_else(|| "daily_standup".to_string());
     let process_id = Uuid::new_v4().to_string();
     let registration = SummaryService::try_register_cancellation_token(&m_id)
@@ -377,11 +376,21 @@ pub async fn api_process_transcript<R: Runtime>(
         if t.is_empty() { None } else { Some(t.to_string()) }
     });
 
-    // Create or reset the process entry in the database
-    if let Err(error) = SummaryProcessesRepository::create_or_reset_process(&pool, &m_id).await {
+    // Drain the live SQLite writer before reading; a visible turn must not be
+    // omitted just because capture queued it immediately before Generate.
+    if let Err(error) = crate::audio::recording_commands::flush_recording_transcripts(&m_id).await {
         SummaryService::cleanup_cancellation_token(&m_id, &registration);
-        return Err(format!("Failed to initialize process: {}", error));
+        return Err(format!("Failed to save live transcript before summary: {}", error));
     }
+    let snapshot = match super::input_snapshot::capture_and_start(&pool, &m_id).await {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            SummaryService::cleanup_cancellation_token(&m_id, &registration);
+            return Err(format!("Failed to capture summary inputs: {}", error));
+        }
+    };
+    let final_prompt = snapshot.context_prompt(&custom_prompt);
+    let text = snapshot.transcript;
 
     log_info!("✓ Summary process initialized for meeting_id: {}", &m_id);
 
@@ -442,6 +451,18 @@ pub async fn api_process_transcript<R: Runtime>(
         message: "Summary generation started".to_string(),
         process_id,
     })
+}
+
+/// Provenance of the displayed summary, retained across failed regenerations.
+#[tauri::command]
+pub async fn api_get_summary_input_snapshot(
+    state: tauri::State<'_, AppState>,
+    meeting_id: String,
+) -> Result<Option<super::input_snapshot::SummaryInputMetadata>, String> {
+    super::input_snapshot::saved_snapshot(state.db_manager.pool(), &meeting_id)
+        .await
+        .map(|snapshot| snapshot.map(|snapshot| snapshot.metadata()))
+        .map_err(|error| format!("Failed to load summary input snapshot: {}", error))
 }
 
 /// Cancels an ongoing summary generation process

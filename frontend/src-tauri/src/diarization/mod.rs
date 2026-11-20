@@ -727,14 +727,16 @@ pub async fn rename_meeting_speaker(
 ) -> Result<MeetingSpeakerRenameResult, String> {
     let _operation_guard = operation_guard().await;
 
-    let outcome = crate::database::repositories::person::PeopleRepository::rename_meeting_speaker(
+    let outcome = if let Some(result) = crate::audio::recording_commands::edit_live_speaker(&meeting_id, from.clone(), to.clone(), false).await {
+        result?
+    } else { crate::database::repositories::person::PeopleRepository::rename_meeting_speaker(
         state.db_manager.pool(),
         &meeting_id,
         &from,
         &to,
     )
     .await
-    .map_err(|e| format!("Failed to rename speaker: {}", e))?;
+    .map_err(|e| format!("Failed to rename speaker: {}", e))? };
     log::info!(
         "🧑‍🤝‍🧑 Renamed speaker '{}' → '{}' across {} segments of meeting {}",
         from, outcome.speaker, outcome.count, meeting_id
@@ -755,14 +757,16 @@ pub async fn reassign_transcript_speaker(
     to: String,
 ) -> Result<MeetingSpeakerRenameResult, String> {
     let _operation_guard = operation_guard().await;
-    let outcome = crate::database::repositories::person::PeopleRepository::reassign_transcript_speaker(
+    let outcome = if let Some(result) = crate::audio::recording_commands::edit_live_speaker(&meeting_id, transcript_id.clone(), to.clone(), true).await {
+        result?
+    } else { crate::database::repositories::person::PeopleRepository::reassign_transcript_speaker(
         state.db_manager.pool(),
         &meeting_id,
         &transcript_id,
         &to,
     )
     .await
-    .map_err(|e| format!("Failed to move this line: {}", e))?;
+    .map_err(|e| format!("Failed to move this line: {}", e))? };
     Ok(MeetingSpeakerRenameResult {
         speaker: outcome.speaker,
         count: outcome.count,

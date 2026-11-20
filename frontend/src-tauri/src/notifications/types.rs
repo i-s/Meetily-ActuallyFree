@@ -22,6 +22,7 @@ pub enum NotificationType {
     TranscriptionComplete,
     MeetingReminder(u64), // Duration in minutes
     SystemError(String),
+    MeetingDetected { process: String, session_id: u64 },
     Test, // For testing notifications
 }
 

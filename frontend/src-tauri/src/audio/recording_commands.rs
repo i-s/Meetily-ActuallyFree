@@ -51,6 +51,59 @@ async fn start_live_diarization<R: Runtime>(app: &AppHandle<R>) {
 // Simple recording state tracking
 static IS_RECORDING: AtomicBool = AtomicBool::new(false);
 static IS_STOPPING: AtomicBool = AtomicBool::new(false);
+// Identity outlives the manager's temporary removal during native Stop.
+static RECORDING_MEETING_ID: Mutex<Option<String>> = Mutex::new(None);
+static TRANSCRIPT_PERSIST_TASK: Mutex<Option<JoinHandle<()>>> = Mutex::new(None);
+static TRANSCRIPT_WRITER: Mutex<Option<recording_persistence::RecordingWriter>> = Mutex::new(None);
+static TRANSCRIPT_PERSIST_ERROR: Mutex<Option<String>> = Mutex::new(None);
+#[path = "recording_persistence.rs"]
+mod recording_persistence;
+
+fn start_transcript_persistence<R: Runtime>(app: &AppHandle<R>, meeting_id: String) -> recording_persistence::RecordingWriter {
+    let pool = app.state::<crate::state::AppState>().db_manager.pool().clone();
+    let app = app.clone();
+    *TRANSCRIPT_PERSIST_ERROR.lock().unwrap() = None;
+    let (writer, task) = recording_persistence::RecordingWriter::start(pool, meeting_id.clone(), move |message| {
+        error!("{}", message);
+        *TRANSCRIPT_PERSIST_ERROR.lock().unwrap() = Some(message.clone());
+        let _ = app.emit("recording-persistence-error", serde_json::json!({ "meeting_id": meeting_id, "message": message }));
+    });
+    *TRANSCRIPT_PERSIST_TASK.lock().unwrap() = Some(task);
+    *TRANSCRIPT_WRITER.lock().unwrap() = Some(writer.clone());
+    writer
+}
+
+/// An AI snapshot must include every transcript already admitted by the native
+/// event listener, or visibly reject the request if storage lost a write.
+pub async fn flush_recording_transcripts(meeting_id: &str) -> Result<(), String> {
+    if RECORDING_MEETING_ID.lock().unwrap().as_deref() != Some(meeting_id) { return Ok(()); }
+    if IS_STOPPING.load(Ordering::SeqCst) { return Err("The recording is still being saved. Try again when Stop completes.".into()); }
+    let writer = TRANSCRIPT_WRITER.lock().unwrap().clone();
+    if let Some(writer) = writer { writer.flush().await?; }
+    // Stop may have taken ownership while the barrier was queued.
+    if IS_STOPPING.load(Ordering::SeqCst) { return Err("The recording is still being saved. Try again when Stop completes.".into()); }
+    match TRANSCRIPT_PERSIST_ERROR.lock().unwrap().clone() {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+/// Frontend recovery can repair a failed final native save after capture ends.
+pub(crate) fn acknowledge_recording_persisted(meeting_id: &str) {
+    if !IS_RECORDING.load(Ordering::SeqCst) && RECORDING_MEETING_ID.lock().unwrap().as_deref() == Some(meeting_id) {
+        *TRANSCRIPT_PERSIST_ERROR.lock().unwrap() = None;
+    }
+}
+
+/// Existing speaker commands use the live writer to order edits with newly
+/// arriving turns. Capture-source labels in the saver remain unchanged.
+pub(crate) async fn edit_live_speaker(meeting_id: &str, from_or_turn: String, to: String, single_turn: bool) -> Option<Result<crate::database::repositories::person::SpeakerRenameOutcome, String>> {
+    if RECORDING_MEETING_ID.lock().unwrap().as_deref() != Some(meeting_id) { return None; }
+    if IS_STOPPING.load(Ordering::SeqCst) { return Some(Err("Wait until the recording finishes saving before editing speakers.".into())); }
+    let writer = TRANSCRIPT_WRITER.lock().unwrap().clone()?;
+    Some(if single_turn { writer.reassign(from_or_turn, to).await } else { writer.rename(from_or_turn, to).await })
+}
+
 
 struct StopGuard;
 
@@ -424,6 +477,9 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
             now.format("%Y-%m-%d_%H-%M-%S")
         )
     });
+    let meeting_id = crate::database::repositories::transcript::TranscriptsRepository::save_transcript(
+        app.state::<crate::state::AppState>().db_manager.pool(), &effective_meeting_name, &[], None, None,
+    ).await.map_err(|error| format!("Could not create recording meeting: {error}"))?;
     manager.set_meeting_name(Some(effective_meeting_name));
 
     install_fatal_error_callback(&mut manager, &app);
@@ -437,13 +493,32 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
     let resolved_system_device_name = system_device.as_ref().map(|device| device.name.clone());
     let transcription_receiver = manager
         .start_recording(microphone_device, system_device, auto_save, Some(level_sender))
-        .await
-        .map_err(|error| { crate::diarization::online::stop(); map_recording_start_error(&app, error) })?;
+        .await;
+    let transcription_receiver = match transcription_receiver {
+        Ok(receiver) => receiver,
+        Err(error) => {
+            crate::diarization::online::stop();
+            // This ID was never exposed to editors; a failed capture start is
+            // not a meeting. Keep later successful starts independent.
+            let _ = sqlx::query("DELETE FROM meetings WHERE id=?").bind(&meeting_id)
+                .execute(app.state::<crate::state::AppState>().db_manager.pool()).await;
+            return Err(map_recording_start_error(&app, error));
+        }
+    };
 
     #[cfg(target_os = "windows")]
     if !per_app_enabled {
         start_windows_audio_route_monitor(&app, &manager, resolved_system_device_name);
     }
+
+    // Persist audio recovery location before exposing the recording to editors.
+    if let Some(folder) = manager.get_meeting_folder() {
+        let result = sqlx::query("UPDATE meetings SET folder_path=? WHERE id=?")
+            .bind(folder.to_string_lossy().as_ref()).bind(&meeting_id)
+            .execute(app.state::<crate::state::AppState>().db_manager.pool()).await;
+        if let Err(error) = result { warn!("Could not persist recording folder: {error}"); }
+    }
+    *RECORDING_MEETING_ID.lock().unwrap() = Some(meeting_id.clone());
 
     // Store the manager globally to keep it alive
     {
@@ -460,13 +535,6 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
     // simply fall back to capture-source labels.
     reset_speech_detected_flag(); // Reset for new recording session
 
-    // Start optimized parallel transcription task and store handle
-    let task_handle = transcription::start_transcription_task(app.clone(), transcription_receiver);
-    {
-        let mut global_task = TRANSCRIPTION_TASK.lock().unwrap();
-        *global_task = Some(task_handle);
-    }
-
     // CRITICAL: Listen for transcript-update events and save to recording manager
     // This enables transcript history persistence for page reload sync
     // Store listener ID for cleanup during stop_recording to ensure microphone is released
@@ -478,12 +546,14 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
             .as_ref()
             .expect("recording manager missing after start")
             .transcript_segments_handle();
+        let persistence = start_transcript_persistence(&app, meeting_id.clone());
+        let segment_meeting_id = meeting_id.clone();
         let listener_id = app.listen("transcript-update", move |event: tauri::Event| {
             // Parse the transcript update from the event payload
             if let Ok(update) = serde_json::from_str::<TranscriptUpdate>(event.payload()) {
                 // Create structured transcript segment
                 let segment = crate::audio::recording_saver::TranscriptSegment {
-                    id: format!("seg_{}", update.sequence_id),
+                    id: format!("{}:seg_{}", segment_meeting_id, update.sequence_id),
                     text: update.text.clone(),
                     audio_start_time: update.audio_start_time,
                     audio_end_time: update.audio_end_time,
@@ -499,6 +569,12 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
                         Some(update.source.clone())
                     },
                 };
+
+                persistence.publish(crate::api::TranscriptSegment {
+                    id: segment.id.clone(), text: segment.text.clone(), timestamp: segment.display_time.clone(),
+                    audio_start_time: Some(segment.audio_start_time), audio_end_time: Some(segment.audio_end_time),
+                    duration: Some(segment.duration), speaker: segment.speaker.clone(),
+                });
 
                 // Save to recording manager
                 let mut saved_through_manager = false;
@@ -525,9 +601,17 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
     if let Err(error) = app.emit("recording-started", serde_json::json!({
         "message": "Recording started successfully with parallel processing",
         "devices": ["Default Microphone", "Default System Audio"],
-        "workers": 3
+        "workers": 3,
+        "meeting_id": meeting_id
     })) {
         warn!("Recording started, but the recording-started event failed: {}", error);
+    }
+
+    // Start optimized parallel transcription task and store handle
+    let task_handle = transcription::start_transcription_task(app.clone(), transcription_receiver);
+    {
+        let mut global_task = TRANSCRIPTION_TASK.lock().unwrap();
+        *global_task = Some(task_handle);
     }
 
     // Update tray menu to reflect recording state
@@ -682,6 +766,9 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
             now.format("%Y-%m-%d_%H-%M-%S")
         )
     });
+    let meeting_id = crate::database::repositories::transcript::TranscriptsRepository::save_transcript(
+        app.state::<crate::state::AppState>().db_manager.pool(), &effective_meeting_name, &[], None, None,
+    ).await.map_err(|error| format!("Could not create recording meeting: {error}"))?;
     manager.set_meeting_name(Some(effective_meeting_name));
 
     install_fatal_error_callback(&mut manager, &app);
@@ -695,13 +782,32 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
     let resolved_system_device_name = system_device.as_ref().map(|device| device.name.clone());
     let transcription_receiver = manager
         .start_recording(mic_device, system_device, auto_save, Some(level_sender))
-        .await
-        .map_err(|error| { crate::diarization::online::stop(); map_recording_start_error(&app, error) })?;
+        .await;
+    let transcription_receiver = match transcription_receiver {
+        Ok(receiver) => receiver,
+        Err(error) => {
+            crate::diarization::online::stop();
+            // This ID was never exposed to editors; a failed capture start is
+            // not a meeting. Keep later successful starts independent.
+            let _ = sqlx::query("DELETE FROM meetings WHERE id=?").bind(&meeting_id)
+                .execute(app.state::<crate::state::AppState>().db_manager.pool()).await;
+            return Err(map_recording_start_error(&app, error));
+        }
+    };
 
     #[cfg(target_os = "windows")]
     if !preferences.per_app_recording_enabled {
         start_windows_audio_route_monitor(&app, &manager, resolved_system_device_name);
     }
+
+    // Persist audio recovery location before exposing the recording to editors.
+    if let Some(folder) = manager.get_meeting_folder() {
+        let result = sqlx::query("UPDATE meetings SET folder_path=? WHERE id=?")
+            .bind(folder.to_string_lossy().as_ref()).bind(&meeting_id)
+            .execute(app.state::<crate::state::AppState>().db_manager.pool()).await;
+        if let Err(error) = result { warn!("Could not persist recording folder: {error}"); }
+    }
+    *RECORDING_MEETING_ID.lock().unwrap() = Some(meeting_id.clone());
 
     // Store the manager globally to keep it alive
     {
@@ -718,13 +824,6 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
     // simply fall back to capture-source labels.
     reset_speech_detected_flag(); // Reset for new recording session
 
-    // Start optimized parallel transcription task and store handle
-    let task_handle = transcription::start_transcription_task(app.clone(), transcription_receiver);
-    {
-        let mut global_task = TRANSCRIPTION_TASK.lock().unwrap();
-        *global_task = Some(task_handle);
-    }
-
     // CRITICAL: Listen for transcript-update events and save to recording manager
     // This enables transcript history persistence for page reload sync
     // Store listener ID for cleanup during stop_recording to ensure microphone is released
@@ -736,12 +835,14 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
             .as_ref()
             .expect("recording manager missing after start")
             .transcript_segments_handle();
+        let persistence = start_transcript_persistence(&app, meeting_id.clone());
+        let segment_meeting_id = meeting_id.clone();
         let listener_id = app.listen("transcript-update", move |event: tauri::Event| {
             // Parse the transcript update from the event payload
             if let Ok(update) = serde_json::from_str::<TranscriptUpdate>(event.payload()) {
                 // Create structured transcript segment
                 let segment = crate::audio::recording_saver::TranscriptSegment {
-                    id: format!("seg_{}", update.sequence_id),
+                    id: format!("{}:seg_{}", segment_meeting_id, update.sequence_id),
                     text: update.text.clone(),
                     audio_start_time: update.audio_start_time,
                     audio_end_time: update.audio_end_time,
@@ -755,6 +856,12 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
                         Some(update.source.clone())
                     },
                 };
+
+                persistence.publish(crate::api::TranscriptSegment {
+                    id: segment.id.clone(), text: segment.text.clone(), timestamp: segment.display_time.clone(),
+                    audio_start_time: Some(segment.audio_start_time), audio_end_time: Some(segment.audio_end_time),
+                    duration: Some(segment.duration), speaker: segment.speaker.clone(),
+                });
 
                 // Save to recording manager
                 let mut saved_through_manager = false;
@@ -784,9 +891,17 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
             mic_device_name.unwrap_or_else(|| "Default Microphone".to_string()),
             system_device_name.unwrap_or_else(|| "Default System Audio".to_string())
         ],
-        "workers": 3
+        "workers": 3,
+        "meeting_id": meeting_id
     })) {
         warn!("Recording started, but the recording-started event failed: {}", error);
+    }
+
+    // Start optimized parallel transcription task and store handle
+    let task_handle = transcription::start_transcription_task(app.clone(), transcription_receiver);
+    {
+        let mut global_task = TRANSCRIPTION_TASK.lock().unwrap();
+        *global_task = Some(task_handle);
     }
 
     // Update tray menu to reflect recording state
@@ -964,6 +1079,34 @@ async fn stop_recording_inner<R: Runtime>(
         if let Some(listener_id) = TRANSCRIPT_LISTENER_ID.lock().unwrap().take() {
             app.unlisten(listener_id);
             info!("âœ… Transcript-update listener removed");
+        }
+    }
+
+    TRANSCRIPT_WRITER.lock().unwrap().take();
+    let persist_task = TRANSCRIPT_PERSIST_TASK.lock().unwrap().take();
+    if let Some(task) = persist_task { let _ = task.await; }
+
+    let final_transcripts = manager_for_cleanup.as_ref().map(|manager| {
+        let segments: Vec<crate::api::TranscriptSegment> = manager.get_transcript_segments().into_iter().map(|segment| crate::api::TranscriptSegment {
+            id: segment.id, text: segment.text, timestamp: segment.display_time,
+            audio_start_time: Some(segment.audio_start_time), audio_end_time: Some(segment.audio_end_time),
+            duration: Some(segment.duration), speaker: segment.speaker,
+        }).collect();
+        (segments, manager.get_meeting_name().unwrap_or_else(|| "New Meeting".into()),
+         manager.get_meeting_folder().map(|path| path.to_string_lossy().into_owned()))
+    });
+    let meeting_id = RECORDING_MEETING_ID.lock().unwrap().clone();
+    if let (Some(meeting_id), Some((segments, title, folder))) = (meeting_id, final_transcripts) {
+        let result = crate::database::repositories::transcript::TranscriptsRepository::finish_recording(
+            app.state::<crate::state::AppState>().db_manager.pool(), &meeting_id, &title, &segments, folder,
+        ).await;
+        match result {
+            Ok(_) => { *TRANSCRIPT_PERSIST_ERROR.lock().unwrap() = None; }
+            Err(error) => {
+                let message = format!("The transcript could not be saved: {error}. Recovery data is retained.");
+                *TRANSCRIPT_PERSIST_ERROR.lock().unwrap() = Some(message.clone());
+                let _ = app.emit("recording-persistence-error", serde_json::json!({ "meeting_id": meeting_id, "message": message }));
+            }
         }
     }
 
@@ -1257,6 +1400,7 @@ async fn stop_recording_inner<R: Runtime>(
         "recording-stopped",
         serde_json::json!({
             "message": "Recording stopped - frontend will save after all transcripts received",
+            "meeting_id": RECORDING_MEETING_ID.lock().unwrap().clone(),
             "folder_path": folder_path_str,
             "meeting_name": meeting_name_str,
             "audio_save_error": audio_save_error
@@ -1274,6 +1418,7 @@ async fn stop_recording_inner<R: Runtime>(
         "recording-stop-complete",
         serde_json::json!({
             "call_api": true,
+            "meeting_id": RECORDING_MEETING_ID.lock().unwrap().clone(),
             "folder_path": folder_path_str,
             "meeting_name": meeting_name_str,
             "audio_save_error": audio_save_error
@@ -1456,6 +1601,7 @@ pub async fn get_recording_state() -> serde_json::Value {
 
     if let Some(manager) = manager_guard.as_ref() {
         serde_json::json!({
+            "meeting_id": RECORDING_MEETING_ID.lock().unwrap().clone(),
             "is_recording": is_recording,
             "is_paused": manager.is_paused(),
             "is_microphone_muted": manager.get_state().is_microphone_muted(),
@@ -1468,6 +1614,7 @@ pub async fn get_recording_state() -> serde_json::Value {
         })
     } else {
         serde_json::json!({
+            "meeting_id": RECORDING_MEETING_ID.lock().unwrap().clone(),
             "is_recording": is_recording,
             "is_paused": false,
             "is_microphone_muted": false,
@@ -1677,5 +1824,21 @@ pub async fn attempt_device_reconnect(
             error!("Manual reconnection error: {}", e);
             Err(e.to_string())
         }
+    }
+}
+
+#[cfg(test)]
+mod persistence_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn recording_identity_ai_snapshot_rejects_stop_after_writer_is_detached() {
+        let _guard = super::super::common::acquire_engine_lifecycle_lock().await;
+        let previous_id = RECORDING_MEETING_ID.lock().unwrap().replace("test-finalizing-meeting".into());
+        let was_stopping = IS_STOPPING.swap(true, Ordering::SeqCst);
+        let result = flush_recording_transcripts("test-finalizing-meeting").await;
+        IS_STOPPING.store(was_stopping, Ordering::SeqCst);
+        *RECORDING_MEETING_ID.lock().unwrap() = previous_id;
+        assert!(result.unwrap_err().contains("still being saved"));
     }
 }

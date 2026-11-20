@@ -105,6 +105,10 @@ source labels rather than guessing a speaker or switching engines.
 
 ## 3. Post-call processing and model selection
 
+Per-recording notes/chat identity, immutable summary inputs, Ask AI context limits,
+and issue #3 acceptance evidence are documented in
+[MEETING_WORKSPACE.md](MEETING_WORKSPACE.md).
+
 Summary-generated title ownership, placeholder rejection and completion refresh
 are documented in [SUMMARY_GENERATED_TITLES.md](SUMMARY_GENERATED_TITLES.md).
 The Codex CLI subscription provider and its subprocess contract are documented
@@ -120,6 +124,9 @@ Frontend post-call sequencing lives in
 `frontend/src/components/MeetingDetails/PostCallProcessingDialog.tsx` and related
 speaker/retranscription dialogs. `useDiarizationEngine.ts` refreshes selected-engine
 state for dialogs, including native activation events and stale-response guards.
+
+The shared Whisper language preference and its regression coverage are documented
+in [WHISPER_LANGUAGE.md](WHISPER_LANGUAGE.md).
 
 Live ASR and post-call ASR defaults are independent. Optional Whisper activation
 saves the **post-call** default; it must not replace the live Parakeet selection.

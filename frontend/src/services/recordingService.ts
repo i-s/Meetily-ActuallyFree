@@ -9,6 +9,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen, UnlistenFn } from '@tauri-apps/api/event';
 
 export interface RecordingState {
+  meeting_id: string | null;
   is_recording: boolean;
   is_paused: boolean;
   is_microphone_muted: boolean;
@@ -21,6 +22,7 @@ export interface RecordingState {
 }
 
 export interface RecordingStoppedPayload {
+  meeting_id?: string;
   message: string;
   folder_path?: string;
   meeting_name?: string;
@@ -131,8 +133,8 @@ export class RecordingService {
    * @param callback - Function to call when recording starts
    * @returns Promise that resolves to unlisten function
    */
-  async onRecordingStarted(callback: () => void): Promise<UnlistenFn> {
-    return listen('recording-started', callback);
+  async onRecordingStarted(callback: (payload: { meeting_id?: string }) => void): Promise<UnlistenFn> {
+    return listen<{ meeting_id?: string }>('recording-started', event => callback(event.payload));
   }
 
   /**

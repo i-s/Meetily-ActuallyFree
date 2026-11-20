@@ -1,6 +1,6 @@
 /**
- * Labs meeting automation. When meeting detection sees a call using the
- * microphone or camera, a recording starts; when that call ends, the
+ * Labs meeting automation. When meeting detection confirms a call,
+ * a recording starts; when that call ends, the
  * recording it started stops and saves. Recordings the user started are
  * never stopped by it.
  *
@@ -21,6 +21,8 @@ export interface AutomatedCall {
   app: string;
   /** Process the detector matched, e.g. "Zoom.exe". */
   process: string;
+  /** Native detector session; distinguishes successive calls in the same app. */
+  session_id?: number;
 }
 
 function read(key: string): string | null {
@@ -45,7 +47,11 @@ function parse(value: string | null): AutomatedCall | null {
   try {
     const parsed = JSON.parse(value) as Partial<AutomatedCall>;
     if (typeof parsed.process === 'string' && parsed.process) {
-      return { app: typeof parsed.app === 'string' && parsed.app ? parsed.app : parsed.process, process: parsed.process };
+      return {
+        app: typeof parsed.app === 'string' && parsed.app ? parsed.app : parsed.process,
+        process: parsed.process,
+        ...(typeof parsed.session_id === 'number' ? { session_id: parsed.session_id } : {}),
+      };
     }
   } catch {
     // Written by #38 as the bare process name.
@@ -54,9 +60,90 @@ function parse(value: string | null): AutomatedCall | null {
   return null;
 }
 
+/** Legacy ownership only matches legacy events; never guess a newer call's owner. */
+export function sameAutomatedCall(left: AutomatedCall, right: AutomatedCall): boolean {
+  return left.process === right.process && left.session_id === right.session_id;
+}
+
+/** Kept above effect lifetimes so routing cannot replay a prompt or race a start. */
+export function createMeetingDetectionSessions() {
+  const latest = new Map<string, number>();
+  const active = new Map<string, AutomatedCall>();
+  let starting: { token: symbol; expires: number } | null = null;
+  const isActive = (call: AutomatedCall) => {
+    const current = active.get(call.process);
+    return !!current && sameAutomatedCall(current, call);
+  };
+  return {
+    detect(call: AutomatedCall): boolean {
+      if (call.session_id === undefined || (latest.get(call.process) ?? -1) >= call.session_id) return false;
+      latest.set(call.process, call.session_id);
+      active.set(call.process, call);
+      return true;
+    },
+    end(call: AutomatedCall) {
+      if (call.session_id !== undefined) {
+        latest.set(call.process, Math.max(latest.get(call.process) ?? -1, call.session_id));
+      }
+      if (isActive(call)) active.delete(call.process);
+    },
+    isActive,
+    claimStart(call: AutomatedCall): symbol | null {
+      if (!isActive(call) || (starting && starting.expires > Date.now())) return null;
+      const token = Symbol('meeting-start');
+      // The recorder prepares models asynchronously. Keep the reservation until
+      // native capture starts; a bounded lease allows retry after a failed setup.
+      starting = { token, expires: Date.now() + PENDING_TTL_MS };
+      return token;
+    },
+    canStart(call: AutomatedCall, token: symbol): boolean {
+      return isActive(call) && starting?.token === token;
+    },
+    releaseStart(token: symbol) {
+      if (starting?.token === token) starting = null;
+    },
+    recordingStarted() { starting = null; },
+  };
+}
+
+/** Reserve before awaiting native calls; recheck session and UI lifetime after each. */
+export async function startDetectedMeeting(
+  call: AutomatedCall,
+  sessions: ReturnType<typeof createMeetingDetectionSessions>,
+  actions: {
+    getRecordingState: () => Promise<{ is_recording?: boolean }>;
+    validateSession: () => Promise<boolean>;
+    enabled: () => boolean;
+    launch: () => void;
+  },
+): Promise<'started' | 'skipped' | 'unconfirmed'> {
+  const reservation = sessions.claimStart(call);
+  if (!reservation) return 'skipped';
+  let launched = false;
+  const current = () => actions.enabled() && sessions.canStart(call, reservation);
+  try {
+    const state = await actions.getRecordingState();
+    if (state.is_recording || !current()) return 'skipped';
+    const valid = await actions.validateSession();
+    if (!current()) return 'skipped';
+    if (!valid) return 'unconfirmed';
+    actions.launch();
+    launched = true;
+    return 'started';
+  } finally {
+    // Keep the reservation through model loading, until recording-started.
+    if (!launched) sessions.releaseStart(reservation);
+  }
+}
+
 /** Called right before the recorder is asked to start for a detected call. */
 export function markAutomatedStart(call: AutomatedCall) {
   writeKey(PENDING_KEY, JSON.stringify({ ...call, at: Date.now() }));
+}
+
+/** Distinguish expired detection requests from ordinary manual starts. */
+export function hasPendingAutomatedStart(): boolean {
+  return read(PENDING_KEY) !== null;
 }
 
 /**
